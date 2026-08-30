@@ -17,6 +17,9 @@ dist/
 .cache/
 .worktrees/
 
+# Project-local Rust toolchain (rustup/cargo), used for isolated builds
+/.local-rust/
+
 # Downloaded by the snap jobs; snapcraft.yaml packages it. Never committed.
 markpad.deb
 pack.log
