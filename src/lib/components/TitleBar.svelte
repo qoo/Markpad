@@ -56,6 +56,8 @@
 		ontabclick,
 		zoomLevel,
 		onresetZoom,
+		onzoomIn,
+		onzoomOut,
 		oncloseTab,
 		isScrollSynced,
 		ontoggleSync,
@@ -100,6 +102,8 @@
 		ontabclick?: () => void;
 		zoomLevel?: number;
 		onresetZoom?: () => void;
+		onzoomIn?: () => void;
+		onzoomOut?: () => void;
 
 		oncloseTab?: (id: string) => void;
 		isScrollSynced?: boolean;
@@ -760,24 +764,41 @@
 						<span class="action-label">{t('menu.settings', currentLanguage)}</span>
 					</button>
 				{:else if id === 'zoom'}
-					<button
+					<div
 						class="menu-zoom-item"
-						onclick={() => {
-							hideTooltip();
-							onresetZoom?.();
-						}}
-						onmousedown={(e) => e.preventDefault()}
-						transition:fly={{ y: -10, duration: 150 }}
-						aria-label={t('tooltip.resetZoom', currentLanguage)}>
+						role="group"
+						aria-label={t('tooltip.resetZoom', currentLanguage)}
+						transition:fly={{ y: -10, duration: 150 }}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-							<circle cx="11" cy="11" r="8"></circle>
-							<line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-							<line x1="11" y1="8" x2="11" y2="14"></line>
-							<line x1="8" y1="11" x2="14" y2="11"></line>
+							<path d="M4 7V4h16v3"></path>
+							<path d="M9 20h6"></path>
+							<path d="M12 4v16"></path>
 						</svg>
-						<span class="zoom-value">{zoomLevel}%</span>
-						<span class="menu-shortcut">{t('tooltip.reset', currentLanguage)}</span>
-					</button>
+						<span class="zoom-label">{t('menu.fontSize', currentLanguage)}</span>
+						<div class="zoom-stepper">
+							<button
+								type="button"
+								class="zoom-step"
+								onclick={() => onzoomOut?.()}
+								onmousedown={(e) => e.preventDefault()}
+								aria-label={t('common.decrease', currentLanguage)}>&#8722;</button>
+							<button
+								type="button"
+								class="zoom-value"
+								onclick={() => {
+									hideTooltip();
+									onresetZoom?.();
+								}}
+								onmousedown={(e) => e.preventDefault()}
+								aria-label={t('tooltip.resetZoom', currentLanguage)}>{zoomLevel}%</button>
+							<button
+								type="button"
+								class="zoom-step"
+								onclick={() => onzoomIn?.()}
+								onmousedown={(e) => e.preventDefault()}
+								aria-label={t('common.increase', currentLanguage)}>&#43;</button>
+						</div>
+					</div>
 				{:else if id === 'zen'}
 					<button
 						class="title-action-btn {settings.zenMode ? 'active' : ''}"
@@ -1339,6 +1360,39 @@
 	}
 
 	.title-actions.show-dropdown .menu-zoom-item:hover {
+		background: transparent;
+	}
+
+	:global(.title-actions.show-dropdown .menu-zoom-item .zoom-label) {
+		flex: 1 1 auto;
+		text-align: left;
+		color: var(--color-fg-default);
+	}
+
+	:global(.title-actions.show-dropdown .menu-zoom-item .zoom-stepper) {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		margin-left: auto;
+	}
+
+	:global(.title-actions.show-dropdown .menu-zoom-item .zoom-step) {
+		width: 24px;
+		height: 24px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 15px;
+		line-height: 1;
+		background: transparent;
+		border: none;
+		border-radius: 4px;
+		color: var(--color-fg-default);
+		cursor: pointer;
+		font-family: var(--win-font);
+	}
+
+	:global(.title-actions.show-dropdown .menu-zoom-item .zoom-step:hover) {
 		background: var(--color-canvas-subtle);
 	}
 
@@ -1353,10 +1407,21 @@
 	}
 
 	:global(.title-actions.show-dropdown .menu-zoom-item .zoom-value) {
-		width: 32px;
-		text-align: left;
+		min-width: 48px;
+		text-align: center;
 		color: var(--color-fg-default);
 		display: inline-block;
+		background: transparent;
+		border: none;
+		border-radius: 4px;
+		padding: 3px 4px;
+		font-size: 13px;
+		font-family: var(--win-font);
+		cursor: pointer;
+	}
+
+	:global(.title-actions.show-dropdown .menu-zoom-item .zoom-value:hover) {
+		background: var(--color-canvas-subtle);
 	}
 
 	.title-action-btn.active {

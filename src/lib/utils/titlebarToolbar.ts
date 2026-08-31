@@ -218,9 +218,14 @@ export function visibleTitlebarActionIds(context: TitlebarActionContext): string
 		}
 		list.push('zen');
 		list.push('tabs');
+		// The font-size stepper is offered whenever a document is open, so the
+		// user can step up or down (and reset) from any starting point — including
+		// the 100% default. It used to appear only away from 100%, back when this
+		// row was a reset-only button; there is nothing to resize on the home
+		// screen, so it stays inside the document block.
+		list.push('zoom');
 	}
 
-	if (context.zoomLevel && context.zoomLevel !== 100) list.push('zoom');
 	list.push('theme');
 	list.push('settings');
 

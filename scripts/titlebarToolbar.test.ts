@@ -158,8 +158,8 @@ test('the home screen offers only the actions that are not about a document', ()
 	]);
 });
 
-test('Reset Zoom appears only away from 100%', () => {
-	assert.ok(!visibleTitlebarActionIds({ ...documentContext, zoomLevel: 100 }).includes('zoom'));
-	assert.ok(!visibleTitlebarActionIds(documentContext).includes('zoom'));
+test('Font-size stepper is always available, including at 100%', () => {
+	assert.ok(visibleTitlebarActionIds({ ...documentContext, zoomLevel: 100 }).includes('zoom'));
+	assert.ok(visibleTitlebarActionIds(documentContext).includes('zoom'));
 	assert.ok(visibleTitlebarActionIds({ ...documentContext, zoomLevel: 125 }).includes('zoom'));
 });

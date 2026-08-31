@@ -3618,6 +3618,8 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 		ondetach={handleDetach}
 		ontabclick={() => (showHome = false)}
 		onresetZoom={() => settings.resetZoom()}
+		onzoomIn={() => settings.zoomIn()}
+		onzoomOut={() => settings.zoomOut()}
 		isFullWidth={settings.previewFullWidth}
 		ontoggleFullWidth={() => settings.togglePreviewFullWidth()}
 		theme={settings.theme}
@@ -3660,6 +3662,8 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 		ondetach={handleDetach}
 		ontabclick={() => (showHome = false)}
 		onresetZoom={() => settings.resetZoom()}
+		onzoomIn={() => settings.zoomIn()}
+		onzoomOut={() => settings.zoomOut()}
 		{isScrollSynced}
 		ontoggleSync={() => tabManager.activeTabId && tabManager.toggleScrollSync(tabManager.activeTabId)}
 		isFullWidth={settings.previewFullWidth}
