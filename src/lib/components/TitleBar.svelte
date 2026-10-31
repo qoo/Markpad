@@ -122,6 +122,41 @@
 	let innerWidth = $state(1000);
 	let isCollapsed = $derived(innerWidth <= 450 || settings.zenMode);
 
+	// Only a maximized window keeps tabs and toolbar on one row. Any smaller
+	// window truncates tab titles long before the toolbar runs out of room,
+	// so the toolbar moves to its own row under the tabs instead. Below 700px
+	// even a maximized window (a small screen) is too narrow to share. Not
+	// offered on the Home screen (no tab strip to protect) or in Zen mode
+	// (which wants less chrome, not a taller title bar).
+	const STACK_BREAKPOINT = 700;
+	let isMaximized = $state(false);
+	$effect(() => {
+		const refresh = () => appWindow.isMaximized().then((value) => (isMaximized = value)).catch(() => {});
+		refresh();
+		const unlisten = appWindow.onResized(refresh);
+		return () => {
+			unlisten.then((fn) => fn()).catch(() => {});
+		};
+	});
+	let isStacked = $derived(
+		(!isMaximized || innerWidth <= STACK_BREAKPOINT) &&
+			!settings.zenMode &&
+			tabManager.tabs.length > 0 &&
+			settings.showTabs,
+	);
+
+	// The title bar's own height, exported as a CSS variable so every other
+	// component that pins itself "just below the title bar" — ZoomOverlay,
+	// DiffOverlay, the loading screen, the TOC panel — reads one number
+	// instead of each hard-coding 36px and silently disagreeing with this
+	// component the day it grows a second row.
+	const TITLEBAR_ROW_HEIGHT = 36;
+	const TITLEBAR_TOOLBAR_ROW_HEIGHT = 32;
+	$effect(() => {
+		const height = isStacked ? TITLEBAR_ROW_HEIGHT + TITLEBAR_TOOLBAR_ROW_HEIGHT : TITLEBAR_ROW_HEIGHT;
+		document.documentElement.style.setProperty('--titlebar-height', `${height}px`);
+	});
+
 	const DEBUG_MACOS = false;
 
 	// The platform comes from `settings.osType` — the Rust `get_os_type` answer
@@ -676,7 +711,7 @@
 		</div>
 	{/if}
 
-	<div class="title-actions-container {isCollapsed ? 'collapsed' : ''}" data-tauri-drag-region>
+	{#snippet toolbarRow()}
 		{#snippet kebabButton()}
 			<button
 				class="kebab-btn {kebabMenuOpen ? 'active' : ''}"
@@ -1105,7 +1140,13 @@
 				{/if}
 			{/if}
 		{/if}
-	</div>
+	{/snippet}
+
+	{#if !isStacked}
+		<div class="title-actions-container {isCollapsed ? 'collapsed' : ''}" data-tauri-drag-region>
+			{@render toolbarRow()}
+		</div>
+	{/if}
 
 	<div class="window-controls-right" data-tauri-drag-region>
 		{#if !isMac}
@@ -1123,6 +1164,24 @@
 			</button>
 		{/if}
 	</div>
+
+	{#if isStacked}
+		<!--
+			`position: fixed` on `.title-bar-toolbar-row` positions it against
+			the viewport regardless of nesting, so this can stay a child of
+			`.custom-title-bar` — which keeps it inside `toolbarRow`'s own
+			template scope — rather than needing to be a sibling. The parent's
+			own box stays the fixed 36px of row 1; this paints outside it
+			(nothing here clips, since `.custom-title-bar` sets no
+			`overflow`), the way an absolutely-positioned dropdown already
+			does elsewhere in this file.
+		-->
+		<div class="title-bar-toolbar-row {isScrolled ? 'scrolled' : ''}" data-tauri-drag-region>
+			<div class="title-actions-container stacked {isCollapsed ? 'collapsed' : ''}" data-tauri-drag-region>
+				{@render toolbarRow()}
+			</div>
+		</div>
+	{/if}
 </div>
 
 <div class="custom-tooltip {tooltip.visible ? 'visible' : ''} align-{tooltip.align}" style="left: {tooltip.x}px; top: {tooltip.y}px;">
@@ -1226,6 +1285,36 @@
 		margin-left: auto;
 		gap: 4px;
 		z-index: 10000;
+	}
+
+	/*
+	 * Row 2 (see `.title-bar-toolbar-row` below): full window width is this
+	 * row's alone, so the icons sit flush left instead of pushed to the far
+	 * right by `margin-left: auto`, which exists only to fight the tab strip
+	 * for space on row 1.
+	 */
+	.title-actions-container.stacked {
+		margin-left: 8px;
+		margin-right: auto;
+	}
+
+	.title-bar-toolbar-row {
+		height: 32px;
+		background-color: var(--color-canvas-default);
+		display: flex;
+		align-items: center;
+		user-select: none;
+		position: fixed;
+		top: 36px;
+		left: 0;
+		right: 0;
+		z-index: 9998;
+		border-bottom: 1px solid transparent;
+		transition: border-color 0.2s;
+	}
+
+	.title-bar-toolbar-row.scrolled {
+		border-bottom-color: var(--color-border-muted);
 	}
 
 	.kebab-btn {

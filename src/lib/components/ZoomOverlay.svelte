@@ -96,7 +96,7 @@
 <style>
 	.zoom-overlay {
 		position: fixed;
-		top: 36px;
+		top: var(--titlebar-height, 36px);
 		left: 0;
 		right: 0;
 		bottom: 0;

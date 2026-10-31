@@ -126,11 +126,18 @@ test('the floating toc toggle clears whatever chrome the pane puts above the doc
 	// only the whole story in preview. In edit mode the editor toolbar occupies
 	// that strip and the toggle sat on its first button, Bold.
 	//
-	// Both halves of `--pane-top-chrome` are pinned because neither side fails
-	// loudly on its own: a custom property nobody sets falls back to the `0px`
-	// in the `var()`, and a custom property nobody reads is just an unused
-	// declaration. Renaming one side would put the toggle back on top of Bold
-	// with every test still green.
+	// The 48px itself is no longer literal either: the title bar's own height
+	// is `var(--titlebar-height, 36px)` now, because the title bar grows a
+	// second row when the window is not maximized (see `isStacked` in
+	// `TitleBar.svelte`) and a hard-coded 36 here would go stale the moment
+	// that happened without this test's `48px` noticing.
+	//
+	// Both remaining halves — `--pane-top-chrome` and `--titlebar-height` —
+	// are pinned because neither side fails loudly on its own: a custom
+	// property nobody sets falls back to the default in its own `var()`, and
+	// a custom property nobody reads is just an unused declaration. Renaming
+	// one side would put the toggle back on top of Bold, or under the
+	// toolbar row, with every test still green.
 	assert.match(
 		viewer,
 		/--pane-top-chrome:\s*\{paneTopChrome\}px;/,
@@ -138,8 +145,8 @@ test('the floating toc toggle clears whatever chrome the pane puts above the doc
 	);
 	assert.match(
 		viewer,
-		/\.toc-toggle-floating\s*\{[\s\S]*?top:\s*calc\(48px \+ var\(--pane-top-chrome, 0px\)\);/,
-		'the toggle reads it',
+		/\.toc-toggle-floating\s*\{[\s\S]*?top:\s*calc\(var\(--titlebar-height, 36px\) \+ 12px \+ var\(--pane-top-chrome, 0px\)\);/,
+		'the toggle reads both the title bar height and the measured pane chrome',
 	);
 
 	// Measured, not assumed: a second copy of the toolbar's height would go

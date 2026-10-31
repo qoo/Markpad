@@ -149,11 +149,19 @@ test('the outline\'s toggle drops the editor toolbar\'s offset once it is over t
 
 	const base = viewer.match(/\.toc-toggle-floating \{([^}]*)\}/);
 	assert.ok(base, 'the floating toggle rule moved or was renamed');
-	assert.match(base[1], /top:\s*calc\([^)]*--pane-top-chrome/);
+	// `[\s\S]*`, not `[^)]*`: the offset also reads `--titlebar-height`
+	// (the title bar's own height is its call too, see `isStacked` in
+	// `TitleBar.svelte`), whose `var(...)` closes a paren before
+	// `--pane-top-chrome` is reached. A charclass that stops at the first
+	// `)` would stop there and never see it.
+	assert.match(base[1], /top:\s*calc\([\s\S]*--pane-top-chrome/);
 
 	const expanded = viewer.match(/\.toc-toggle-floating\.expanded \{([^}]*)\}/);
 	assert.ok(expanded, 'the expanded rule moved or was renamed');
-	assert.match(expanded[1], /top:\s*\d+px/);
+	// A `calc()` now (title bar height plus the 12px inset), not a bare
+	// literal — but still no `--pane-top-chrome`, which is the one thing
+	// this test exists to check.
+	assert.match(expanded[1], /top:\s*calc\(/);
 	assert.equal(
 		/--pane-top-chrome/.test(expanded[1]),
 		false,

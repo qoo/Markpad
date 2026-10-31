@@ -4386,7 +4386,7 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 
 	.drag-overlay {
 		position: fixed;
-		top: 36px;
+		top: var(--titlebar-height, 36px);
 		left: 0;
 		right: 0;
 		bottom: 0;
@@ -4455,10 +4455,10 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 
 	.loading-screen {
 		position: fixed;
-		top: 36px;
+		top: var(--titlebar-height, 36px);
 		left: 0;
 		width: 100%;
-		height: calc(100% - 36px);
+		height: calc(100% - var(--titlebar-height, 36px));
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -4507,7 +4507,7 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 		position: absolute;
 		top: 0;
 		left: 0;
-		padding-top: 36px;
+		padding-top: var(--titlebar-height, 36px);
 		box-sizing: border-box;
 		overflow: hidden;
 	}
@@ -4628,12 +4628,16 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 
 	/*
 	 * `.layout-container` is absolutely positioned from top: 0, so a bar in
-	 * normal flow would end up underneath it. Pinned just below the 36px
-	 * title bar instead, the way editors surface file-changed-on-disk notices.
+	 * normal flow would end up underneath it. Pinned just below the title
+	 * bar instead, the way editors surface file-changed-on-disk notices.
+	 * `--titlebar-height` rather than a literal 36px: the title bar grows a
+	 * second row (see `TitleBar.svelte`'s `isStacked`) whenever the window is
+	 * not maximized, and this bar would sit half-hidden under that second row
+	 * if it kept assuming 36.
 	 */
 	.external-change-bar {
 		position: fixed;
-		top: 36px;
+		top: var(--titlebar-height, 36px);
 		left: 0;
 		right: 0;
 		z-index: 40000;
@@ -4692,11 +4696,11 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 
 	.toc-overlay-wrapper {
 		position: absolute;
-		top: 36px;
+		top: var(--titlebar-height, 36px);
 		left: 0;
 		bottom: 0;
 		z-index: 1000;
-		height: calc(100% - 36px);
+		height: calc(100% - var(--titlebar-height, 36px));
 		width: var(--toc-width);
 		background-color: var(--color-canvas-default);
 		border-right: 1px solid transparent;
@@ -4755,12 +4759,16 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 	.toc-toggle-floating {
 		position: absolute;
 		/*
-		 * 36px of title bar, a 12px inset, and however tall the editor toolbar
-		 * is right now — 0 when there isn't one. See `paneTopChrome`: the last
-		 * term is measured because the toolbar's height is the toolbar's to
-		 * decide, and a copy of it here would silently go stale.
+		 * The title bar's height, a 12px inset, and however tall the editor
+		 * toolbar is right now — 0 when there isn't one. See `paneTopChrome`:
+		 * the last term is measured because the toolbar's height is the
+		 * toolbar's to decide, and a copy of it here would silently go
+		 * stale. `--titlebar-height` for the same reason: the title bar's
+		 * own height is its call (it grows a second row when the window is
+		 * not maximized, see `isStacked` in `TitleBar.svelte`), and 36px here
+		 * would go stale the same way.
 		 */
-		top: calc(48px + var(--pane-top-chrome, 0px));
+		top: calc(var(--titlebar-height, 36px) + 12px + var(--pane-top-chrome, 0px));
 		left: 8px;
 		width: 28px;
 		height: 28px;
@@ -4801,7 +4809,7 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 	 */
 	.toc-toggle-floating.expanded {
 		left: 24px;
-		top: 48px;
+		top: calc(var(--titlebar-height, 36px) + 12px);
 	}
 
 	.toc-toggle-floating.on-right {
@@ -4867,9 +4875,9 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 
 	.toc-overlay-wrapper.is-pinned {
 		position: absolute; /* Keep it absolute but it will stay in the padded area */
-		top: 36px !important;
+		top: var(--titlebar-height, 36px) !important;
 		left: 0;
-		height: calc(100% - 36px);
+		height: calc(100% - var(--titlebar-height, 36px));
 		background-color: var(--color-canvas-default);
 		border-right: 1px solid var(--color-border-default);
 	}

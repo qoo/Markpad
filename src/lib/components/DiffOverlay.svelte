@@ -111,7 +111,7 @@
 <style>
 	.diff-overlay {
 		position: fixed;
-		inset: 36px 0 0 0;
+		inset: var(--titlebar-height, 36px) 0 0 0;
 		z-index: 40001;
 		display: flex;
 		flex-direction: column;
