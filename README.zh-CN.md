@@ -1,7 +1,7 @@
 <div align="center">
   <img src="src-tauri/icons/128x128.png" width="128" alt="Markpad Icon" />
   <h1>Markpad</h1>
-  <p><b>Markdown 界的记事本</b></p>
+  <p><b>轻如记事本，雅如 Markdown。</b></p>
 
   [![GitHub Release](https://img.shields.io/github/v/release/sftwrdotdev/Markpad?style=flat-square)](https://github.com/sftwrdotdev/Markpad/releases/latest)
 
@@ -25,12 +25,13 @@
 
 **编辑**
 - Monaco —— 与 VS Code 同一个编辑器 —— 并支持 Vim 模式
-- 分屏，两侧按行同步
+- 分屏，可开启两侧按行同步滚动
 - 写链接时自动补全标题，格式工具栏可自定义
 - 图片直接粘贴进文档；文件拖进来即打开
 
 **文档**
 - 多标签页、多窗口、窗口标签，以及会自己回来的会话
+- 主页列出最近的文件；置顶的标签就是一组保存好的文件，随时重新打开
 - 文件在磁盘上被改动时自动重载
 - 导出 HTML、打印 PDF
 - 在标准 Markdown 之外还支持 wikilink、嵌入和提示框 —— 见下面的
@@ -38,7 +39,7 @@
 
 **其余**
 - Windows、macOS、Linux
-- 约 10MB 内存占用，无遥测，自由开源
+- 无遥测，自由开源
 - 26 种界面语言
 
 ## 下载
@@ -49,6 +50,12 @@
 
 ```powershell
 choco install markpad-app
+```
+
+#### macOS（Homebrew）
+
+```bash
+brew install --cask markpad
 ```
 
 #### Linux（Snap）
@@ -74,7 +81,7 @@ sudo snap install markpad
 
 两个 Windows 文件的区别只在装不装：`-setup.exe` 会把 Markpad 装进 Program Files 和开始菜单，不带 `-setup` 的那个放哪儿就在哪儿运行。
 
-> 通过 `.dmg`（macOS）、`*-setup.exe`（Windows NSIS）或 `.AppImage`（Linux）直接安装之后，Markpad 会通过应用内的 *检查更新…*（macOS 在应用菜单，其它平台在设置里）从 GitHub 发行版自更新。Snap 和 Chocolatey 的更新由这两个包管理器负责。
+> 通过 `.dmg` 或 Homebrew（macOS）、`*-setup.exe`（Windows NSIS）或 `.AppImage`（Linux）直接安装之后，Markpad 会通过应用内的 *检查更新…*（macOS 在应用菜单，其它平台在设置里）从 GitHub 发行版自更新。Snap 和 Chocolatey 的更新由这两个包管理器负责。
 >
 > **`.deb` 和 `.rpm` 是一次性安装。** `tauri-plugin-updater` 替换不了由包管理器装上的文件，也没有 apt 或 dnf 源可以更新 —— 升级要去发行页面下载新的安装包。*检查更新…* 会认出这类安装并直接告诉你。
 

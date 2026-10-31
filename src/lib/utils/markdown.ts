@@ -1,5 +1,6 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { assignFoldKey, isFolded } from "./foldState.js";
+import { isOffHostUncPath } from "./markdownLinks.js";
 import { parseSourceposLineRange } from "./previewAnchor.js";
 import { carrySourcepos } from "./richContent.js";
 
@@ -24,7 +25,7 @@ const alertIcons: Record<string, string> = {
  * ./markdownLinks.ts, which resolves an *href*. The two were named alike and
  * differ in three ways that are each right for one caller and wrong for the
  * other, so `the path resolver for documents and the one for hrefs differ on
- * purpose` in scripts/exportHtml.test.ts pins the differences rather than
+ * purpose` in scripts/export.test.ts pins the differences rather than
  * papering over them:
  *
  *   - `\` separates here, in the relative half too: a Windows author writes
@@ -85,6 +86,18 @@ function replaceWithYoutubeLink(element: Element, videoId: string, href: string)
 	element.replaceWith(link);
 }
 
+/**
+ * A link whose text is its URL: comrak's autolink, where a bare `www.` gains
+ * `http://` in the href. `$select=Name&$top=2` in such a URL is a query, not
+ * math. `autolink_ranges` in src-tauri/src/markdown.rs keeps the backend from
+ * masking it for the same reason.
+ */
+function isAutolink(link: Element): boolean {
+	const href = link.getAttribute("href");
+	const text = link.textContent;
+	return href === text || href === `http://${text}`;
+}
+
 function processInlineMath(root: Element) {
 	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
 		acceptNode(node) {
@@ -93,6 +106,8 @@ function processInlineMath(root: Element) {
 				if (curr.hasAttribute("data-math"))
 					return NodeFilter.FILTER_REJECT;
 				if (["CODE", "PRE", "SCRIPT", "STYLE"].includes(curr.tagName))
+					return NodeFilter.FILTER_REJECT;
+				if (curr.tagName === "A" && isAutolink(curr))
 					return NodeFilter.FILTER_REJECT;
 				curr = curr.parentElement;
 			}
@@ -105,7 +120,7 @@ function processInlineMath(root: Element) {
 	while ((node = walker.nextNode())) {
 		const text = (node as Text).nodeValue || "";
 		if (text.includes("$")) {
-			const newText = convertInlineMathDelimiters(text);
+			const newText = convertInlineMathDelimiters(text).text;
 			if (newText !== text) toReplace.push({ node: node as Text, newText });
 		}
 	}
@@ -117,11 +132,97 @@ function processInlineMath(root: Element) {
 function processDisplayMathBlocks(root: Element, doc: Document) {
 	for (const element of Array.from(root.querySelectorAll("p, li"))) {
 		const math = extractDisplayMathBlock(element);
-		if (!math) continue;
+		if (!math) {
+			processDisplayMathRuns(element, doc);
+			continue;
+		}
 
 		element.setAttribute("data-math", "display");
 		element.setAttribute("data-math-source", math);
 		element.replaceChildren(doc.createTextNode(math));
+	}
+}
+
+/** What may follow a closing `$$` in a tight list item: a block on its own line. */
+const BLOCK_AFTER_DISPLAY_CLOSER = /^(BR|UL|OL|BLOCKQUOTE|PRE|TABLE|HR|DIV)$/;
+
+function tagOf(node: Node | null): string {
+	return node?.nodeType === Node.ELEMENT_NODE ? (node as Element).tagName : "";
+}
+
+/**
+ * Renders a `$$` block that shares its paragraph with prose:
+ *
+ *     The formula
+ *     $$
+ *     x^2
+ *     $$
+ *     is nice.
+ *
+ * With no blank line around it, the block is part of the paragraph, and
+ * `render.hardbreaks` turns every line of it into a text node between two
+ * `<br>`s. `extractDisplayMathBlock` wants the whole element to be the
+ * formula and `processInlineMath` only ever sees one line, so the formula was
+ * shown as its source.
+ *
+ * The rule is the multi-line half of `find_display_close` in
+ * src-tauri/src/markdown.rs, which already hid exactly these lines from
+ * comrak: an opening `$$` with nothing after it on its line, then lines up to
+ * the first one that is `$$` alone. A code span anywhere in between ends the
+ * search, as a code region does there. Text before the opener and after the
+ * closer stays prose.
+ */
+function processDisplayMathRuns(element: Element, doc: Document) {
+	let node = element.firstChild;
+	while (node) {
+		const openerBreak = node.nextSibling;
+		const opener =
+			node.nodeType === Node.TEXT_NODE && tagOf(openerBreak) === "BR"
+				? convertInlineMathDelimiters(node.nodeValue || "").opener
+				: -1;
+		if (opener === -1) {
+			node = node.nextSibling;
+			continue;
+		}
+
+		const lines: string[] = [];
+		let closer: Node | null = null;
+		for (let line = openerBreak!.nextSibling; line?.nodeType === Node.TEXT_NODE; ) {
+			const next: Node | null = line.nextSibling;
+			const value = (line.nodeValue || "").replace(/^\n/, "");
+			if (
+				value.trim() === "$$" &&
+				(!next || BLOCK_AFTER_DISPLAY_CLOSER.test(tagOf(next)))
+			) {
+				closer = line;
+				break;
+			}
+			if (tagOf(next) !== "BR") break;
+			lines.push(value);
+			line = next!.nextSibling;
+		}
+		const math = lines.join("\n").trim();
+		if (!closer || !math) {
+			node = node.nextSibling;
+			continue;
+		}
+
+		const span = doc.createElement("span");
+		span.setAttribute("data-math", "display");
+		span.setAttribute("data-math-source", math);
+		span.appendChild(doc.createTextNode(math));
+		// The formula is a block of its own; a `<br>` straight after it would
+		// draw an empty line.
+		let after = closer.nextSibling;
+		if (tagOf(after) === "BR") after = after!.nextSibling;
+		for (let drop = openerBreak!; drop !== after; ) {
+			const next = drop.nextSibling!;
+			drop.parentNode!.removeChild(drop);
+			drop = next;
+		}
+		node.nodeValue = (node.nodeValue || "").slice(0, opener);
+		element.insertBefore(span, after);
+		node = after;
 	}
 }
 
@@ -171,9 +272,14 @@ function extractDisplayMathBlock(element: Element): string | null {
  * src-tauri/src/markdown.rs hides the escape from comrak for exactly this
  * moment.
  */
-function convertInlineMathDelimiters(text: string): string {
+function convertInlineMathDelimiters(text: string): {
+	text: string;
+	/** Where an unclosed `$$` with nothing after it starts, or -1. */
+	opener: number;
+} {
 	const parts: string[] = [];
 	let index = 0;
+	let opener = -1;
 	// Allows adjacent inline spans like `$a$$b$` without treating `$$` display
 	// delimiters as inline math openings.
 	let previousDollarAllowsInlineOpen = false;
@@ -215,6 +321,7 @@ function convertInlineMathDelimiters(text: string): string {
 				continue;
 			}
 
+			if (!text.slice(index + 2).trim()) opener = index;
 			parts.push("$$");
 			previousDollarAllowsInlineOpen = false;
 			index += 2;
@@ -246,7 +353,7 @@ function convertInlineMathDelimiters(text: string): string {
 		previousDollarAllowsInlineOpen = true;
 	}
 
-	return parts.join("");
+	return { text: parts.join(""), opener };
 }
 
 function findDisplayMathEnd(text: string, start: number): number {
@@ -294,54 +401,9 @@ function processBlockIds(root: Element, doc: Document) {
 		anchor.setAttribute("aria-hidden", "true");
 		el.replaceWith(anchor);
 	}
-
-	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-		acceptNode(node) {
-			const parent = node.parentElement;
-			if (!parent) return NodeFilter.FILTER_REJECT;
-			if (
-				[
-					"CODE",
-					"PRE",
-					"SCRIPT",
-					"STYLE",
-					"H1",
-					"H2",
-					"H3",
-					"H4",
-					"H5",
-					"H6",
-				].includes(parent.tagName)
-			)
-				return NodeFilter.FILTER_REJECT;
-			return NodeFilter.FILTER_ACCEPT;
-		},
-	});
-
-	const blockIdPattern = / \^([a-zA-Z0-9_-]+)\s*$/;
-	const nodes: { node: Text; id: string }[] = [];
-	let textNode: Node | null;
-	while ((textNode = walker.nextNode())) {
-		const text = (textNode as Text).nodeValue || "";
-		const match = text.match(blockIdPattern);
-		if (match) nodes.push({ node: textNode as Text, id: match[1] });
-	}
-
-	for (const { node, id } of nodes) {
-		const text = node.nodeValue || "";
-		const cleanText = text.replace(blockIdPattern, "");
-		const anchor = doc.createElement("a");
-		anchor.id = id;
-		anchor.className = "block-id-anchor";
-		anchor.setAttribute("data-label", id);
-		anchor.setAttribute("aria-hidden", "true");
-		const parent = node.parentNode;
-		if (parent) {
-			const textBefore = doc.createTextNode(cleanText);
-			parent.replaceChild(anchor, node);
-			parent.insertBefore(textBefore, anchor);
-		}
-	}
+	// A trailing ` ^id` in text is the renderer's to rewrite (BLOCK_ID_RE in
+	// markdown.rs), and it already has: one still in the text was left alone
+	// on purpose, so nothing here matches it again.
 }
 
 const taskTextBoundaryTags = new Set([
@@ -379,12 +441,21 @@ const taskTextBoundaryTags = new Set([
 	"UL",
 ]);
 
+/**
+ * Blank the way HTML means it: ASCII whitespace only. JS `\s` and `trim()` also
+ * match U+00A0, which a writer types on purpose, to keep an empty line
+ * Markdown would collapse or to indent text (#843).
+ */
+function isBlank(text: string | null | undefined): boolean {
+	return /^[ \t\n\f\r]*$/.test(text ?? "");
+}
+
 function stripLeadingWhitespace(nodes: Node[]) {
 	for (let index = 0; index < nodes.length; ) {
 		const node = nodes[index];
 		if (node.nodeType !== 3) break;
 
-		const trimmed = node.textContent?.replace(/^\s+/, "") || "";
+		const trimmed = node.textContent?.replace(/^[ \t\n\f\r]+/, "") || "";
 		if (trimmed) {
 			node.textContent = trimmed;
 			break;
@@ -392,6 +463,40 @@ function stripLeadingWhitespace(nodes: Node[]) {
 		node.parentNode?.removeChild(node);
 		nodes.splice(index, 1);
 	}
+}
+
+// A tight task item keeps its text bare, so text that follows a block inside
+// it (`- [ ] a` / fenced code / `then b`) is a bare text node of the `<li>`.
+// The item is a grid, CSS can only place elements, and an anonymous grid item
+// lands in the 15px checkbox column: one letter per line (#832). Wrap every
+// such run, inline elements included, the way the first line already is.
+function wrapTextAfterTaskBlocks(li: Element) {
+	let run: Node[] = [];
+	const flush = () => {
+		if (run.some((n) => n.nodeType !== 3 || !isBlank(n.textContent))) {
+			const wrapper = li.ownerDocument!.createElement("span");
+			wrapper.className = "task-text";
+			li.insertBefore(wrapper, run[0]);
+			stripLeadingWhitespace(run);
+			for (const n of run) wrapper.appendChild(n);
+		}
+		run = [];
+	};
+
+	for (const n of Array.from(li.childNodes)) {
+		const el = n.nodeType === 1 ? (n as Element) : null;
+		if (
+			el &&
+			(taskTextBoundaryTags.has(el.tagName) ||
+				el.tagName === "INPUT" ||
+				el.classList.contains("task-text"))
+		) {
+			flush();
+			continue;
+		}
+		run.push(n);
+	}
+	flush();
 }
 
 function processTaskItems(root: Element) {
@@ -436,14 +541,14 @@ function processTaskItems(root: Element) {
 		const inlineNodes: Node[] = [];
 		let paragraphNode: Element | null = null;
 		for (const n of afterInput) {
-			if (n.nodeType === 3 && !n.textContent?.trim()) {
+			if (n.nodeType === 3 && isBlank(n.textContent)) {
 				inlineNodes.push(n);
 				continue;
 			}
 
 			if (n.nodeType === 1 && taskTextBoundaryTags.has((n as Element).tagName)) {
 				const onlyLeadingWhitespace = inlineNodes.every(
-					(node) => node.nodeType === 3 && !node.textContent?.trim(),
+					(node) => node.nodeType === 3 && isBlank(node.textContent),
 				);
 				if ((n as Element).tagName === "P" && onlyLeadingWhitespace) {
 					paragraphNode = n as Element;
@@ -454,13 +559,13 @@ function processTaskItems(root: Element) {
 		}
 
 		const hasInlineText = inlineNodes.some(
-			(n) => n.nodeType !== 3 || n.textContent?.trim(),
+			(n) => n.nodeType !== 3 || !isBlank(n.textContent),
 		);
 		if (paragraphNode) {
 			stripLeadingWhitespace(inlineNodes);
 			const paragraphChildren = Array.from(paragraphNode.childNodes);
 			const hasParagraphText = paragraphChildren.some(
-				(n) => n.nodeType !== 3 || n.textContent?.trim(),
+				(n) => n.nodeType !== 3 || !isBlank(n.textContent),
 			);
 			if (!hasParagraphText) {
 				paragraphNode.remove();
@@ -481,6 +586,8 @@ function processTaskItems(root: Element) {
 		} else {
 			stripLeadingWhitespace(inlineNodes);
 		}
+
+		wrapTextAfterTaskBlocks(li);
 
 		if ((input as HTMLInputElement).checked) {
 			li.classList.add("task-done");
@@ -582,21 +689,39 @@ export function processMarkdownHtml(
 ): string {
 	const parser = new DOMParser();
 	const doc = parser.parseFromString(html, "text/html");
+	processBlockMarkup(doc.body, filePath);
+	wrapHeadings(Array.from(doc.body.querySelectorAll(".foldable-header")), { next: 0 });
+	applyFolds(doc.body, foldOverrides);
+	return doc.body.innerHTML;
+}
 
-	// The keys handed out in THIS render, shared by the callout pass and the
-	// heading pass below so that neither can hand out a key the other used.
-	const foldKeys = new Set<string>();
+/** `+` or `-`, on a foldable callout: what the document opens it as. */
+const CALLOUT_FOLD_ATTR = "data-callout-fold";
 
-	for (const img of doc.querySelectorAll("img")) {
+/**
+ * Everything `processMarkdownHtml` does that only looks inside one top-level
+ * block. Fold keys and the heading wrappers need the whole document and are
+ * `applyFolds` and `wrapHeadings`.
+ */
+export function processBlockMarkup(root: Element, filePath: string): void {
+	const doc = root.ownerDocument;
+	for (const img of root.querySelectorAll("img")) {
 		const src = img.getAttribute("src");
 		let finalSrc = src;
 		if (src && !src.startsWith("http") && !src.startsWith("data:")) {
 			try {
 				const decodedSrc = decodeURIComponent(src);
-				finalSrc = convertFileSrc(
-					resolveDocumentRelativePath(filePath, decodedSrc),
-				);
-				img.setAttribute("src", finalSrc);
+				const resolved = resolveDocumentRelativePath(filePath, decodedSrc);
+				// Rendering alone fetches this, so a UNC path on another host
+				// would leak the user's NTLM hash without a click. Left as
+				// written, `//host/x` would instead load as a web address.
+				if (isOffHostUncPath(resolved, filePath)) {
+					finalSrc = null;
+					img.removeAttribute("src");
+				} else {
+					finalSrc = convertFileSrc(resolved);
+					img.setAttribute("src", finalSrc);
+				}
 			} catch (e) {
 				console.error("Failed to decode/resolve image src:", src, e);
 			}
@@ -612,7 +737,7 @@ export function processMarkdownHtml(
 			if (isVideo || isAudio) {
 				const media = doc.createElement(isVideo ? "video" : "audio");
 				media.setAttribute("controls", "");
-				media.setAttribute("src", finalSrc || "");
+				if (finalSrc) media.setAttribute("src", finalSrc);
 				media.style.maxWidth = "100%";
 				carrySourcepos(img, media);
 
@@ -636,7 +761,7 @@ export function processMarkdownHtml(
 		}
 	}
 
-	for (const a of doc.querySelectorAll("a")) {
+	for (const a of root.querySelectorAll("a")) {
 		const href = a.getAttribute("href");
 		if (href && isYoutubeLink(href)) {
 			const parent = a.parentElement;
@@ -658,7 +783,7 @@ export function processMarkdownHtml(
 			let prev = br.previousSibling;
 			let isLeading = true;
 			while (prev) {
-				if (prev.nodeType === 3 && prev.textContent?.replace(/\xA0|\s|&nbsp;/g, "").trim()) {
+				if (prev.nodeType === 3 && !isBlank(prev.textContent)) {
 					isLeading = false;
 					break;
 				} else if (prev.nodeType === 1) {
@@ -675,9 +800,9 @@ export function processMarkdownHtml(
 		// Also clean up leading empty text nodes and paragraphs
 		while (node.firstChild) {
 			const child = node.firstChild;
-			if (child.nodeType === 3 && child.textContent?.replace(/\xA0|\s|&nbsp;/g, "").trim() === "") {
+			if (child.nodeType === 3 && isBlank(child.textContent)) {
 				child.parentElement?.removeChild(child);
-			} else if (child.nodeType === 1 && (child as Element).tagName === "P" && (child as Element).innerHTML.replace(/\xA0|\s|&nbsp;/g, "").trim() === "") {
+			} else if (child.nodeType === 1 && (child as Element).tagName === "P" && isBlank((child as Element).innerHTML)) {
 				child.parentElement?.removeChild(child);
 			} else {
 				break;
@@ -685,21 +810,14 @@ export function processMarkdownHtml(
 		}
 	};
 
-	// parse callouts
-	for (const bq of Array.from(doc.querySelectorAll("blockquote"))) {
-		const walker = doc.createTreeWalker(bq, NodeFilter.SHOW_TEXT);
-		let textNode: Text | null = null;
-		let matchResult: RegExpMatchArray | null = null;
-		
-		let curr: Node | null;
-		while (curr = walker.nextNode()) {
-			const m = curr.nodeValue?.match(/^\s*\[!([a-zA-Z0-9_\-]+)\]([+-]?)\s*/i);
-			if (m) {
-				textNode = curr as Text;
-				matchResult = m;
-				break;
-			}
-		}
+	for (const bq of Array.from(root.querySelectorAll("blockquote"))) {
+		// Only the text the quote's first paragraph opens with is a marker, as
+		// in Obsidian and GitHub: `[!note]` in code or a nested quote is text.
+		let first = bq.firstChild;
+		while (first && first.nodeType === 3 && isBlank(first.textContent)) first = first.nextSibling;
+		const lead = first?.nodeType === 1 && (first as Element).tagName === "P" ? first.firstChild : null;
+		const matchResult = lead?.nodeType === 3 ? lead.nodeValue?.match(/^\s*\[!([a-zA-Z0-9_\-]+)\]([+-]?)\s*/i) : null;
+		const textNode = matchResult ? (lead as Text) : null;
 
 		if (textNode && matchResult) {
 			const type = matchResult[1].toLowerCase();
@@ -780,36 +898,21 @@ export function processMarkdownHtml(
 			if (contentInner.childNodes.length === 0) {
 				container.classList.add("callout-title-only");
 			} else {
-				// A callout the reader folds is remembered exactly like a
-				// heading, and `> [!note]-` is the document's opening position
-				// rather than a state of its own — see `foldState.ts`. A
-				// title-only callout hides nothing and so is not a fold at all,
-				// which is why the key is assigned in this branch.
-				if (isFoldable) {
-					const key = assignFoldKey(container, foldKeys);
-					if (isFolded(foldOverrides, key, fold === "-")) {
-						contentWrapper.classList.add("is-collapsed");
-						container.classList.add("is-collapsed");
-					}
-				}
+				// The fold key is the document's to hand out: see `applyFolds`.
+				if (isFoldable) container.setAttribute(CALLOUT_FOLD_ATTR, fold);
 				container.appendChild(contentWrapper);
 			}
 			bq.replaceWith(container);
 		}
 	}
 
-	processDisplayMathBlocks(doc.body, doc);
-	processBlockIds(doc.body, doc);
-	processTaskItems(doc.body);
-	processInlineMath(doc.body);
-	processSoftLineAnchors(doc.body, doc);
+	processDisplayMathBlocks(root, doc);
+	processBlockIds(root, doc);
+	processTaskItems(root);
+	processInlineMath(root);
+	processSoftLineAnchors(root, doc);
 
-	const headings = Array.from(doc.querySelectorAll("h1, h2, h3, h4, h5, h6"));
-	// The heading↔wrapper pairing only needs to be unique within this
-	// render's output (the previous DOM is replaced wholesale), so a
-	// counter keeps the HTML deterministic for identical input.
-	let nextFoldId = 0;
-	for (const h of headings) {
+	for (const h of Array.from(root.querySelectorAll("h1, h2, h3, h4, h5, h6"))) {
 		// comrak puts the deduplicated heading id ("title", "title-1", ...)
 		// on an empty inner <a class="anchor">, so h.id is empty and the fold
 		// key falls all the way back to the heading text — which collides for
@@ -827,13 +930,26 @@ export function processMarkdownHtml(
 		chevron.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
 		h.insertBefore(chevron, h.firstChild);
 		h.classList.add("foldable-header");
+	}
 
-		const wrapper = doc.createElement("div");
-		wrapper.className = "foldable-content-wrapper";
-		const inner = doc.createElement("div");
-		inner.className = "content-inner";
-		wrapper.appendChild(inner);
+	// Clean up empty paragraphs that might be leftovers from blank lines
+	Array.from(root.querySelectorAll("p")).forEach((p) => {
+		if (isBlank(p.innerHTML)) {
+			p.remove();
+		}
+	});
+}
 
+/**
+ * Moves what follows each heading, up to the next heading of the same or a
+ * higher level, into the heading's `.foldable-content-wrapper`.
+ *
+ * `heads` in document order. Returns the wrappers it made.
+ */
+export function wrapHeadings(heads: Element[], ids: FoldIds): HTMLElement[] {
+	const made: HTMLElement[] = [];
+	for (const h of heads) {
+		const { wrapper, inner } = makeFoldWrapper(h.ownerDocument, h, ids);
 		let current = h.nextElementSibling;
 		const level = parseInt(h.tagName[1], 10);
 		while (current) {
@@ -847,24 +963,55 @@ export function processMarkdownHtml(
 			current = next;
 		}
 		if (h.parentNode) h.parentNode.insertBefore(wrapper, h.nextSibling);
-
-		const mappingId = "wrap-" + nextFoldId++;
-		h.setAttribute("data-fold-target", mappingId);
-		wrapper.id = mappingId;
-
-		const key = assignFoldKey(h, foldKeys);
-		if (isFolded(foldOverrides, key)) {
-			h.classList.add("is-collapsed");
-			wrapper.classList.add("is-collapsed");
-		}
+		made.push(wrapper);
 	}
+	return made;
+}
 
-	// Clean up empty paragraphs that might be leftovers from blank lines
-	Array.from(doc.querySelectorAll("p")).forEach((p) => {
-		if (p.innerHTML.replace(/&nbsp;|\s/g, "").trim() === "") {
-			p.remove();
-		}
-	});
+/** Where the `wrap-N` ids of one document have got to. */
+export interface FoldIds { next: number }
 
-	return doc.body.innerHTML;
+export function makeFoldWrapper(doc: Document, h: Element, ids: FoldIds) {
+	const wrapper = doc.createElement("div");
+	wrapper.className = "foldable-content-wrapper";
+	const inner = doc.createElement("div");
+	inner.className = "content-inner";
+	wrapper.appendChild(inner);
+	// Only has to be unique within the live document.
+	const mappingId = "wrap-" + ids.next++;
+	h.setAttribute("data-fold-target", mappingId);
+	wrapper.id = mappingId;
+	return { wrapper, inner };
+}
+
+/**
+ * Hands out every fold key in `root`, callouts first and then headings, in
+ * document order, and sets each fold's collapsed state from `foldOverrides`.
+ * With `onlyChanged`, a fold whose key did not change keeps the state it has,
+ * which may be one the reader toggled.
+ */
+export function applyFolds(root: Element, foldOverrides: Set<string>, onlyChanged = false): void {
+	const foldKeys = new Set<string>();
+	for (const container of Array.from(root.querySelectorAll(`.callout-foldable[${CALLOUT_FOLD_ATTR}]`))) {
+		// A title-only callout hides nothing, so it is not a fold.
+		const content = Array.from(container.childNodes).find(
+			(child): child is Element =>
+				child.nodeType === 1 && (child as Element).classList.contains("markdown-alert-content"),
+		);
+		if (!content) continue;
+		const before = container.getAttribute("data-fold-key");
+		const key = assignFoldKey(container, foldKeys);
+		if (onlyChanged && before === key) continue;
+		const folded = isFolded(foldOverrides, key, container.getAttribute(CALLOUT_FOLD_ATTR) === "-");
+		container.classList.toggle("is-collapsed", folded);
+		content.classList.toggle("is-collapsed", folded);
+	}
+	for (const h of Array.from(root.querySelectorAll(".foldable-header[data-fold-target]"))) {
+		const before = h.getAttribute("data-fold-key");
+		const key = assignFoldKey(h, foldKeys);
+		if (onlyChanged && before === key) continue;
+		const folded = isFolded(foldOverrides, key);
+		h.classList.toggle("is-collapsed", folded);
+		h.nextElementSibling?.classList.toggle("is-collapsed", folded);
+	}
 }

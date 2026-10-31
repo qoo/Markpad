@@ -1,4 +1,6 @@
-import { invoke } from '@tauri-apps/api/core';
+import { commands, type SemanticKind } from '../bindings.js';
+
+import { frontMatterFenceLines } from './frontMatter.js';
 
 /**
  * The editor's second colouring layer: what the renderer says is really there.
@@ -32,6 +34,7 @@ export const TOKEN_TYPES = [
 	'code',
 	'strong',
 	'emph',
+	'strongemph',
 	'strike',
 	'highlight',
 	'insert',
@@ -51,6 +54,28 @@ export const TOKEN_TYPES = [
  * (`standaloneThemeService.getTokenStyleMetadata`).
  */
 export const TOKEN_MODIFIERS = ['marker'] as const;
+
+/**
+ * Every kind Rust's `SemanticKind` can emit, at runtime: the generated type is
+ * erased, and the theme rules are checked against each of these. The two
+ * assertions below make a kind missing here, or one Rust no longer emits, a
+ * svelte-check error.
+ */
+export const SEMANTIC_KINDS = [
+	'heading', 'heading.marker', 'list.marker', 'task.marker', 'quote.marker', 'rule', 'fence',
+	'frontmatter', 'table.marker', 'code', 'code.marker', 'strong', 'strong.marker', 'emph',
+	'emph.marker', 'strongemph', 'strike', 'strike.marker', 'highlight', 'highlight.marker',
+	'insert', 'insert.marker', 'link', 'link.marker', 'image', 'image.marker', 'math',
+	'math.marker', 'wikilink', 'wikilink.marker', 'footnote', 'html',
+] as const satisfies readonly SemanticKind[];
+const everyKindListed: [Exclude<SemanticKind, (typeof SEMANTIC_KINDS)[number]>] extends [never] ? true : never = true;
+
+/** A kind's token type: `heading.marker` is the `heading` type with the `marker` modifier. */
+type TokenTypeOf<Kind extends string> = Kind extends `${infer Type}.marker` ? Type : Kind;
+/** A kind the legend does not list is dropped by the encoder, silently and only for that construct. */
+const everyKindInTheLegend: [Exclude<TokenTypeOf<SemanticKind>, (typeof TOKEN_TYPES)[number]>] extends [never] ? true : never = true;
+void everyKindListed;
+void everyKindInTheLegend;
 
 export type SemanticSpan = { kind: string; line: number; start: number; len: number };
 
@@ -106,7 +131,8 @@ export function createMarkdownSemanticTokensProvider(monaco: typeof import('mona
 		const version = model.getVersionId();
 		if (cache && cache.uri === uri && cache.version === version) return cache.tokens;
 
-		const spans = (await invoke('markdown_semantic_spans', { content: model.getValue() })) as SemanticSpan[];
+		const content = model.getValue();
+		const spans = await commands.markdownSemanticSpans(content, frontMatterFenceLines(content));
 		// The model can have moved on while Rust was parsing. Returning tokens
 		// for text that is no longer there would paint the wrong ranges, so the
 		// stale answer is cached against its own version and Monaco asks again.

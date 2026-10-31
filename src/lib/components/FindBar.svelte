@@ -4,23 +4,32 @@
 	import { t } from '../utils/i18n.js';
 	import type { LanguageCode } from '../utils/i18n.js';
 	import { collapsedFoldsAround } from '../utils/foldState.js';
+	import { FOLD_TRANSITION_MS } from '../utils/foldLayout.js';
 	import { settings } from '../stores/settings.svelte.js';
 	import { jumpScrollBehavior } from '../utils/motion.js';
+	import { findMatches, markMatches } from '../utils/findText.js';
 
 	// Stepping between matches is a jump, so it answers the same preference the
 	// table of contents and back/forward do.
-	const jumpBehavior = $derived(
-		jumpScrollBehavior(settings.animateJumpScroll, settings.systemReducedMotion),
-	);
+	const jumpBehavior = $derived(jumpScrollBehavior(settings.animateJumpScroll));
 
 	let {
 		open = $bindable(false),
-		markdownBody,
+		contentRoot,
 		onunfold,
 		language,
 	} = $props<{
 		open: boolean;
-		markdownBody: HTMLElement | null;
+		/**
+		 * The element holding the document being read — the active tab's
+		 * `.markdown-blocks`, not the `.markdown-body` article around it. The
+		 * article now holds one such host per open tab and all but one of them
+		 * are `display: none`, so a search rooted there would count, highlight
+		 * and step through matches in documents the reader cannot see. Find
+		 * never needs the scroller: it reveals a match with `scrollIntoView` on
+		 * the mark itself.
+		 */
+		contentRoot: HTMLElement | null;
 		/** Open the fold with this key. Only the owner of the fold state can. */
 		onunfold?: (key: string) => void;
 		/**
@@ -45,9 +54,6 @@
 	// (content the browser cannot reveal, `display: none`, is not matched at
 	// all). So the matches stay in the count and the fold opens on the way to
 	// them.
-	//
-	// styles.css animates the fold height for 0.25s.
-	const FOLD_TRANSITION_MS = 300;
 
 	let inputEl = $state<HTMLInputElement>();
 	let query = $state('');
@@ -60,8 +66,9 @@
 
 	function isHostElement(el: Element | null): boolean {
 		if (!el) return false;
-		// Skip elements whose text is not user-visible (script/style/noscript)
-		// and our own find marks (to avoid re-walking already-highlighted text).
+		// Skip elements whose text is not user-visible (script/style/noscript,
+		// KaTeX's hidden MathML copy of each formula) and our own find marks
+		// (to avoid re-walking already-highlighted text).
 		// CODE and PRE intentionally NOT skipped: code blocks contain real
 		// content the user expects to be searchable, even when highlight.js
 		// has wrapped tokens in nested <span>s.
@@ -70,6 +77,7 @@
 			tag === 'SCRIPT' ||
 			tag === 'STYLE' ||
 			tag === 'NOSCRIPT' ||
+			el.classList.contains('katex-mathml') ||
 			el.classList.contains(FIND_MARK_CLASS)
 		);
 	}
@@ -99,7 +107,7 @@
 	 * function.
 	 */
 	function revealFoldsAround(mark: HTMLElement): boolean {
-		const root = markdownBody as HTMLElement | null;
+		const root = contentRoot as HTMLElement | null;
 		if (!root) return false;
 
 		// Outermost first, so a nested fold is already on screen by the time its
@@ -110,7 +118,7 @@
 	}
 
 	export function clearHighlights() {
-		const root = markdownBody as HTMLElement | null;
+		const root = contentRoot as HTMLElement | null;
 		if (!root) return;
 		const marks = Array.from(
 			root.querySelectorAll(`mark.${FIND_MARK_CLASS}`),
@@ -124,33 +132,8 @@
 		}
 	}
 
-	function findInTextNode(text: string, needle: string): number[] {
-		// returns array of start indices for non-overlapping matches
-		const indices: number[] = [];
-		if (!needle) return indices;
-		const haystack = caseSensitive ? text : text.toLowerCase();
-		const search = caseSensitive ? needle : needle.toLowerCase();
-		let from = 0;
-		while (from <= haystack.length - search.length) {
-			const i = haystack.indexOf(search, from);
-			if (i === -1) break;
-			if (wholeWord) {
-				const before = i === 0 ? '' : haystack.charAt(i - 1);
-				const after = haystack.charAt(i + search.length);
-				const isBoundary = (c: string) => c === '' || !/[\p{L}\p{N}_]/u.test(c);
-				if (!isBoundary(before) || !isBoundary(after)) {
-					from = i + 1;
-					continue;
-				}
-			}
-			indices.push(i);
-			from = i + search.length;
-		}
-		return indices;
-	}
-
 	function applyHighlights() {
-		if (!markdownBody) {
+		if (!contentRoot) {
 			matchCount = 0;
 			activeIndex = -1;
 			truncated = false;
@@ -164,57 +147,16 @@
 			return;
 		}
 
-		const root = markdownBody;
-		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-			acceptNode(node: Node) {
-				const text = (node as Text).nodeValue;
-				if (!text) return NodeFilter.FILTER_REJECT;
-				if (isInsideHost(node, root)) return NodeFilter.FILTER_REJECT;
-				return NodeFilter.FILTER_ACCEPT;
-			},
-		});
-
-		let total = 0;
-		let hitCap = false;
-
-		// Walk and process in a single pass. We advance the walker BEFORE
-		// mutating each text node so its internal currentNode never points
-		// at a detached node — replaceChild on the previous text node would
-		// otherwise leave the walker in an undefined state.
-		let textNode = walker.nextNode() as Text | null;
-		while (textNode) {
-			const next = walker.nextNode() as Text | null;
-
-			const text = textNode.nodeValue || '';
-			const indices = findInTextNode(text, query);
-			if (indices.length > 0) {
-				const parent = textNode.parentNode;
-				if (parent) {
-					const doc = textNode.ownerDocument || document;
-					const frag = doc.createDocumentFragment();
-					let cursor = 0;
-					let breakOut = false;
-					for (const i of indices) {
-						if (total >= MAX_MATCHES) {
-							hitCap = true;
-							breakOut = true;
-							break;
-						}
-						if (i > cursor) frag.appendChild(doc.createTextNode(text.slice(cursor, i)));
-						const mark = doc.createElement('mark');
-						mark.className = FIND_MARK_CLASS;
-						mark.textContent = text.slice(i, i + query.length);
-						frag.appendChild(mark);
-						cursor = i + query.length;
-						total++;
-					}
-					if (cursor < text.length) frag.appendChild(doc.createTextNode(text.slice(cursor)));
-					parent.replaceChild(frag, textNode);
-					if (breakOut) break;
-				}
-			}
-			textNode = next;
-		}
+		const root = contentRoot;
+		const { matches, truncated: hitCap } = findMatches(
+			root,
+			query,
+			{ caseSensitive, wholeWord },
+			(node) => isInsideHost(node, root),
+			MAX_MATCHES,
+		);
+		markMatches(matches, FIND_MARK_CLASS);
+		const total = matches.length;
 
 		matchCount = total;
 		truncated = hitCap;
@@ -226,25 +168,33 @@
 		}
 	}
 
-	function getMarks(): HTMLElement[] {
-		const root = markdownBody as HTMLElement | null;
+	/** The marks of each match, in order: one per text node the match covers. */
+	function getMatches(): HTMLElement[][] {
+		const root = contentRoot as HTMLElement | null;
 		if (!root) return [];
-		return Array.from(
-			root.querySelectorAll(`mark.${FIND_MARK_CLASS}`),
-		) as HTMLElement[];
+		const groups = new Map<string, HTMLElement[]>();
+		for (const mark of root.querySelectorAll<HTMLElement>(`mark.${FIND_MARK_CLASS}`)) {
+			const key = mark.dataset.findMatch ?? '';
+			const group = groups.get(key);
+			if (group) group.push(mark);
+			else groups.set(key, [mark]);
+		}
+		return [...groups.values()];
 	}
 
 	function setActive(index: number, scroll: boolean = true) {
-		const marks = getMarks();
-		if (marks.length === 0) {
+		const matches = getMatches();
+		if (matches.length === 0) {
 			activeIndex = -1;
 			return;
 		}
-		const safe = ((index % marks.length) + marks.length) % marks.length;
-		marks.forEach((m, i) => m.classList.toggle(FIND_MARK_ACTIVE_CLASS, i === safe));
+		const safe = ((index % matches.length) + matches.length) % matches.length;
+		matches.forEach((marks, i) => {
+			for (const m of marks) m.classList.toggle(FIND_MARK_ACTIVE_CLASS, i === safe);
+		});
 		activeIndex = safe;
 		if (scroll) {
-			const target = marks[safe];
+			const target = matches[safe][0];
 			const revealed = revealFoldsAround(target);
 			target.scrollIntoView({ block: 'center', behavior: jumpBehavior });
 			if (revealed) {

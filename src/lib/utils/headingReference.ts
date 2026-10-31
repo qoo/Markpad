@@ -64,6 +64,26 @@ function linkLabel(text: string): string {
 	return text.replace(/([[\]])/g, '\\$1');
 }
 
+/**
+ * The file half of a wikilink to `fileName`. The renderer adds `.md` to a
+ * target with no extension of its own (`wikilink_file_destination`), so only
+ * `.md` may be dropped, and only when what is left does not itself read as
+ * one: `note.markdown` and `v1.2.md` stay whole.
+ */
+function wikilinkNote(fileName: string): string {
+	const stem = fileName.replace(/\.md$/, '');
+	return stem !== fileName && !/[^/\\]\.[A-Za-z0-9]{1,8}$/.test(stem) ? stem : fileName;
+}
+
+/**
+ * What a rendered heading reads as. The outline and the preview's context menu
+ * both name a heading by this, so "Copy Reference" writes the same text from
+ * either. A block id is already an empty anchor by now, so nothing is stripped.
+ */
+export function headingText(heading: Element): string {
+	return heading.textContent?.trim() ?? '';
+}
+
 export type HeadingReference = {
 	/** The heading as it reads. Both spellings show this to the reader. */
 	text: string;
@@ -80,10 +100,38 @@ export type HeadingReference = {
 
 export function headingReference({ text, slug, fileName, style }: HeadingReference): string {
 	if (style === 'wikilink') {
-		const note = fileName ? fileName.replace(/\.[^.]+$/, '') : '';
+		const note = fileName ? wikilinkNote(fileName) : '';
 		return note ? `[[${note}#${text}]]` : `#${text}`;
 	}
 
 	const destination = fileName ? `${fileName}#${slug}` : `#${slug}`;
 	return `[${linkLabel(text)}](${linkDestination(destination)})`;
+}
+
+/**
+ * The reference for a heading of `tab`'s document, in the spelling that
+ * document is written in. The style is read from the buffer, so an unsaved
+ * edit already counts.
+ */
+export function referenceForTab(
+	text: string,
+	slug: string,
+	tab: { path?: string | null; rawContent?: string } | null | undefined,
+): string {
+	const fileName = tab?.path ? tab.path.split(/[/\\]/).pop() || null : null;
+	return headingReference({
+		text,
+		slug,
+		fileName,
+		style: preferredReferenceStyle(tab?.rawContent ?? ''),
+	});
+}
+
+/**
+ * A rendered heading's id, straight off the element: comrak wrote it, and the
+ * outline reads it the same way. It can be on an anchor comrak nests inside the
+ * heading rather than on the heading itself.
+ */
+export function headingSlug(heading: Element): string {
+	return heading.id || heading.querySelector('a.anchor')?.id || '';
 }

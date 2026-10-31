@@ -6,20 +6,18 @@ import {
 	TASK_BOX,
 } from './listSyntax.js';
 import { shortcutLabel } from './shortcuts.js';
+import { applyMove, getAdjacentMove, getReorderMove, type ToolbarMove } from './toolbarMove.js';
+import type { TranslationKey } from './i18n.js';
 
 type EditorToolbarGroup = 'inline' | 'block' | 'list' | 'insert';
 
 export type EditorToolbarTool = {
 	id: string;
 	label: string;
-	name: string;
+	/** The app menu's i18n key for this command, so the toolbar names it the same way. */
+	labelKey: TranslationKey;
 	shortcut?: (modifier: 'Ctrl' | 'Cmd') => string;
 	group: EditorToolbarGroup;
-};
-
-type EditorToolbarMove = {
-	fromIndex: number;
-	toIndex: number;
 };
 
 /**
@@ -29,28 +27,26 @@ type EditorToolbarMove = {
  * and the shortcut it advertises cannot be attached to different commands.
  */
 const BASE_TOOLBAR_TOOLS: ReadonlyArray<Omit<EditorToolbarTool, 'shortcut'>> = [
-	{ id: 'fmt-bold', label: 'B', name: 'Bold', group: 'inline' },
-	{ id: 'fmt-italic', label: 'I', name: 'Italic', group: 'inline' },
-	{ id: 'fmt-underline', label: 'U', name: 'Underline', group: 'inline' },
-	{ id: 'fmt-strikethrough', label: 'S', name: 'Strikethrough', group: 'inline' },
-	{ id: 'fmt-inline-code', label: '`', name: 'Inline Code', group: 'inline' },
-	{ id: 'fmt-code-block', label: '{}', name: 'Code Block', group: 'block' },
-	{ id: 'fmt-quote', label: '>', name: 'Quote', group: 'block' },
-	{ id: 'fmt-heading-1', label: 'H1', name: 'Heading 1', group: 'block' },
-	{ id: 'fmt-heading-2', label: 'H2', name: 'Heading 2', group: 'block' },
-	{ id: 'fmt-heading-3', label: 'H3', name: 'Heading 3', group: 'block' },
-	{ id: 'fmt-bullet-list', label: '-', name: 'Bullet List', group: 'list' },
-	{ id: 'fmt-numbered-list', label: '1.', name: 'Numbered List', group: 'list' },
-	{ id: 'fmt-checklist', label: '[ ]', name: 'Checklist', group: 'list' },
-	{ id: 'fmt-link', label: '[]', name: 'Link', group: 'insert' },
-	{ id: 'insert-table-simple', label: '#', name: 'Table', group: 'insert' },
+	{ id: 'fmt-bold', label: 'B', labelKey: 'menu.bold', group: 'inline' },
+	{ id: 'fmt-italic', label: 'I', labelKey: 'menu.italic', group: 'inline' },
+	{ id: 'fmt-underline', label: 'U', labelKey: 'menu.underline', group: 'inline' },
+	{ id: 'fmt-strikethrough', label: 'S', labelKey: 'menu.strikethrough', group: 'inline' },
+	{ id: 'fmt-inline-code', label: '`', labelKey: 'menu.inlineCode', group: 'inline' },
+	{ id: 'fmt-code-block', label: '{}', labelKey: 'menu.codeBlock', group: 'block' },
+	{ id: 'fmt-quote', label: '>', labelKey: 'menu.quote', group: 'block' },
+	{ id: 'fmt-heading-1', label: 'H1', labelKey: 'menu.heading1', group: 'block' },
+	{ id: 'fmt-heading-2', label: 'H2', labelKey: 'menu.heading2', group: 'block' },
+	{ id: 'fmt-heading-3', label: 'H3', labelKey: 'menu.heading3', group: 'block' },
+	{ id: 'fmt-bullet-list', label: '-', labelKey: 'menu.bulletList', group: 'list' },
+	{ id: 'fmt-numbered-list', label: '1.', labelKey: 'menu.numberedList', group: 'list' },
+	{ id: 'fmt-checklist', label: '[ ]', labelKey: 'menu.checklist', group: 'list' },
+	{ id: 'fmt-link', label: '[]', labelKey: 'menu.link', group: 'insert' },
+	{ id: 'insert-table-simple', label: '#', labelKey: 'menu.insertTable', group: 'insert' },
 ];
 
 /**
- * The tooltip hint used to be a second copy of each chord, kept in step with
- * `Editor.svelte` by hand until #480 wrote a test for it. It is now read from
- * `shortcuts.ts`, so a tool with no registry row advertises nothing — which is
- * the same rule the test enforces from the other side.
+ * The tooltip hint is read from `shortcuts.ts`, so a tool with no registry row
+ * advertises nothing.
  */
 const EDITOR_TOOLBAR_TOOLS: EditorToolbarTool[] = BASE_TOOLBAR_TOOLS.map((tool) =>
 	shortcutLabel(tool.id, 'Ctrl') === undefined
@@ -117,7 +113,11 @@ type LineMarker = {
 };
 
 const LINE_MARKERS = {
-	'fmt-quote': { prefix: INDENT, own: /^>\s+/, render: () => '> ', competing: null },
+	// The space after `>` is optional: a quote's blank line is a bare `>`, and
+	// `>text` is a quote too. Requiring it judged those lines unquoted, so a
+	// multi-paragraph quote nested instead of coming off. Only one space goes
+	// with the marker; the rest is the quoted text's own indentation.
+	'fmt-quote': { prefix: INDENT, own: /^> ?/, render: () => '> ', competing: null },
 	// The list toggles exclude a following task box from `own` so that they add
 	// their marker to a checklist item instead of un-toggling it and leaving the
 	// box behind.
@@ -304,15 +304,25 @@ function leadingRun(text: string, ch: string): number {
  * and falls through to wrapping, which is `***word***` — asking for italic on
  * bold text means both, exactly as it does when the markers are selected.
  *
+ * Except when the run is this marker and another tool's side by side, which is
+ * what `***word***` is: bold's pair and italic's. Taking this tool's half leaves
+ * the other's whole, the same exception `toggleInlineWrap` makes, so Bold there
+ * answers `*word*` and Italic `**word**` rather than wrapping a fourth and
+ * fifth asterisk around them.
+ *
  * Both sides must match, so a half-written `~~word~` is left alone rather than
  * half unwrapped.
  */
 function ownMarkerReach(id: InlineWrapToolId, before: string, after: string): number {
-	for (const marker of INLINE_WRAPS[id].strip) {
+	const { strip } = INLINE_WRAPS[id];
+	for (const marker of strip) {
 		const ch = marker[0];
-		if (trailingRun(before, ch) !== marker.length) continue;
-		if (leadingRun(after, ch) !== marker.length) continue;
-		return marker.length;
+		const run = trailingRun(before, ch);
+		if (leadingRun(after, ch) !== run) continue;
+		const besideAnotherTool = ALL_WRAP_MARKERS.some(
+			(other) => !strip.includes(other) && other[0] === ch && other.length + marker.length === run,
+		);
+		if (run === marker.length || besideAnotherTool) return marker.length;
 	}
 	return 0;
 }
@@ -353,9 +363,8 @@ export function inlineWrapEdit(
 }
 
 /**
- * Where `text` ends when it is written starting at `startColumn`, as a line
- * offset from the start and a column — what the caller needs to leave exactly
- * the written text selected.
+ * The selection to leave once `text` has replaced `selected`, written starting
+ * at `startColumn`: both columns, and the end's line offset from the start.
  *
  * WHY THE EDIT HAS TO SAY. An `executeEdits` with no end-cursor state leaves
  * the old selection to be adjusted against the new text, and once the replaced
@@ -369,17 +378,29 @@ export function inlineWrapEdit(
  * Selecting what was written keeps the two directions symmetric — strip and
  * the word stays selected, wrap and the marked-up word does — so a second
  * click on the same button is always the inverse of the first.
+ *
+ * Except with nothing selected. What was written is then an empty pair, and
+ * selecting `****` made the next keystroke replace the markers (#778). The
+ * caret goes between them, which is also where a second click finds and strips
+ * them.
  */
-export function inlineWrapSelectionEnd(
+export function inlineWrapSelectionAfter(
+	id: InlineWrapToolId,
 	startColumn: number,
+	selected: string,
 	text: string,
-): { lineOffset: number; column: number } {
+): { startColumn: number; lineOffset: number; endColumn: number } {
+	if (selected === '' && text !== '') {
+		const caret = startColumn + INLINE_WRAPS[id].write.length;
+		return { startColumn: caret, lineOffset: 0, endColumn: caret };
+	}
 	const lines = text.split('\n');
 	const lineOffset = lines.length - 1;
 	return {
+		startColumn,
 		lineOffset,
 		// Columns are 1-based, so the column after a line of length n is n + 1.
-		column: lineOffset === 0 ? startColumn + text.length : lines[lineOffset].length + 1,
+		endColumn: lineOffset === 0 ? startColumn + text.length : lines[lineOffset].length + 1,
 	};
 }
 
@@ -428,44 +449,18 @@ export function getEditorToolbarReorderMove(
 	order: readonly string[],
 	draggedId: string,
 	targetId: string,
-): EditorToolbarMove | null {
-	const normalized = normalizeEditorToolbarOrder(order);
-	const fromIndex = normalized.indexOf(draggedId);
-	const toIndex = normalized.indexOf(targetId);
-
-	if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return null;
-	return { fromIndex, toIndex };
+): ToolbarMove | null {
+	return getReorderMove(normalizeEditorToolbarOrder(order), draggedId, targetId);
 }
 
 export function getEditorToolbarAdjacentMove(
 	order: readonly string[],
 	id: string,
 	direction: 'up' | 'down',
-): EditorToolbarMove | null {
-	const normalized = normalizeEditorToolbarOrder(order);
-	const fromIndex = normalized.indexOf(id);
-	if (fromIndex === -1) return null;
-
-	const toIndex = direction === 'up' ? fromIndex - 1 : fromIndex + 1;
-	if (toIndex < 0 || toIndex >= normalized.length) return null;
-
-	return { fromIndex, toIndex };
+): ToolbarMove | null {
+	return getAdjacentMove(normalizeEditorToolbarOrder(order), id, direction);
 }
 
-export function applyEditorToolbarMove(order: readonly string[], move: EditorToolbarMove): string[] {
-	const normalized = normalizeEditorToolbarOrder(order);
-	if (
-		move.fromIndex < 0 ||
-		move.fromIndex >= normalized.length ||
-		move.toIndex < 0 ||
-		move.toIndex >= normalized.length ||
-		move.fromIndex === move.toIndex
-	) {
-		return normalized;
-	}
-
-	const next = [...normalized];
-	const [moved] = next.splice(move.fromIndex, 1);
-	next.splice(move.toIndex, 0, moved);
-	return next;
+export function applyEditorToolbarMove(order: readonly string[], move: ToolbarMove): string[] {
+	return applyMove(normalizeEditorToolbarOrder(order), move);
 }

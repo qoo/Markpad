@@ -25,6 +25,9 @@ body {
 
 :root {
 	--win-font: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, sans-serif;
+	/* The margin round a document on paper (the PDF and a printed export) and
+	   round an exported file on screen, where CSS makes 1cm 37.8px. */
+	--page-margin: 1cm;
 
 	/* Default Light Theme */
 	--color-fg-default: #1f2328;
@@ -60,7 +63,8 @@ body {
 	--hljs-type: #953800;
 }
 
-:root[data-theme="light"] {
+:root[data-theme="light"],
+#print-root {
 	/* Explicit Light Theme Override */
 	--color-fg-default: #1f2328;
 	--color-fg-muted: #656d76;
@@ -176,7 +180,14 @@ body {
 
 /* KaTeX Adjustment */
 .katex-display {
-	margin: 1.5em 0 !important;
+	/* `overflow-y: hidden` keeps a wide formula's horizontal scrollbar from
+	   bringing a vertical one, but it also clips at the padding edge. KaTeX
+	   sizes the block from its own font metrics, and a glyph it has no metrics
+	   for — the CJK label on an mhchem arrow, `->[燃烧]` — draws taller than
+	   the box, so its top was cut off. The padding is that headroom; the margin
+	   gives it back, so the block still sits 1.5em from its neighbours. */
+	margin: 1.1em 0 !important;
+	padding: 0.4em 0;
 	overflow-x: auto;
 	overflow-y: hidden;
 	text-align: center;
@@ -188,8 +199,8 @@ body {
 
 /* Floating Scrollbar */
 ::-webkit-scrollbar {
-	width: 8px;
-	height: 8px;
+	width: 14px;
+	height: 14px;
 }
 
 ::-webkit-scrollbar-corner {
@@ -200,15 +211,19 @@ body {
 	background: transparent;
 }
 
+/* 8px at rest, 12px under the pointer, between the Windows and macOS thumbs.
+   Keep in step with the Monaco scrollbar in Editor.svelte. */
 ::-webkit-scrollbar-thumb {
-	background-color: rgba(120, 120, 120, 0.2);
+	background-color: rgba(120, 120, 120, 0.35);
 	border-radius: 10px;
-	border: 2px solid transparent;
+	border: 3px solid transparent;
 	background-clip: content-box;
 }
 
-::-webkit-scrollbar-thumb:hover {
-	background-color: rgba(120, 120, 120, 0.4);
+::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:active {
+	background-color: rgba(120, 120, 120, 0.55);
+	border-width: 1px;
 }
 
 .markdown-body {
@@ -224,8 +239,16 @@ body {
 	word-wrap: break-word;
 	overflow-wrap: anywhere;
 	text-align: left;
+	/* Space CJK from Latin. Ignored where unsupported. */
+	text-autospace: normal;
 	user-select: text;
 	-webkit-user-select: text;
+}
+
+/* Every Newline Breaks the Line off: a newline in a paragraph reads as the space
+   after the hidden `<br>`, as CommonMark renders it (#967). */
+.markdown-body.soft-breaks br.softbreak {
+	display: none;
 }
 
 .markdown-body .octicon {
@@ -500,7 +523,7 @@ body {
 
 .markdown-body a {
 	background-color: transparent;
-	color: var(--color-accent-fg);
+	color: var(--md-link, var(--color-accent-fg));
 	text-decoration: none;
 }
 
@@ -509,9 +532,26 @@ body {
 	text-decoration: underline dotted;
 }
 
+/*
+ * The colours an imported VS Code theme gives Markdown, applied to the rendered
+ * construct rather than to the markup that produced it (#682). Every fallback
+ * is the value the rule had before, so a built-in theme — which has no
+ * `tokenColors` to take — renders exactly as it did.
+ */
 .markdown-body b,
 .markdown-body strong {
 	font-weight: 600;
+	color: var(--md-strong, inherit);
+}
+
+.markdown-body em,
+.markdown-body i {
+	color: var(--md-emph, inherit);
+}
+
+.markdown-body del,
+.markdown-body s {
+	color: var(--md-strike, inherit);
 }
 
 .markdown-body dfn {
@@ -565,6 +605,7 @@ body {
 .markdown-body samp {
 	font-family: monospace, monospace;
 	font-size: 1em;
+	text-autospace: no-autospace;
 }
 
 .markdown-body figure {
@@ -690,8 +731,17 @@ body {
 	padding: 6px 13px;
 	border: 1px solid var(--color-border-default);
 	white-space: normal;
-	overflow-wrap: anywhere;
+	/* Not `anywhere`: that lets a column shrink to one character, so a long
+	   neighbour squeezes a short column into breaking mid-word (#927). */
+	overflow-wrap: break-word;
 	word-break: normal;
+	font-variant-numeric: tabular-nums;
+}
+
+/* Set by `tableColumnResize.ts` while the pointer is on a column border. */
+.markdown-body.column-resize-hover {
+	cursor: col-resize;
+	user-select: none;
 }
 
 .markdown-body table tr {
@@ -747,16 +797,7 @@ body {
 	margin-bottom: 16px;
 	font-weight: 600;
 	line-height: 1.25;
-	display: flex;
-	/* A heading is a flex container so the fold chevron can sit beside its text,
-	   which makes every element inside it a flex item — an inline `<code>`, an
-	   image, a KaTeX span. `flex-start` then pins each of them to the top of the
-	   line instead of standing them on the text's baseline, and the smaller the
-	   element the further it floats: #681 reported inline code in a heading
-	   riding above the words around it. `baseline` is what inline layout would
-	   have done. The chevron is unaffected — it is positioned in its own rule
-	   below — so this changes nothing but the alignment of real content. */
-	align-items: baseline;
+	text-wrap-style: balance;
 	position: relative;
 }
 
@@ -783,21 +824,18 @@ body {
 	position: relative;
 	overflow: visible !important;
 }
-.markdown-body .foldable-header:hover .header-fold-icon,
-.markdown-body .is-collapsed .header-fold-icon {
+.markdown-body .foldable-header:hover > .header-fold-icon,
+.markdown-body .foldable-header.is-collapsed > .header-fold-icon {
 	opacity: 0.5; /* show on hover or when collapsed */
 }
 .markdown-body .header-fold-icon:hover {
 	opacity: 1 !important;
 }
-.markdown-body .is-collapsed .header-fold-icon {
+/* `>` throughout: a heading's content wrapper holds the headings below it, so
+ * a descendant selector turned every nested chevron as the section folded. */
+.markdown-body .foldable-header.is-collapsed > .header-fold-icon {
 	transform: rotate(-90deg);
 }
-.is-collapsed + .folded-hidden,
-.folded-hidden {
-	display: none !important;
-}
-
 .foldable-content-wrapper {
 	height: var(--fold-content-height, auto);
 	transition: height 0.25s ease, opacity 0.25s ease;
@@ -813,14 +851,18 @@ body {
 
 .markdown-alert-content {
 	display: grid;
-	grid-template-rows: 1fr;
+	/* `minmax(0, …)`, not a bare `fr`: WebKit (macOS, Linux) keeps the height a
+	   bare `1fr` row got at a narrower width, so a callout first laid out in the
+	   zero-width preview pane stays that tall after Ctrl+E widens it (#850). The
+	   collapsed value is spelled the same way so the two still interpolate. */
+	grid-template-rows: minmax(0, 1fr);
 	transition: grid-template-rows 0.25s ease, opacity 0.25s ease;
 	opacity: 1;
 	overflow: visible;
 }
 
 .markdown-alert-content.is-collapsed {
-	grid-template-rows: 0fr;
+	grid-template-rows: minmax(0, 0fr);
 	opacity: 0;
 	overflow: hidden; /* must hide when collapsed */
 }
@@ -828,7 +870,7 @@ body {
 	min-height: 0;
 	overflow: visible; /* show carets in the gutter when expanded */
 }
-.is-collapsed .content-inner {
+.is-collapsed > .content-inner {
 	overflow: hidden;
 }
 
@@ -840,7 +882,7 @@ body {
 	margin-left: auto;
 	flex-shrink: 0;
 }
-.callout-foldable.is-collapsed .callout-fold-icon {
+.callout-foldable.is-collapsed > .markdown-alert-title > .callout-fold-icon {
 	transform: rotate(-90deg);
 }
 
@@ -870,7 +912,11 @@ body {
 .markdown-body h6 {
 	font-weight: 600;
 	font-size: 0.85em;
-	color: var(--color-fg-muted);
+	color: var(--md-heading, var(--color-fg-muted));
+}
+
+.markdown-body :is(h1, h2, h3, h4, h5) {
+	color: var(--md-heading, inherit);
 }
 
 .markdown-body p {
@@ -883,7 +929,7 @@ body {
 .markdown-body blockquote {
 	margin: 0;
 	padding: 0 1em;
-	color: var(--color-fg-muted);
+	color: var(--md-quote, var(--color-fg-muted));
 	border-left: 0.25em solid var(--color-border-default);
 }
 
@@ -892,6 +938,15 @@ body {
 	margin-top: 0;
 	margin-bottom: 16px;
 	padding-left: 2em;
+}
+
+/* A task item is a grid, where margins do not collapse, so a nested list's
+ * margin would add 16px per level under the last sub-task (#911). */
+.markdown-body ul ul,
+.markdown-body ul ol,
+.markdown-body ol ol,
+.markdown-body ol ul {
+	margin-bottom: 0;
 }
 
 .markdown-body ol ol,
@@ -935,6 +990,10 @@ body {
 .markdown-body dl dd {
 	padding: 0 16px;
 	margin-bottom: 16px;
+}
+
+.markdown-body :not(pre) > code {
+	color: var(--md-code, inherit);
 }
 
 .markdown-body code {
@@ -1034,33 +1093,6 @@ body {
 	border: 0;
 }
 
-.markdown-body .csv-data td,
-.markdown-body .csv-data th {
-	padding: 5px;
-	overflow: hidden;
-	font-size: 12px;
-	line-height: 1;
-	text-align: left;
-	white-space: nowrap;
-}
-
-.markdown-body .csv-data .blob-num {
-	padding: 10px 8px 9px;
-	text-align: right;
-	background: var(--color-canvas-default);
-	border: 0;
-}
-
-.markdown-body .csv-data tr {
-	border-top: 0;
-}
-
-.markdown-body .csv-data th {
-	font-weight: 600;
-	background: var(--color-canvas-subtle);
-	border-top: 0;
-}
-
 .markdown-body [data-footnoteref] {
 	font-size: 75%;
 	vertical-align: super;
@@ -1140,15 +1172,6 @@ body {
 	padding-bottom: 8px !important;
 }
 
-.markdown-body details.markdown-alert summary.markdown-alert-title {
-	list-style: none;
-	cursor: pointer;
-}
-
-.markdown-body details.markdown-alert summary.markdown-alert-title::-webkit-details-marker {
-	display: none;
-}
-
 .markdown-body .markdown-alert-title svg:not(.callout-fold-icon) {
 	margin-right: 0.5rem;
 	display: inline-block;
@@ -1160,10 +1183,6 @@ body {
 	margin-left: auto;
 	transition: transform 0.2s ease;
 	opacity: 0.5;
-}
-
-.markdown-body details.markdown-alert[open] .callout-fold-icon {
-	transform: rotate(90deg);
 }
 
 .markdown-body .callout-title-inner {
@@ -1227,10 +1246,6 @@ body {
 
 .markdown-body .markdown-alert-caution > .markdown-alert-title {
 	color: var(--color-danger-fg);
-}
-
-.markdown-body .markdown-alert-caution .alert-icon {
-	vertical-align: text-bottom;
 }
 
 /* Syntax Highlighting */
@@ -1335,44 +1350,6 @@ body {
 	background-color: var(--color-canvas-subtle);
 }
 
-.split-view {
-	display: flex;
-	flex-direction: row;
-	width: 100%;
-	height: 100vh;
-	padding-top: var(--titlebar-height, 36px);
-	box-sizing: border-box;
-}
-
-.split-editor {
-	flex: 1;
-	height: 100%;
-	position: relative;
-	border-right: 1px solid var(--color-border-default);
-	min-width: 0;
-}
-
-.split-editor .editor-container {
-	padding-top: 0 !important;
-}
-
-.split-preview {
-	flex: 1;
-	height: 100%;
-	overflow: hidden;
-	min-width: 0;
-	background-color: var(--color-canvas-default);
-}
-
-.split-preview .markdown-body {
-	margin: 0 !important;
-	height: 100% !important;
-	padding: 20px 40px !important;
-	width: 100% !important;
-	max-width: none !important;
-	box-sizing: border-box;
-}
-
 .split-bar {
 	width: 4px;
 	height: 100%;
@@ -1388,145 +1365,91 @@ body {
 	background-color: var(--color-accent-fg);
 }
 
+/*
+ * A tab switch draws the new tab's layout without animating it.
+ * `MarkdownViewer.svelte` adds `tab-switching` to `.layout-container`, forces a
+ * style recalculation and removes the class, all before the first paint. The
+ * selectors are the elements whose transitions follow per-tab state: the
+ * outline wrapper's shadow and the toggle button's position.
+ *
+ * Keep this in styles.css. The class is added through `classList`, so Svelte
+ * would prune these selectors from the component's scoped `<style>` and every
+ * transition would come back silently. `!important` beats the scoped
+ * declarations.
+ */
+.layout-container.tab-switching .toc-overlay-wrapper,
+.layout-container.tab-switching .toc-toggle-floating {
+	transition: none !important;
+}
+
 /* print styles for pdf export */
+/* The PDF/print route renders the document from the buffer into `#print-root`
+   (see `exportAsPdf`), the same article the HTML export writes to disk. The
+   sheet below reveals that element and hides the rest of the app, so nothing on
+   screen — title bar, tab strip, splitter, find highlights, fold state — can
+   reach paper, and a new part of the interface cannot leak onto a page by being
+   forgotten here. It used to print the live window, and this block was a list of
+   app parts being subtracted back out: fifteen issues over five months were that
+   list missing an entry (#668).
+
+   What is left is typography for paper. */
 @media print {
 	@page {
 		margin: 0;
 		size: auto;
 	}
 
-	/* A fold is a reading convenience of this session, not part of the
-	   document. Exporting is the act of handing the document to someone who
-	   has neither the app nor a way to open a collapsed section, so a print
-	   that clips one to zero height silently deletes text the author can
-	   still see two clicks away — and it disagreed with the HTML export,
-	   which renders every fold open (see utils/export.ts). Both routes now
-	   ship the whole document.
-
-	   Both collapse mechanisms have to be undone, and `opacity` matters as
-	   much as the size: the screen rules pair `height: 0` /
-	   `grid-template-rows: 0fr` with `opacity: 0`, so restoring only the
-	   size would print blank space where the section is. */
-	.foldable-content-wrapper {
-		height: auto !important;
-		transition: none !important;
-		overflow: visible !important;
+	/* `#app` is `display: contents`, so the viewer's own markup and the print
+	   article are siblings here. Structural rather than a list of names: a part
+	   added to the interface tomorrow is hidden by the same rule. */
+	body > :not(#app) {
+		display: none !important;
+	}
+	#app > :not(#print-root) {
+		display: none !important;
+	}
+	#print-root {
+		display: block !important;
 	}
 
+	html,
+	body {
+		background: white !important;
+		overflow: visible !important;
+		height: auto !important;
+		min-height: auto !important;
+		margin: 0 !important;
+		padding: 0 !important;
+	}
+
+	/* A callout written as "> [!note]-" carries its collapsed state in the
+	   markup itself, so it arrives here collapsed: text that is in the document,
+	   clipped to zero height, on a page that has no way to open it. Heading
+	   folds arrive open — the render is handed an empty fold state. The HTML
+	   export takes the same position from the other side (see
+	   `buildExportDocument`). */
 	.foldable-content-wrapper.is-collapsed {
 		height: auto !important;
 		overflow: visible !important;
 		opacity: 1 !important;
 	}
-
-	.markdown-alert-content {
-		transition: none !important;
-		overflow: visible !important;
-	}
-
 	.markdown-alert-content.is-collapsed {
-		grid-template-rows: 1fr !important;
+		grid-template-rows: minmax(0, 1fr) !important;
 		overflow: visible !important;
 		opacity: 1 !important;
 	}
-
 	.foldable-content-wrapper .content-inner,
 	.markdown-alert-content .content-inner {
 		overflow: visible !important;
 	}
-
-	/* The chevrons are the control for that fold. On paper they control
-	   nothing, and a collapsed one is rotated to point at content that is
-	   now printed open, so it would be actively misleading. */
 	.markdown-body .header-fold-icon,
-	.markdown-body .callout-fold-icon {
+	.markdown-body .callout-fold-icon,
+	.lang-label {
 		display: none !important;
-	}
-
-	.custom-title-bar,
-	.tab-area,
-	.window-controls-left,
-	.window-controls-right,
-	.title-actions-container,
-	.tooltip,
-	.custom-tooltip,
-	.drag-overlay,
-	.pane.editor-pane,
-	.split-bar,
-	.home-menu-container,
-	.kebab-btn,
-	.title-action-btn,
-	.theme-dropdown-container,
-	.control-btn,
-	.lang-label,
-	.top-fade-mask,
-	.toc-overlay-wrapper,
-	.toc-toggle-floating,
-	.find-bar {
-		display: none !important;
-	}
-
-	/* The find bar is hidden above, but its marks wrap document text. Adding
-	   them to the list would delete the matched words from the export, so the
-	   highlight is neutralised instead of removed. `!important` is what
-	   decides here: FindBar.svelte paints the mark from a `:global()` rule of
-	   equal specificity, and the order between a component style and this
-	   sheet is not guaranteed. */
-	.markdown-body mark.markpad-find-match,
-	.markdown-body mark.markpad-find-match.active {
-		background-color: transparent !important;
-		box-shadow: none !important;
-		color: inherit !important;
-		border-radius: 0 !important;
-		padding: 0 !important;
-	}
-
-	html,
-	body,
-	#app,
-	.markdown-container,
-	.layout-container,
-	.pane.viewer-pane,
-	.viewer-content {
-		background: white !important;
-		overflow: visible !important;
-		height: auto !important;
-		min-height: auto !important;
-		position: static !important;
-		margin: 0 !important;
-		padding: 0 !important;
-		width: 100% !important;
-		border-radius: 0 !important;
-	}
-
-	/* The viewer pane carries an inline split ratio during normal interaction.
-	   Width alone cannot override that flex value in the print layout.
-
-	   The `#app` is not decoration. Edit mode collapses the preview with a
-	   MarkdownViewer.svelte rule that Svelte scopes to
-	   `.layout-container:not(.split).editing.svelte-xxx .viewer-pane:where(...)`
-	   — five classes, against two for `.pane.viewer-pane`. Two `!important`
-	   declarations are decided by specificity, so the component won and the
-	   pane the whole print layout is built around stayed at `width: 0`. That
-	   is why Export PDF from the editor printed a blank page. `#app` is the
-	   application root element (see app.html); its id is the only handle this
-	   sheet has that outranks a component's scoped selector.
-
-	   `opacity` is listed for the same reason `.foldable-content-wrapper`
-	   above lists it: the collapse is size *and* opacity, so restoring the
-	   width alone prints a correctly sized blank rectangle.
-
-	   The pane also animates its flex, and a print taken mid-transition would
-	   capture an intermediate width. */
-	#app .pane.viewer-pane {
-		width: 100% !important;
-		flex: none !important;
-		opacity: 1 !important;
-		transition: none !important;
 	}
 
 	.markdown-body {
-		padding: 0.75in !important;
+		padding: var(--page-margin) !important;
 		margin: 0 !important;
 		box-sizing: border-box !important;
 		box-decoration-break: clone !important;
@@ -1541,7 +1464,6 @@ body {
 		-webkit-print-color-adjust: exact !important;
 		position: static !important;
 	}
-
 	.markdown-body pre,
 	.markdown-body pre code {
 		white-space: pre-wrap !important;
@@ -1549,9 +1471,6 @@ body {
 		word-break: normal !important;
 		overflow: visible !important;
 	}
-
-	/* Paper has no horizontal scrollbar. Let the browser distribute columns from
-	   their content so wide tables wrap at words instead of one glyph at a time. */
 	.markdown-body table {
 		display: table !important;
 		table-layout: auto !important;
@@ -1559,19 +1478,16 @@ body {
 		max-width: 100% !important;
 		overflow: visible !important;
 	}
-
 	.markdown-body table th,
 	.markdown-body table td {
 		overflow-wrap: break-word !important;
 		word-break: normal !important;
 	}
-
 	.markdown-body p,
 	.markdown-body li {
 		orphans: 3;
 		widows: 3;
 	}
-
 	.markdown-body h1,
 	.markdown-body h2,
 	.markdown-body h3,
@@ -1580,8 +1496,9 @@ body {
 	.markdown-body h6 {
 		break-after: avoid;
 		break-inside: avoid;
+		line-height: 1.2;
+		margin: 1.4em 0 0.55em;
 	}
-
 	.markdown-body pre,
 	.markdown-body blockquote,
 	.markdown-body .markdown-alert,
@@ -1592,82 +1509,39 @@ body {
 	.markdown-body .katex-display {
 		break-inside: avoid;
 	}
-
 	.markdown-body .markdown-alert {
 		page-break-inside: avoid !important;
 		break-inside: avoid !important;
 		box-decoration-break: clone !important;
 		-webkit-box-decoration-break: clone !important;
 	}
-
-	.markdown-body details.markdown-alert {
-		page-break-inside: avoid !important;
-		break-inside: avoid !important;
-	}
-
 	.markdown-body tr {
 		break-inside: avoid;
 		page-break-inside: avoid;
 	}
-
-	/* Diagrams are re-rendered with Mermaid's light theme before an
-	   export (see utils/mermaidPrint.ts), so the printed SVG already
-	   carries paper colours and needs no overrides here. Recolouring
-	   Mermaid's output from CSS meant enumerating its internal class
-	   names, which differ per diagram type and change between
-	   releases. */
-
 	.markdown-body .frontmatter-panel,
-	.markdown-body .frontmatter-summary {
+	.markdown-body .frontmatter-summary,
+	.markdown-body .export-frontmatter-panel {
 		box-sizing: border-box !important;
 		max-width: 100% !important;
 	}
-
-	.markdown-body .frontmatter-title {
-		min-width: 0 !important;
-		overflow: hidden !important;
-		text-overflow: ellipsis !important;
-	}
-
-	.markdown-body .frontmatter-count {
-		flex-shrink: 0 !important;
-	}
-
-	/* Keep screen chrome out of the export while giving the document its own
-	   compact paper rhythm. These rules intentionally do not affect preview. */
-	.markdown-body h1,
-	.markdown-body h2,
-	.markdown-body h3,
-	.markdown-body h4,
-	.markdown-body h5,
-	.markdown-body h6 {
-		line-height: 1.2;
-		margin: 1.4em 0 0.55em;
-	}
-
 	.markdown-body p {
 		margin: 0 0 0.75em;
 	}
-
 	.markdown-body ul,
 	.markdown-body ol {
 		margin: 0.4em 0 0.8em;
 		padding-left: 1.5em;
 	}
-
 	.markdown-body li + li {
 		margin-top: 0.2em;
 	}
-
 	.markdown-body blockquote {
 		margin: 1em 0;
 		padding: 0.15em 1em;
 		color: #333;
 		border-left: 3px solid #bbb;
 	}
-
-	/* Code should retain a paper boundary but may split across pages rather
-	   than force a near-page-sized block onto the following page. */
 	.markdown-body pre {
 		margin: 1em 0;
 		padding: 0.75em 1em;
@@ -1677,50 +1551,40 @@ body {
 		break-inside: auto;
 		page-break-inside: auto;
 	}
-
 	.markdown-body img {
 		display: block;
 		max-width: 100% !important;
 		height: auto !important;
 		margin: 1em auto;
 	}
-
-	/* Images and diagrams are replaced content: they cannot be fragmented, so
-	   the `break-inside: avoid` above crops anything taller than the printable
-	   column instead of moving it to the next page. Cap the height so they
-	   scale to fit — `height: auto` and the intrinsic ratio bring the width
-	   down with it.
-
-	   `@page` has no margin and `.markdown-body` adds 0.75in top and bottom,
-	   leaving 9.5in on Letter and 10.19in on A4. One absolute cap below both
-	   fits either sheet; viewport units would be shorter to write but resolve
-	   against the page box inconsistently across the platform webviews. */
+	/* An image or a diagram taller than the paper used to be clipped at the page
+	   break rather than scaled; 9in fits both Letter and A4 inside the
+	   page margins above. */
 	.markdown-body img,
 	.markdown-body .mermaid-diagram svg {
 		max-height: 9in !important;
 		object-fit: contain !important;
 	}
-
-	/* `.mermaid-diagram` scrolls horizontally on screen, and that same overflow
-	   would clip on paper the diagram the cap just made fit. */
 	.markdown-body .mermaid-diagram {
 		overflow: visible !important;
 	}
-
 	.markdown-body table {
 		margin: 1em 0;
 		font-size: 0.9em;
 	}
-
 	.markdown-body table th,
 	.markdown-body table td {
 		padding: 0.4em 0.55em;
 		vertical-align: top;
 	}
+}
 
-	.markdown-container {
-		zoom: 1 !important;
-	}
+/* Paper is white whatever the screen is wearing, so the print article carries
+   the light palette rather than the app's current theme. Declared on the
+   element, so it wins over the theme's own `:root` definitions for this
+   subtree. */
+#print-root {
+	display: none;
 }
 
 /* ===== Extended markdown features ===== */
@@ -1803,8 +1667,10 @@ body {
 	opacity: 1;
 }
 
-.markdown-body ul.contains-task-list,
-.markdown-body ul li.task-list-item {
+/* On the item, not the list: comrak marks the whole `<ul>` once any item is a
+ * task, and `list-style` inherits, so a plain item beside a task lost its
+ * bullet. */
+.markdown-body li.task-list-item {
 	list-style: none;
 }
 
@@ -1872,20 +1738,29 @@ body {
 	transform: rotate(45deg);
 }
 
-/* strike-through completed task text */
-.markdown-body li.task-done {
+/*
+ * Strike and dim a completed task. `task-done` is the class the app sets; the
+ * `:has` selectors are the fallback for reload and initial state. Both paths
+ * must change together, or nothing a user sees changes.
+ *
+ * Every selector names the item's own children, never its descendants, and
+ * nothing goes on the `li` itself:
+ *
+ * - `:has(input:checked)` without `>` matches any ancestor of a ticked item, so
+ *   ticking a sub-task struck out every parent above it (#911).
+ * - `text-decoration` on the `li` propagates into nested lists, and no
+ *   descendant can undo it, so a ticked parent struck out its open sub-tasks.
+ * - `opacity` composites once per element that declares it. A rule matching
+ *   every descendant multiplied 0.65 down the markup, and KaTeX, twelve spans
+ *   deep, landed at 0.65^12 = 0.006 and vanished -- see the two task items in
+ *   samples/katex-stress.md.
+ */
+.markdown-body li.task-done > .task-text,
+.markdown-body li.task-done > *:not(input):not(.task-text):not(ul):not(ol),
+.markdown-body li.task-list-item:has(> input[data-task-checkbox]:checked) > .task-text,
+.markdown-body li.task-list-item:has(> input[data-task-checkbox]:checked) > *:not(input):not(.task-text):not(ul):not(ol) {
 	text-decoration: line-through;
 	text-decoration-color: var(--color-fg-muted);
-}
-
-/* The live path -- `task-done` is the class the app sets. The `:has` block
- * further down is the fallback for reload and initial state, and both carried
- * the same defect; fixing one and not the other changes nothing a user sees.
- * See the note on the `:has` rule for why opacity may not be applied per
- * descendant, and why it may not move up onto the `li` either. */
-.markdown-body li.task-done .task-text,
-.markdown-body li.task-done > *:not(input):not(.task-text):not(ul):not(ol) {
-	text-decoration: line-through;
 	opacity: 0.65;
 }
 
@@ -1897,46 +1772,14 @@ body {
 	padding: 0 3px;
 }
 
-/* :has fallback for reload / initial state */
-.markdown-body li.task-list-item:has(input[data-task-checkbox]:checked) {
-	text-decoration: line-through;
-	text-decoration-color: var(--color-fg-muted);
+/* The reader's session-only highlights, drawn without touching the DOM. */
+::highlight(markpad-annotation) {
+	background-color: var(--highlight-color, rgba(255, 208, 0, 0.4));
 }
 
-/*
- * `opacity` does not inherit -- it composites, once per element that declares
- * it. The selector list here ended in `... :checked *`, every descendant, so a
- * ticked item multiplied 0.65 by itself all the way down its own markup. Plain
- * words survived that at one or two levels deep. KaTeX nests twelve spans, so a
- * formula landed at 0.65^12 = 0.006 and vanished, while the words beside it only
- * faded -- see the two task items in samples/katex-stress.md, which exist as a
- * pair for exactly this reason.
- *
- * Applied to the wrapper the content sits in, so it happens once. Not moved up
- * onto the `li`: opacity on an ancestor cannot be undone by a descendant, and
- * the rules below deliberately restore the checkbox and any nested list to full
- * opacity. `text-decoration` needs no such help -- it propagates to descendant
- * text on its own, which is why the `li` rule above already carries it.
- */
-.markdown-body li.task-list-item:has(input[data-task-checkbox]:checked) .task-text,
-.markdown-body li.task-list-item:has(input[data-task-checkbox]:checked) > *:not(input):not(.task-text):not(ul):not(ol) {
-	text-decoration: line-through;
-	opacity: 0.65;
-}
-
-/* restore opacity/decoration for certain safe elements like ul/ol/checkboxes/links */
-.markdown-body li.task-done input[data-task-checkbox],
-.markdown-body li.task-list-item:has(input[data-task-checkbox]:checked) input[data-task-checkbox] {
-	text-decoration: none !important;
-	opacity: 1 !important;
-}
-
-.markdown-body li.task-done ul,
-.markdown-body li.task-done ol,
-.markdown-body li.task-list-item:has(input[data-task-checkbox]:checked) ul,
-.markdown-body li.task-list-item:has(input[data-task-checkbox]:checked) ol {
-	text-decoration: none;
-	opacity: 1;
+/* Highlight Matches of Selection: fainter than a highlight, so the two read apart. */
+::highlight(markpad-occurrence) {
+	background-color: color-mix(in srgb, var(--color-accent-fg) 20%, transparent);
 }
 
 .markdown-body .footnote-backref,
@@ -1993,9 +1836,8 @@ body {
  * So drop both clips while the widget is visible. Nothing else escapes: Monaco
  * clips its own content — and the find widget itself, which lives in
  * `.overlayWidgets` — inside `.overflow-guard`, leaving `.context-view` as the
- * only child that can paint outside. `:has(.find-widget.visible)` still scopes
- * it to when the widget is up, so the pane's flex/opacity transitions keep the
- * clip they were written against.
+ * only child that can paint outside. `:has(.find-widget.visible)` limits this
+ * to while the widget is open.
  *
  * `overflow: clip` with an `overflow-clip-margin` would bound the escape more
  * tightly, but WebKit ships `clip` without the margin property, so it would
@@ -2015,4 +1857,24 @@ body {
    the editor belongs over the title bar, not under it. */
 .context-view {
 	z-index: 10000 !important;
+}
+
+/* The `.context-view` is absolutely positioned inside `.editor-container`, so
+   the tooltip's shrink-to-fit width stops at the editor's right edge, not the
+   window's. In split view the find widget's last buttons sit against that edge:
+   the tooltip wraps to two lines after Monaco has measured it as one and placed
+   it above the button, so the second line lands on the button and the tooltip
+   flickers as the pointer crosses it (#883). Sizing it to its text lets
+   Monaco's own window-edge shift do the placement. `.workbench-hover` keeps its
+   700px cap. */
+.context-view .monaco-hover {
+	width: max-content;
+}
+
+/* The folding chevron sits in a strip that also holds the TOC button's
+   clearance when line numbers are off (`utils/editorOptions.ts`). Monaco
+   centres the chevron in the strip, which would put it under the button;
+   the right end keeps it against the line it folds. */
+.monaco-editor .margin-view-overlays .cldr[class*="codicon-folding-"] {
+	justify-content: flex-end;
 }

@@ -47,6 +47,7 @@ export type AnchorNode = {
 	readonly childNodes: Iterable<AnchorNode>;
 	getAttribute?(name: string): string | null;
 	readonly classList?: { contains(token: string): boolean };
+	readonly style?: { readonly display?: string };
 };
 
 type AnchorMatch = LineRange & {
@@ -134,11 +135,18 @@ const ELEMENT_NODE = 1;
  * every soft-wrapped line of prose ends in one of these, and resolving an
  * anchor to one hands the restore `offsetTop = 0, offsetHeight = 0` — which
  * scrolls the preview to the top of the document instead of to the line.
+ *
+ * An inline `display: none` subtree has no box either, and the preview holds
+ * one per open tab: every tab's `.markdown-blocks` host lives in the one
+ * article, and only the active tab's is displayed. Two tabs showing the same
+ * file carry the same source lines, so a hidden host earlier in the article
+ * would otherwise own the anchor, and its samples would break the ordering the
+ * offset mapping searches.
  */
 const BOXLESS_TAGS = new Set(['BR', 'WBR']);
 
 function isAnchorable(node: AnchorNode): boolean {
-	return !BOXLESS_TAGS.has(node.tagName ?? '');
+	return !BOXLESS_TAGS.has(node.tagName ?? '') && node.style?.display !== 'none';
 }
 
 /**
@@ -280,7 +288,7 @@ function elementChildren(node: AnchorNode): AnchorNode[] {
  * every candidate sibling on every call, and on a 13,000-line document that is
  * ~6ms per mapping — measured, in Chrome, over this pipeline's own output.
  *
- * WHAT INVALIDATES THEM: `invalidateAnchorMemos`, which `patchPreviewBlocks`
+ * WHAT INVALIDATES THEM: `invalidateAnchorMemos`, which `patchPreview`
  * calls before it touches the tree. It has to, because these answers are no
  * longer a function of a node's identity.
  *
@@ -288,9 +296,9 @@ function elementChildren(node: AnchorNode): AnchorNode[] {
  * wholesale by `bind:innerHTML` on every render pass, so a changed document was
  * a new set of nodes and the entries describing the old ones were collected
  * with them. Nothing invalidated these memos because nothing could.
- * `blockPatch.ts` breaks that premise on purpose — it keeps the nodes whose
+ * `previewPatch.ts` breaks that premise on purpose — it keeps the nodes whose
  * rendering did not change, and rewrites `data-sourcepos` ON THOSE KEPT NODES
- * from the new tree (`refreshSourcepos`, `carrySourcepos`). A kept node is the
+ * from the new markup (`moveSourcepos`). A kept node is the
  * same key, so its entry survives the edit that changed its range, and the memo
  * keeps answering with the lines the block used to be on — permanently, because
  * nothing is ever going to replace that node either. Every edit that shifts a
@@ -310,17 +318,25 @@ function elementChildren(node: AnchorNode): AnchorNode[] {
  *
  * Folding, task checkboxes and rich-content rendering still leave the annotated
  * blocks and their ranges exactly where they were.
+ *
+ * `sampleCache` is the third memo, the sample table per root (see
+ * `lineSamples`). It does depend on folds, on which host is displayed and on
+ * Mermaid replacing a `<pre>`, so `applyFold`, the viewer's tab switch and
+ * `renderRichContent` call this too.
  */
 let ownRangeCache = new WeakMap<object, LineRange | null>();
 let spanCache = new WeakMap<object, LineRange | null>();
+let sampleCache = new WeakMap<object, LineSample[]>();
 
 /**
- * Forget every memoised range. Whoever rewrites a `data-sourcepos` in place, or
- * changes what is inside a node that is being kept, owes this call.
+ * Forget every memoised range. Whoever rewrites a `data-sourcepos` in place,
+ * changes what is inside a node that is being kept, or changes which annotated
+ * elements are followed (a fold, a host shown or hidden), owes this call.
  */
 export function invalidateAnchorMemos(): void {
 	ownRangeCache = new WeakMap<object, LineRange | null>();
 	spanCache = new WeakMap<object, LineRange | null>();
+	sampleCache = new WeakMap<object, LineSample[]>();
 }
 
 function ownRange(node: AnchorNode): LineRange | null {
@@ -400,31 +416,6 @@ function lineDistance(span: LineRange, line: number): number {
 }
 
 /**
- * A block owns the pixels `[top, top + height)` — half open at the bottom.
- *
- * Adjacent blocks touch: margins collapse, and one block's bottom edge is the
- * next one's top. If both claim that pixel the earlier one wins, because the
- * descent stops at the first candidate whose distance is zero. That is a
- * feedback loop rather than an off-by-one: a line resolved back to a pixel
- * lands on the TOP edge of its block, which the block ABOVE then claims, so
- * every echo between the panes walks the reader one block up the document.
- * (Observed in Chrome over this pipeline's own output; the DOM shim has no
- * layout, so its blocks never touched and the loop was invisible there.)
- *
- * A block whose bottom edge is exactly the offset therefore reports the
- * smallest positive distance instead of zero: still the nearest thing when
- * nothing contains the offset, but beaten by whatever does.
- */
-function boxDistance(box: AnchorBox, offset: number): number {
-	if (!Number.isFinite(box.top) || !Number.isFinite(box.height)) return Number.NaN;
-	if (offset < box.top) return box.top - offset;
-
-	const below = offset - (box.top + box.height);
-	if (below < 0) return 0;
-	return below > 0 ? below : Number.EPSILON;
-}
-
-/**
  * Descend to the narrowest annotated element `distanceOf` says is closest.
  *
  * `strict` is the difference between "which block owns this line" (a line
@@ -486,37 +477,6 @@ export function findAnchorElement(root: AnchorNode, line: number): AnchorMatch |
 }
 
 /**
- * As `findAnchorElement`, but a line no block owns resolves to the nearest
- * block instead of to nothing. Only the scroll-sync mapping wants this: the
- * blank lines between blocks are a third of a typical document, and falling
- * back to the proportional mapping on every one of them would make the paired
- * pane jump back and forth as the reader scrolled.
- */
-function findNearestAnchorElement(root: AnchorNode, line: number): AnchorMatch | null {
-	if (!Number.isFinite(line) || line <= 0) return null;
-	return descend(root, null, (span) => lineDistance(span, line), false);
-}
-
-/**
- * The narrowest annotated element whose box covers `offset`, or the nearest one
- * when the offset falls in the margin between two blocks or in the padding
- * below the last one.
- *
- * `measure` supplies the layout — `offsetTop` / `offsetHeight` in the browser.
- * It is a parameter because this module is otherwise pure enough to run against
- * the render-protocol DOM shim, and that shim has no layout at all; injecting
- * one is what lets the mapping be tested over real pipeline output.
- */
-function findAnchorElementAtOffset(
-	root: AnchorNode,
-	offset: number,
-	measure: MeasureAnchorBox,
-): AnchorMatch | null {
-	if (!Number.isFinite(offset)) return null;
-	return descend(root, null, (_span, node) => boxDistance(measure(node), offset), false);
-}
-
-/**
  * Where to scroll so `line` sits `offset` pixels below the top of the viewport,
  * interpolating linearly across the resolved element for multi-line blocks.
  *
@@ -536,6 +496,90 @@ export function getAnchorScrollTop(
 	const ratio = totalLines > 0 ? Math.max(0, Math.min(1, (line - range.startLine) / totalLines)) : 0;
 
 	return Math.max(0, elementTop + elementHeight * ratio - offset);
+}
+
+/**
+ * The preview's scroll container: the element the restore writes to, and the
+ * root the anchor is resolved under.
+ *
+ * Nothing about its geometry is read off it. The layout arrives as `measure`
+ * and the scroll range as `scrollMax`, as everywhere else in this file — neither
+ * the DOM shim nor jsdom has a layout, so a test supplies its own, and
+ * `scrollHeight` is not a measurement `src/lib/utils` is allowed to take (see
+ * the `fold-height-from-layout` lint rule in eslint.config.js).
+ */
+export type PreviewScrollContainer = AnchorNode & {
+	scrollTop: number;
+};
+
+/**
+ * The three ways a tab records where its reader was — see `Tab` in
+ * `stores/tabs.svelte.ts` for why there are three.
+ */
+export type ReadingPosition = {
+	readonly anchorLine: number;
+	readonly scrollPercentage: number;
+	readonly scrollTop: number;
+};
+
+/**
+ * Put `container` back where the reader of this tab was, and return which entry
+ * of the cascade answered.
+ *
+ * One function rather than one per caller, because the cascade is an ORDER and
+ * a second copy that consulted the same three fields in a different one would
+ * be a different answer for the same tab. It stops at the first entry that
+ * resolves:
+ *
+ *   - `anchorLine`, an interpolated restore: find the rendered element that owns
+ *     the saved source line and put that line back under the anchor offset. This
+ *     descends, because `processMarkdownHtml` re-parents every block after a
+ *     heading into a `.foldable-content-wrapper` with no `data-sourcepos`, so a
+ *     scan of the container's children only ever matched an anchor sitting
+ *     exactly on a top-level heading line (see navigation.anchors.test.ts).
+ *     Measured through `measure` — `measureAnchorBox` in the app — and not raw
+ *     `offsetTop`: an anchor inside a table or a code block sits in that
+ *     table's or that shell's space, and restoring to it would open the tab at
+ *     the top instead.
+ *   - `scrollPercentage`, when there is anything to scroll;
+ *   - `scrollTop`, the raw pixel offset, which is also what puts a tab that has
+ *     never been scrolled at the top.
+ *
+ * `'nothing'` means the container held no document to anchor to and could not
+ * scroll — every caller that renders a tab's document AFTER activating it gets
+ * this on the activation and has to ask again once the document is in.
+ */
+export function restorePreviewReadingPosition(
+	container: PreviewScrollContainer,
+	position: ReadingPosition,
+	scrollMax: number,
+	measure: MeasureAnchorBox,
+): 'anchor' | 'percentage' | 'pixels' | 'nothing' {
+	if (position.anchorLine > 0) {
+		const match = findAnchorElement(container, position.anchorLine);
+		if (match) {
+			const box = measure(match.element);
+			container.scrollTop = getAnchorScrollTop(
+				box.top,
+				box.height,
+				match,
+				position.anchorLine,
+				PREVIEW_ANCHOR_OFFSET,
+			);
+			return 'anchor';
+		}
+	}
+
+	if (scrollMax > 0 && position.scrollPercentage > 0) {
+		container.scrollTop = position.scrollPercentage * scrollMax;
+		return 'percentage';
+	}
+
+	container.scrollTop = position.scrollTop;
+	// A container with nothing to scroll cannot hold a position: the assignment
+	// above clamps to 0, so a reader who was part-way down was not restored —
+	// the caller was asked too early and has to ask again with the document in.
+	return scrollMax > 0 || position.scrollTop === 0 ? 'pixels' : 'nothing';
 }
 
 /* ------------------------------------------------------------------ */
@@ -578,9 +622,9 @@ type LineSample = { element: AnchorNode; line: number };
  * at one line and give the interval between them zero span. The inner one is
  * kept because it is the one whose box actually bounds the text.
  *
- * Not memoised: this walks the tree without measuring anything, and the
- * measuring is what costs. Caching it would mean invalidating on every render,
- * and a stale table would silently map to the wrong lines.
+ * Called through `lineSamples`, which memoises the table: the walk visits the
+ * whole document and ran on every scroll event, twice per event in split
+ * view. Only the elements are cached; their boxes are measured live.
  */
 function collectLineSamples(root: AnchorNode): LineSample[] {
 	const samples: LineSample[] = [];
@@ -638,6 +682,15 @@ function collectLineSamples(root: AnchorNode): LineSample[] {
 	return samples;
 }
 
+function lineSamples(root: AnchorNode): LineSample[] {
+	let samples = sampleCache.get(root as object);
+	if (!samples) {
+		samples = collectLineSamples(root);
+		sampleCache.set(root as object, samples);
+	}
+	return samples;
+}
+
 /**
  * The samples either side of `offset`: the last one at or above it, and the
  * first one below.
@@ -684,7 +737,7 @@ export function getSourceLineAtPreviewOffset(
 ): RendererLine | null {
 	if (!Number.isFinite(offset)) return null;
 
-	const samples = collectLineSamples(root);
+	const samples = lineSamples(root);
 	if (samples.length === 0) return null;
 
 	const { previous, next } = samplesAround(samples, offset, measure);
@@ -722,7 +775,7 @@ export function getPreviewOffsetForSourceLine(
 ): number | null {
 	if (!Number.isFinite(line)) return null;
 
-	const samples = collectLineSamples(root);
+	const samples = lineSamples(root);
 	if (samples.length === 0) return null;
 
 	// The mirror of `samplesAround`, over lines rather than pixels. Both

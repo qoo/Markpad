@@ -85,11 +85,13 @@ function holderFor(fragment: DocumentFragment): HTMLElement {
  *     broken image. `file:` is what a desktop application can open. A remote
  *     image or a data URI resolves to null here and keeps the src it has.
  */
-export function copyableHtml(fragment: DocumentFragment, tabPath: string): string {
+export function copyableHtml(fragment: DocumentFragment, tabPath: string, dropSoftBreaks = false): string {
 	const holder = holderFor(fragment);
 
 	for (const duplicate of holder.querySelectorAll('.katex-mathml')) duplicate.remove();
 	for (const control of holder.querySelectorAll('.header-fold-icon, .callout-fold-icon')) control.remove();
+	// Hidden by `.soft-breaks` in the preview, which the clipboard does not carry (#967).
+	if (dropSoftBreaks) for (const br of holder.querySelectorAll('br.softbreak')) br.remove();
 
 	for (const img of holder.querySelectorAll('img')) {
 		const src = img.getAttribute('src');
@@ -121,10 +123,30 @@ export function copyableFlavours(selection: Selection, tabPath: string): { text:
 	const range = expandToWholeFormulas(selection.getRangeAt(0));
 	const fragment = range.cloneContents();
 	const hasMath = !!fragment.querySelector('.katex-mathml');
+	const start = range.startContainer;
+	const dropSoftBreaks = !!(start instanceof Element ? start : start.parentElement)?.closest('.soft-breaks');
 
 	return {
 		// A second clone: the HTML pass consumes the first one.
 		text: hasMath ? (texSubstituted(holderFor(range.cloneContents())).textContent ?? '') : selection.toString(),
-		html: copyableHtml(fragment, tabPath),
+		html: copyableHtml(fragment, tabPath, dropSoftBreaks),
 	};
+}
+
+/**
+ * The document's `copy` handler: ⌘C in the preview and Edit ▸ Copy both land
+ * here (#549). It writes the clipboard itself and cancels the native copy, so
+ * the flavours on the clipboard are exactly these two and WebKit adds none.
+ */
+export function handleCopy(e: ClipboardEvent, tabPath: string) {
+	const active = document.activeElement;
+	if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
+	const selection = window.getSelection();
+	if (!selection || selection.isCollapsed || !selection.rangeCount || !e.clipboardData) return;
+	// Rendered content keeps its formatting when copied (#674), as in a
+	// browser or VS Code's Markdown preview.
+	const { text, html } = copyableFlavours(selection, tabPath);
+	e.clipboardData.setData('text/plain', text);
+	e.clipboardData.setData('text/html', html);
+	e.preventDefault();
 }

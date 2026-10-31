@@ -9,7 +9,7 @@
  * tab as `path === '' && title === 'Recents'`, which described the home tab as
  * it was first written and nothing since (#392). A literal that only some of
  * its readers know about is a literal that can fall out of step in silence, so
- * `singleImplementationConvention.test.ts` pins the string to this file.
+ * the `home-tab-sentinel` lint rule pins the string to this file.
  *
  * A tab kind is not really a path, and nothing stops a document from being
  * opened at a relative path spelled exactly `HOME`. Neither is fixed here, but
@@ -26,4 +26,18 @@ export const HOME_TAB_PATH = 'HOME';
  */
 export function isHomePath(path: string): boolean {
 	return path === HOME_TAB_PATH;
+}
+
+/**
+ * Whether the window draws the home screen instead of a document: an empty
+ * window, the home tab, or the Home button's overlay over any tab. Decided by
+ * tab kind, never by the localised title (#392).
+ *
+ * `activeTab` is a getter, read only when `showHome` is false: an effect that
+ * calls this must not re-run on a tab switch while the Home overlay is up.
+ */
+export function showsHomeScreen(activeTab: () => { path: string } | undefined, showHome: boolean): boolean {
+	if (showHome) return true;
+	const tab = activeTab();
+	return !tab || isHomePath(tab.path);
 }

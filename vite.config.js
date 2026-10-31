@@ -1,11 +1,28 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
+import adapter from "@sveltejs/adapter-static";
+import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
+import { monacoImePatch } from "./scripts/monacoImePatch.mjs";
 
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [sveltekit()],
+  // See scripts/monacoImePatch.mjs: a build-time patch to Monaco, to delete
+  // once microsoft/vscode#333909 ships in a release.
+  plugins: [
+    monacoImePatch,
+    sveltekit({
+      preprocess: vitePreprocess(),
+      // Tauri doesn't have a Node.js server to do proper SSR
+      // so we use adapter-static with a fallback to index.html to put the site in SPA mode
+      // See: https://svelte.dev/docs/kit/single-page-apps
+      // See: https://v2.tauri.app/start/frontend/sveltekit/ for more info
+      adapter: adapter({
+        fallback: "index.html",
+      }),
+    }),
+  ],
   build: {
     chunkSizeWarningLimit: 6000,
   },

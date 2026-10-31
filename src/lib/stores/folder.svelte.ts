@@ -1,0 +1,154 @@
+import { commands, events } from '../bindings.js';
+import type { UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+
+/** One child of a folder, as `read_folder_entries` lists it. */
+export interface FolderEntry {
+	name: string;
+	path: string;
+	isDir: boolean;
+}
+
+/** The folder a window's restore snapshot names, if any. */
+export function snapshotFolder(json: string): string | null {
+	try {
+		const root: unknown = JSON.parse(json)?.folderRoot;
+		return typeof root === 'string' && root !== '' ? root : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The folder open in this window's sidebar.
+ *
+ * Holds only what the reader has looked at: the root's children and those of
+ * each folder they expanded. Each of those folders is watched (one level,
+ * non-recursive) while it is expanded, and a `folder-changed` event re-reads
+ * that one listing. Collapsing a folder stops its watch and forgets its
+ * listing, so the cost of the sidebar is the part of the tree on screen.
+ */
+export class FolderManager {
+	root = $state<string | null>(null);
+	expanded = $state<string[]>([]);
+	entries = $state<Record<string, FolderEntry[]>>({});
+	error = $state<string | null>(null);
+
+	#unlisten: UnlistenFn | null = null;
+	/** Per folder, the read whose answer is still wanted. An older one landing late is dropped. */
+	#reads = new Map<string, number>();
+	#nextRead = 0;
+
+	rootName = $derived(this.root ? folderName(this.root) : '');
+
+	async open(path: string) {
+		await this.close();
+		this.root = path;
+		this.error = null;
+		this.#unlisten ??= await events.folderChanged(getCurrentWindow()).listen((event) => {
+			if (this.isLoaded(event.payload)) void this.#read(event.payload);
+		});
+		await this.#load(path);
+	}
+
+	async close() {
+		if (this.root === null) return;
+		this.root = null;
+		this.expanded = [];
+		this.entries = {};
+		this.error = null;
+		await commands.unwatchAllFolders().catch(console.error);
+	}
+
+	/** Reopens this window's folder from its snapshot, if it is still there. */
+	async restore(saved: string | null) {
+		if (!saved) return;
+		await this.open(saved);
+		// A folder deleted or unmounted since: drop it rather than show an error on launch.
+		if (this.error) await this.close();
+	}
+
+	isExpanded(path: string): boolean {
+		return this.expanded.includes(path);
+	}
+
+	isLoaded(path: string): boolean {
+		return path in this.entries;
+	}
+
+	async toggle(path: string) {
+		if (this.isExpanded(path)) {
+			this.#collapse(path);
+			return;
+		}
+		this.expanded = [...this.expanded, path];
+		await this.#load(path);
+	}
+
+	/** Forgets `path` and every folder expanded under it, and stops watching them. */
+	#collapse(path: string) {
+		this.expanded = this.expanded.filter((p) => p !== path && !isInside(p, path));
+		const kept: Record<string, FolderEntry[]> = {};
+		for (const [dir, list] of Object.entries(this.entries)) {
+			if (dir === path || isInside(dir, path)) {
+				commands.unwatchFolder(dir).catch(console.error);
+			} else {
+				kept[dir] = list;
+			}
+		}
+		this.entries = kept;
+	}
+
+	/** Re-reads every listing on screen, for the Refresh button. */
+	async refresh() {
+		await Promise.all(Object.keys(this.entries).map((dir) => this.#read(dir)));
+	}
+
+	async #load(path: string) {
+		await this.#read(path);
+		if (this.isLoaded(path)) await commands.watchFolder(path).catch(console.error);
+	}
+
+	async #read(path: string) {
+		const mine = ++this.#nextRead;
+		this.#reads.set(path, mine);
+		try {
+			const list = await commands.readFolderEntries(path);
+			if (!this.#landed(path, mine)) return;
+			// The folder may have been collapsed or closed while the read was in flight.
+			if (path !== this.root && !this.isExpanded(path)) return;
+			this.entries = { ...this.entries, [path]: list };
+			if (path === this.root) this.error = null;
+		} catch (error) {
+			if (!this.#landed(path, mine)) return;
+			if (path === this.root) {
+				this.error = String(error);
+			} else {
+				// A subfolder that vanished collapses; its parent's listing drops it on the next event.
+				this.#collapse(path);
+			}
+		}
+	}
+
+	/** Whether read `mine` of `path` is the newest one, retiring it if so. */
+	#landed(path: string, mine: number): boolean {
+		if (this.#reads.get(path) !== mine) return false;
+		this.#reads.delete(path);
+		return true;
+	}
+}
+
+/** The last component of a path, with either separator. */
+export function folderName(path: string): string {
+	const trimmed = path.replace(/[\\/]+$/, '');
+	const name = trimmed.split(/[\\/]/).pop();
+	return name || trimmed || path;
+}
+
+/** Whether `path` lies under `folder`, on either separator. */
+export function isInside(path: string, folder: string): boolean {
+	const base = folder.replace(/[\\/]+$/, '');
+	return path.length > base.length && path.startsWith(base) && (path[base.length] === '/' || path[base.length] === '\\');
+}
+
+export const folderManager = new FolderManager();

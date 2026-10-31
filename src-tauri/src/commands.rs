@@ -1,13 +1,11 @@
 //! Every `#[tauri::command]` the frontend can `invoke`, plus the blocking
 //! helpers they run on the pool.
-//!
-//! Split out of `lib.rs`; the code and its tests are unchanged.
 
 use crate::fs_safety::{
     atomic_write, canonical_identity, encode_text, ensure_path_within_root, read_to_string_lossy,
     resolve_image_directory, safe_path_component,
 };
-use crate::markdown::{build_markdown_preview, convert_markdown, heading_anchors, HeadingAnchor};
+use crate::markdown::{build_markdown_preview, convert_markdown_with, outline, Outline};
 use crate::window_runtime::{self, WatcherState};
 use std::fs;
 use std::path::Path;
@@ -19,6 +17,15 @@ const MAX_VSIX_UNCOMPRESSED_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_THEME_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const VSIX_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const VSIX_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs `f` on the blocking pool. A panicked task reports its `JoinError` text.
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+}
 
 /// Reads a VSIX entry as text under a hard byte ceiling.
 ///
@@ -60,35 +67,19 @@ fn validate_vsix_archive_limits<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
-/// Creates the destination window for a tab transfer. The window's label
-/// embeds the transfer token ("window-<token>"), so the new frontend can
-/// derive which pending transfer to claim from its own label — no URL
-/// query involved (the asset protocol 404s on "index.html?x=y" paths).
-/// Deliberately async. `WebviewWindowBuilder::build()` deadlocks on Windows
-/// when it runs inside a synchronous command: WebView2 needs the main thread
-/// to pump messages while the webview is created, but a sync command IS the
-/// main thread, blocked waiting for build() to return. The whole app then
-/// freezes — no new window, no menus, an unresponsive close button
-/// (tauri-apps/tauri#12521). An async command runs off the event loop, and
-/// Tauri dispatches the actual window creation to the main thread itself, so
-/// macOS's main-thread requirement is still satisfied.
-#[tauri::command]
-pub async fn create_transfer_window(app: AppHandle, token: String) -> Result<(), String> {
-    window_runtime::create_transfer_window(app, token)
-}
-
-/// Returns `(html, content, is_full, lossy, encoding)`. See `DecodedText`: the
+/// Returns `(content, is_full, lossy, encoding)`. See `DecodedText`: the
 /// frontend refuses to write a `lossy` buffer back over its file, and saves a
 /// faithful one as the `encoding` it came in.
 #[tauri::command]
+#[specta::specta]
 pub async fn open_markdown_preview(
     path: String,
     max_bytes: usize,
-) -> Result<(String, String, bool, bool, String), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+) -> Result<(String, bool, bool, String), String> {
+    blocking(move || {
+        crate::asset_protocol::trust_document_host(&path);
         let preview = build_markdown_preview(Path::new(&path), max_bytes)?;
         Ok((
-            preview.html,
             preview.content,
             preview.is_full,
             preview.lossy,
@@ -96,14 +87,18 @@ pub async fn open_markdown_preview(
         ))
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
+/// `front_matter_lines` is how many leading lines are front matter, which the
+/// frontend decides (`frontMatterFenceLines`); the same for the one below.
+/// Off the main thread like `markdown_semantic_spans`: Monaco asks on every edit.
 #[tauri::command]
-pub async fn list_heading_anchors(markdown: String) -> Result<Vec<HeadingAnchor>, String> {
-    tauri::async_runtime::spawn_blocking(move || Ok(heading_anchors(&markdown)))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()))
+#[specta::specta]
+pub async fn markdown_outline(
+    markdown: String,
+    front_matter_lines: usize,
+) -> Result<Outline, String> {
+    blocking(move || Ok(outline(&markdown, front_matter_lines))).await
 }
 
 /// The ranges the editor should colour, from the same parse the preview uses.
@@ -112,19 +107,35 @@ pub async fn list_heading_anchors(markdown: String) -> Result<Vec<HeadingAnchor>
 /// document and 24 ms for a 1.7 MB one, which is small but not nothing, and
 /// Monaco asks for this on every edit.
 #[tauri::command]
+#[specta::specta]
 pub async fn markdown_semantic_spans(
     content: String,
+    front_matter_lines: usize,
 ) -> Result<Vec<crate::semantic::SemanticSpan>, String> {
-    tauri::async_runtime::spawn_blocking(move || Ok(crate::semantic::semantic_spans(&content)))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()))
+    blocking(move || {
+        Ok(crate::semantic::semantic_spans(
+            &content,
+            front_matter_lines,
+        ))
+    })
+    .await
 }
 
+/// `split_blocks`: the preview's form, with `BLOCK_SEPARATOR` between
+/// top-level blocks. The export asks for the plain document.
 #[tauri::command]
-pub async fn render_markdown(content: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || Ok(convert_markdown(&content)))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()))
+#[specta::specta]
+pub async fn render_markdown(
+    content: String,
+    split_blocks: Option<bool>,
+) -> Result<String, String> {
+    blocking(move || {
+        Ok(convert_markdown_with(
+            &content,
+            split_blocks.unwrap_or(false),
+        ))
+    })
+    .await
 }
 
 /// Reads a file, with the fidelity of the decode and the encoding it was
@@ -133,33 +144,22 @@ pub async fn render_markdown(content: String) -> Result<String, String> {
 /// first auto-save does not write U+FFFD over a file that could not be read,
 /// and `encoding` so it does not write UTF-8 over one that could.
 ///
-/// This is now the only read-to-string command. Its sibling
-/// `read_file_content` returned the text and dropped the verdict; it survived
-/// #379 for callers that re-read a file whose tab was already flagged, then
-/// lost its last call site and stayed registered — a command whose defining
-/// property is that it hides the flag, one `invoke` away from any new caller.
-/// Deleting it makes "which command should this use" a question with one
-/// answer rather than a convention.
-///
-/// Deliberately async, like every other file-touching command here. A
-/// synchronous `#[tauri::command]` runs on the main thread, so a read from a
-/// slow volume (SMB, iCloud, a failing USB stick) freezes the whole
-/// application — every window, its menus and its scrolling — until the I/O
-/// returns. `spawn_blocking` moves the wait onto the blocking pool, which is
-/// what `tauri::async_runtime` provides it for.
+/// Async so a read from a slow volume (SMB, iCloud) waits on the blocking
+/// pool, not on the main thread that every window shares.
 #[tauri::command]
+#[specta::specta]
 pub async fn read_file_content_checked(path: String) -> Result<(String, bool, String), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
+        crate::asset_protocol::trust_document_host(&path);
         read_to_string_lossy(&path)
             .map(|decoded| (decoded.content, decoded.lossy, decoded.encoding))
             .map_err(|e| e.to_string())
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
-fn mime_type_for_export_path(path: &Path) -> &'static str {
-    match path
+fn mime_type_for_export_path(path: &Path) -> Option<&'static str> {
+    let mime = match path
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
@@ -173,8 +173,13 @@ fn mime_type_for_export_path(path: &Path) -> &'static str {
         Some("bmp") => "image/bmp",
         Some("ico") => "image/x-icon",
         Some("avif") => "image/avif",
-        _ => "application/octet-stream",
-    }
+        Some("tif") | Some("tiff") => "image/tiff",
+        Some("heic") => "image/heic",
+        Some("heif") => "image/heif",
+        Some("jxl") => "image/jxl",
+        _ => return None,
+    };
+    Some(mime)
 }
 
 fn file_bytes_to_data_url(mime_type: &str, bytes: &[u8]) -> String {
@@ -187,14 +192,18 @@ fn file_bytes_to_data_url(mime_type: &str, bytes: &[u8]) -> String {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn read_file_as_data_url(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
+        // Only image types: the HTML export is the only caller, and inlining
+        // whatever an `<img src>` names would embed `![](../../.ssh/id_rsa)`
+        // in a file meant to be shared.
+        let mime_type = mime_type_for_export_path(Path::new(&path))
+            .ok_or_else(|| format!("not an image: {path}"))?;
         let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-        let mime_type = mime_type_for_export_path(Path::new(&path));
         Ok(file_bytes_to_data_url(mime_type, &bytes))
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 /// Writes `content` to `path` as `encoding` — the label the file was decoded
@@ -213,17 +222,20 @@ pub async fn read_file_as_data_url(path: String) -> Result<String, String> {
 /// On a network or removable volume that is seconds of blocking I/O, and on
 /// the main thread it would stall every window until the save completes.
 #[tauri::command]
+#[specta::specta]
 pub async fn save_file_content(
     path: String,
     content: String,
     encoding: String,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
+        // As on read: a document saved to a share (Save As into
+        // `\\host\share\`) resolves its relative images against that host.
+        crate::asset_protocol::trust_document_host(&path);
         let bytes = encode_text(&content, &encoding)?;
         atomic_write(Path::new(&path), &bytes).map_err(|e| e.to_string())
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 /// Resolve `path` to the identity the filesystem gives it — see
@@ -238,22 +250,24 @@ pub async fn save_file_content(
 /// Async because `realpath` walks the path component by component and can hit
 /// a network volume that is slow or unreachable.
 #[tauri::command]
+#[specta::specta]
 pub async fn canonicalize_path(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         canonical_identity(Path::new(&path))
             .map(|resolved| resolved.to_string_lossy().into_owned())
             .map_err(|e| e.to_string())
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn print_pdf(window: tauri::WebviewWindow) -> Result<(), String> {
     window.print().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn export_pdf_windows(window: tauri::WebviewWindow, path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -339,22 +353,129 @@ pub async fn export_pdf_windows(window: tauri::WebviewWindow, path: String) -> R
 /// volume makes that wait the share's, and on the main thread it would stall
 /// every window until it returns.
 #[tauri::command]
+#[specta::specta]
 pub async fn open_file_folder(path: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || opener::reveal(path).map_err(|e| e.to_string()))
+    blocking(move || opener::reveal(path).map_err(|e| e.to_string())).await
+}
+
+/// Extensions whose default handler runs the file instead of showing it,
+/// including launchers and shortcuts that run or open something else.
+#[cfg(target_os = "macos")]
+const LAUNCHABLE_EXTENSIONS: &[&str] = &[
+    "app", "command", "tool", "terminal", "workflow", "action", "prefpane", "pkg", "mpkg",
+    "webloc", "inetloc", "fileloc", "jar", "sh", "bash", "zsh", "csh", "ksh", "py",
+];
+#[cfg(target_os = "windows")]
+const LAUNCHABLE_EXTENSIONS: &[&str] = &[
+    "exe",
+    "com",
+    "bat",
+    "cmd",
+    "ps1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "lnk",
+    "msi",
+    "msp",
+    "scr",
+    "hta",
+    "pif",
+    "cpl",
+    "reg",
+    "url",
+    "application",
+    "appref-ms",
+    "msc",
+    // hh.exe renders a compiled help file's HTML with script enabled.
+    "chm",
+    // msdt.exe runs the troubleshooter's embedded PowerShell.
+    "diagcab",
+    "jar",
+];
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const LAUNCHABLE_EXTENSIONS: &[&str] = &["desktop", "appimage", "run", "sh", "jar"];
+
+/// Whether opening `path` with the OS default handler would run a program.
+/// A symlink opens its target, so both names are checked.
+fn is_launchable(path: &Path) -> bool {
+    let target = fs::canonicalize(path).ok();
+    std::iter::once(path)
+        .chain(target.as_deref())
+        .any(|p| has_launchable_extension(p) || is_extensionless_executable(p))
+}
+
+fn has_launchable_extension(path: &Path) -> bool {
+    // Windows drops trailing dots and spaces from a name: `x.exe.` is `x.exe`.
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    name.trim_end_matches(['.', ' '])
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| LAUNCHABLE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// The executable bit only counts without an extension: a file with one is
+/// opened by the handler for its type, and on exFAT, NTFS and SMB volumes
+/// every file reports the bit set. An extensionless executable opens in
+/// Terminal on macOS and runs from Linux file managers.
+#[cfg(unix)]
+fn is_extensionless_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.extension().is_none()
+        && fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_extensionless_executable(_path: &Path) -> bool {
+    false
+}
+
+/// Asked before a local-file link is handed to `openPath`: a launchable
+/// target is revealed in the file manager instead of run. Async because the
+/// metadata read waits on whatever volume holds the path.
+#[tauri::command]
+#[specta::specta]
+pub async fn is_launchable_path(path: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || is_launchable(Path::new(&path)))
         .await
-        .unwrap_or_else(|e| Err(e.to_string()))
+        .unwrap_or(true)
 }
 
 /// Async because a rename is a round trip to whatever holds the path — on a
 /// network or removable volume, seconds of blocking I/O for a metadata
 /// operation that looks instant on a local disk.
 #[tauri::command]
+#[specta::specta]
 pub async fn rename_file(old_path: String, new_path: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        fs::rename(old_path, new_path).map_err(|e| e.to_string())
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()))
+    blocking(move || rename_file_blocking(Path::new(&old_path), Path::new(&new_path))).await
+}
+
+/// `fs::rename` replaces an existing target without asking, so a new name
+/// that is already taken is refused. The exception is a target that is the
+/// same file under another spelling — `a.md` to `A.md` on a case-insensitive
+/// volume — which `canonical_identity` recognizes.
+///
+/// A rename names a file in the same folder. The frontend builds the new path
+/// by swapping the last segment for what the user typed, so `sub/x.md` there
+/// would move the file into a subfolder and `..` would name the folder itself.
+fn rename_file_blocking(old_path: &Path, new_path: &Path) -> Result<(), String> {
+    if new_path.parent() != old_path.parent() || new_path.file_name().is_none() {
+        return Err("The new name must not contain a path separator".to_string());
+    }
+    if fs::symlink_metadata(new_path).is_ok() && !is_same_file(old_path, new_path) {
+        let name = new_path.file_name().unwrap_or_default().to_string_lossy();
+        return Err(format!("\"{name}\" already exists"));
+    }
+    fs::rename(old_path, new_path).map_err(|e| e.to_string())
+}
+
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    matches!(
+        (canonical_identity(a), canonical_identity(b)),
+        (Ok(a), Ok(b)) if a == b
+    )
 }
 
 /// Async because arming a watcher opens the watched path, and an unreachable
@@ -367,18 +488,18 @@ pub async fn rename_file(old_path: String, new_path: String) -> Result<(), Strin
 /// blocking task. It is injected by Tauri either way, so the command's
 /// frontend-facing arguments are unchanged.
 #[tauri::command]
+#[specta::specta]
 pub async fn watch_file(
     window: tauri::Window,
     handle: AppHandle,
     path: String,
 ) -> Result<(), String> {
     let state_handle = handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         let state = state_handle.state::<WatcherState>();
         window_runtime::watch_file(window, handle, state, path)
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 /// Records what colour the NEXT window should be painted before it has a webview.
@@ -391,11 +512,43 @@ pub async fn watch_file(
 /// file by the time it applies the theme, so it sends the answer instead.
 /// `app.rs` is the only reader — see the background colour it picks at startup.
 #[tauri::command]
-pub fn save_theme(app: AppHandle, theme: String) -> Result<(), String> {
+#[specta::specta]
+pub fn save_theme(app: AppHandle, theme: Appearance) -> Result<(), String> {
+    let theme_path = window_runtime::config_file(&app, "theme.txt")?;
+    atomic_write(&theme_path, theme.as_str().as_bytes()).map_err(|e| e.to_string())
+}
+
+/// What `save_theme` writes to `theme.txt` and `app.rs` reads back, one word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Appearance::System => "system",
+            Appearance::Light => "light",
+            Appearance::Dark => "dark",
+        }
+    }
+
+    /// `theme.txt` as written. Anything else — no file, or the raw theme name
+    /// older builds wrote — asks the OS.
+    pub fn from_saved(saved: &str) -> Self {
+        [Appearance::Light, Appearance::Dark]
+            .into_iter()
+            .find(|appearance| appearance.as_str() == saved)
+            .unwrap_or(Appearance::System)
+    }
+}
+
+fn themes_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
-    let theme_path = config_dir.join("theme.txt");
-    atomic_write(&theme_path, theme.as_bytes()).map_err(|e| e.to_string())
+    Ok(config_dir.join("themes"))
 }
 
 fn theme_slug(value: &str) -> String {
@@ -408,6 +561,7 @@ fn theme_slug(value: &str) -> String {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn fetch_vscode_theme(app: AppHandle, url: String) -> Result<String, String> {
     use std::io::Cursor;
     // Parse URL: e.g. https://vscodethemes.com/e/teabyii.ayu/ayu-dark-bordered
@@ -523,8 +677,7 @@ pub async fn fetch_vscode_theme(app: AppHandle, url: String) -> Result<String, S
         }
         let theme_json = read_zip_entry_to_string(theme_file, MAX_THEME_JSON_BYTES)?;
 
-        let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-        let themes_dir = config_dir.join("themes");
+        let themes_dir = themes_dir(&app)?;
         fs::create_dir_all(&themes_dir).map_err(|e| e.to_string())?;
 
         let dest_name = if matched_name_str.is_empty() {
@@ -543,9 +696,9 @@ pub async fn fetch_vscode_theme(app: AppHandle, url: String) -> Result<String, S
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn get_saved_vscode_themes(app: AppHandle) -> Result<Vec<String>, String> {
-    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    let themes_dir = config_dir.join("themes");
+    let themes_dir = themes_dir(&app)?;
     let mut themes = Vec::new();
     if let Ok(entries) = fs::read_dir(themes_dir) {
         for entry in entries.flatten() {
@@ -562,22 +715,46 @@ pub fn get_saved_vscode_themes(app: AppHandle) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn read_vscode_theme(app: AppHandle, name: String) -> Result<String, String> {
-    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let themes_dir = themes_dir(&app)?;
     let name = safe_path_component(&name, "theme name")?;
-    let theme_file_path = config_dir.join("themes").join(format!("{}.json", name));
+    let theme_file_path = themes_dir.join(format!("{}.json", name));
     fs::read_to_string(theme_file_path).map_err(|e| e.to_string())
 }
 
+/// Installs a theme carried in a settings file (#134), so importing settings
+/// on another machine does not mean finding the theme on vscodethemes.com again.
+/// The file may come from anyone: the name is one path component and the JSON
+/// is held to the same size limit as a downloaded theme.
 #[tauri::command]
+#[specta::specta]
+pub fn install_vscode_theme(app: AppHandle, name: String, json: String) -> Result<(), String> {
+    write_vscode_theme(&themes_dir(&app)?, &name, &json)
+}
+
+fn write_vscode_theme(themes_dir: &Path, name: &str, json: &str) -> Result<(), String> {
+    let name = safe_path_component(name, "theme name")?;
+    if json.len() as u64 > MAX_THEME_JSON_BYTES {
+        return Err("Theme exceeds the allowed size".to_string());
+    }
+    serde_json::from_str::<serde_json::Value>(json).map_err(|e| e.to_string())?;
+    fs::create_dir_all(themes_dir).map_err(|e| e.to_string())?;
+    atomic_write(&themes_dir.join(format!("{}.json", name)), json.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn delete_vscode_theme(app: AppHandle, name: String) -> Result<(), String> {
-    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let themes_dir = themes_dir(&app)?;
     let name = safe_path_component(&name, "theme name")?;
-    let theme_file_path = config_dir.join("themes").join(format!("{}.json", name));
+    let theme_file_path = themes_dir.join(format!("{}.json", name));
     fs::remove_file(theme_file_path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn is_win11() -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -603,6 +780,7 @@ pub fn is_win11() -> bool {
 /// CoreText on macOS) and the settings dialog invokes it on open. On the main
 /// thread it stalls every window for the duration.
 #[tauri::command]
+#[specta::specta]
 pub async fn get_system_fonts() -> Vec<String> {
     tauri::async_runtime::spawn_blocking(|| {
         use font_kit::source::SystemSource;
@@ -642,148 +820,170 @@ pub async fn get_system_fonts() -> Vec<String> {
 /// installer rather than overwriting anything in place, and macOS is the one
 /// platform where `bundle_type()` answers without the patch.
 #[tauri::command]
+#[specta::specta]
 pub fn self_update_supported(app: AppHandle) -> bool {
     #[cfg(target_os = "linux")]
-    {
-        app.env().appimage.is_some()
-    }
+    let is_appimage = app.env().appimage.is_some();
     #[cfg(not(target_os = "linux"))]
-    {
+    let is_appimage = {
         let _ = app;
-        true
-    }
+        false
+    };
+    self_update_supported_for(is_appimage)
+}
+
+/// Only Linux is gated: there only an AppImage can be replaced in place.
+fn self_update_supported_for(is_appimage: bool) -> bool {
+    !cfg!(target_os = "linux") || is_appimage
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn get_os_type() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        "macos".to_string()
+    match std::env::consts::OS {
+        os @ ("macos" | "windows" | "linux") => os,
+        _ => "unknown",
     }
-    #[cfg(target_os = "windows")]
-    {
-        "windows".to_string()
+    .to_string()
+}
+
+/// Keep one `arboard::Clipboard` alive for the rest of the process, so that
+/// what we copy survives the command that copied it (#729).
+///
+/// On X11 there is no clipboard store: the copying process owns the CLIPBOARD
+/// selection and hands the bytes over when another app asks for them. arboard
+/// serves those requests from a background thread and an invisible window it
+/// destroys when the last `Clipboard` drops — which, with one built and
+/// dropped per command, is the moment `clipboard_write_text` returns. Its only
+/// parting move is to offer the data to a clipboard manager, so on a desktop
+/// that ships one (GNOME) copying appears to work and on one that does not
+/// (XFCE, the reporter's) everything Markpad copies is gone before it can be
+/// pasted. Holding an instance keeps the window and the ownership; the
+/// per-command `Clipboard::new()`s below reuse arboard's global and their drop
+/// becomes a no-op.
+///
+/// Nowhere else needs this. On Wayland arboard uses the data-control protocol
+/// (wl-clipboard-rs) when `WAYLAND_DISPLAY` is set and the compositor offers
+/// it. Each copy is then served by a detached thread that no `Clipboard` owns,
+/// so the instance forgotten here is an empty struct. A compositor without the
+/// protocol falls back to X11 through XWayland, where the above applies. macOS
+/// and Windows write into a store the system owns.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn retain_clipboard_ownership() {
+    use std::sync::atomic::AtomicBool;
+    static RETAINED: AtomicBool = AtomicBool::new(false);
+
+    retain_forever(&RETAINED, || arboard::Clipboard::new().ok());
+}
+
+/// Builds one value with `make` and never drops it. Racing threads would leak a
+/// second handle, not a second connection; both are `Arc`s onto the same
+/// global. Failure is not recorded, so a copy attempted before the display is
+/// reachable does not poison later ones.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn retain_forever<T>(retained: &std::sync::atomic::AtomicBool, make: impl FnOnce() -> Option<T>) {
+    use std::sync::atomic::Ordering;
+    if retained.load(Ordering::Relaxed) {
+        return;
     }
-    #[cfg(target_os = "linux")]
-    {
-        "linux".to_string()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        "unknown".to_string()
+    if let Some(value) = make() {
+        std::mem::forget(value);
+        retained.store(true, Ordering::Relaxed);
     }
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn clipboard_write_text(text: String) -> Result<(), String> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    retain_clipboard_ownership();
+
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     clipboard.set_text(text).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn clipboard_read_text() -> Result<String, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     clipboard.get_text().map_err(|e| e.to_string())
 }
 
+/// Files copied in Explorer or Finder: the clipboard holds their paths, not
+/// their pixels (#768). A path that is not valid UTF-8 is skipped, since the
+/// frontend could not hand it back to `copy_file_to_img`.
 #[tauri::command]
-pub fn clipboard_read_image(macos_image_scaling: bool) -> Result<String, String> {
+#[specta::specta]
+pub fn clipboard_read_file_list() -> Result<Vec<String>, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    let paths = clipboard.get().file_list().map_err(|e| e.to_string())?;
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| path.into_os_string().into_string().ok())
+        .collect())
+}
+
+/// Async so the resize and PNG encode of a screenshot-sized image run on the
+/// blocking pool: a sync command runs on the main thread and freezes the window.
+#[tauri::command]
+#[specta::specta]
+pub async fn clipboard_read_image(macos_image_scaling: bool) -> Result<String, String> {
+    blocking(move || clipboard_read_image_blocking(macos_image_scaling)).await
+}
+
+fn clipboard_read_image_blocking(macos_image_scaling: bool) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     let _ = macos_image_scaling;
 
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     let image = clipboard.get_image().map_err(|e| e.to_string())?;
 
-    // encode as png
+    let (bytes, width, height) = (image.bytes, image.width as u32, image.height as u32);
+
+    #[cfg(target_os = "macos")]
+    let (bytes, width, height) = if macos_image_scaling {
+        use image::{DynamicImage, RgbaImage};
+        // Whole pixels only, zero-padded to the declared size: a short buffer
+        // leaves the missing pixels transparent rather than failing.
+        let mut raw = bytes[..bytes.len() / 4 * 4].to_vec();
+        raw.resize(width as usize * height as usize * 4, 0);
+        let buffer = RgbaImage::from_raw(width, height, raw)
+            .ok_or_else(|| "Clipboard image is too large".to_string())?;
+        let (width, height) = (width / 2, height / 2);
+        let resized = DynamicImage::ImageRgba8(buffer).resize(
+            width,
+            height,
+            image::imageops::FilterType::Lanczos3,
+        );
+        (
+            std::borrow::Cow::Owned(resized.to_rgba8().into_raw()),
+            width,
+            height,
+        )
+    } else {
+        (bytes, width, height)
+    };
+
+    use image::ImageEncoder;
     let mut png_data = Vec::new();
-    {
-        let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
-        use image::ImageEncoder;
-
-        // Check if running on macOS and scale image if needed
-        #[cfg(target_os = "macos")]
-        {
-            if macos_image_scaling {
-                // Use image crate for high-quality scaling
-                use image::{DynamicImage, ImageBuffer, Rgba};
-
-                // Convert arboard Image to ImageBuffer
-                let mut img_buffer = ImageBuffer::new(image.width as u32, image.height as u32);
-                for (x, y, pixel) in img_buffer.enumerate_pixels_mut() {
-                    let idx = (y * image.width as u32 + x) as usize * 4;
-                    if idx + 3 < image.bytes.len() {
-                        *pixel = Rgba([
-                            image.bytes[idx],
-                            image.bytes[idx + 1],
-                            image.bytes[idx + 2],
-                            image.bytes[idx + 3],
-                        ]);
-                    }
-                }
-
-                // Create DynamicImage
-                let dynamic_image = DynamicImage::ImageRgba8(img_buffer);
-
-                // Resize with high-quality Lanczos3 filter
-                let resized = dynamic_image.resize(
-                    (image.width / 2) as u32,
-                    (image.height / 2) as u32,
-                    image::imageops::FilterType::Lanczos3,
-                );
-
-                // Write the resized image
-                let resized_rgba = resized.to_rgba8();
-                encoder
-                    .write_image(
-                        resized_rgba.as_raw(),
-                        (image.width / 2) as u32,
-                        (image.height / 2) as u32,
-                        image::ExtendedColorType::Rgba8,
-                    )
-                    .map_err(|e| e.to_string())?;
-            } else {
-                // Use original image if scaling is disabled
-                encoder
-                    .write_image(
-                        image.bytes.as_ref(),
-                        image.width as u32,
-                        image.height as u32,
-                        image::ExtendedColorType::Rgba8,
-                    )
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            // For other platforms, use the original image
-            encoder
-                .write_image(
-                    image.bytes.as_ref(),
-                    image.width as u32,
-                    image.height as u32,
-                    image::ExtendedColorType::Rgba8,
-                )
-                .map_err(|e| e.to_string())?;
-        }
-    }
+    image::codecs::png::PngEncoder::new(&mut png_data)
+        .write_image(&bytes, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|e| e.to_string())?;
 
     use base64::{engine::general_purpose, Engine as _};
     Ok(general_purpose::STANDARD.encode(&png_data))
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn save_image(
     parent_dir: String,
     filename: String,
     base64_data: String,
     image_directory: String,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        save_image_blocking(&parent_dir, &filename, &base64_data, &image_directory)
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()))
+    blocking(move || save_image_blocking(&parent_dir, &filename, &base64_data, &image_directory))
+        .await
 }
 
 fn save_image_blocking(
@@ -811,26 +1011,26 @@ fn save_image_blocking(
 
     atomic_write(&file_path, &bytes).map_err(|e| e.to_string())?;
 
-    let rel_path = if image_directory.is_empty() {
-        filename.to_string()
-    } else {
-        format!("{}/{}", image_directory, filename)
-    };
+    Ok(image_rel_path(image_directory, filename))
+}
 
-    Ok(rel_path)
+/// The link text for `name` in `image_directory`, relative to the document.
+fn image_rel_path(image_directory: &str, name: &str) -> String {
+    if image_directory.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", image_directory, name)
+    }
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn copy_file_to_img(
     src_path: String,
     parent_dir: String,
     image_directory: String,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        copy_file_to_img_blocking(&src_path, &parent_dir, &image_directory)
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()))
+    blocking(move || copy_file_to_img_blocking(&src_path, &parent_dir, &image_directory)).await
 }
 
 /// How many conflict names to try before giving up. Chromium's download path
@@ -840,18 +1040,9 @@ const MAX_IMG_NAME_ATTEMPTS: u32 = 100;
 
 /// Builds the `attempt`-th conflict name, e.g. `photo_1.png`, `photo_2.png`.
 ///
-/// Every mainstream implementation resolves a name conflict with an
-/// incrementing counter — Chrome/Firefox downloads (`photo (1).png`), Windows
-/// Explorer (`photo (2).png`), macOS Finder (`photo 2.png`) — and none uses a
-/// timestamp. They disagree only on the decoration, so this picks the one that
-/// survives the destination: the name is about to be pasted into a Markdown
-/// link, where parentheses are metacharacters and spaces need escaping, while
-/// `_` needs neither. It is also the separator this function already used.
-///
-/// An empty extension gets no separator: `Path::extension()` is `None` for a
-/// dotfile such as `.png`, and appending the dot unconditionally produced
-/// `photo_1.` — a name Windows silently creates *without* the trailing dot,
-/// leaving the link written into the document pointing at nothing.
+/// `_` because the name goes into a Markdown link, where `()` and spaces need
+/// escaping. No dot when `ext` is empty (a dotfile such as `.png`): Windows
+/// drops a trailing dot, and the link would point at nothing.
 fn img_conflict_name(stem: &str, ext: &str, attempt: u32) -> String {
     if ext.is_empty() {
         format!("{stem}_{attempt}")
@@ -881,21 +1072,10 @@ fn copy_file_to_img_blocking(
 
     let mut source = fs::File::open(src).map_err(|e| e.to_string())?;
 
-    // The destination name is claimed with `create_new`, which is a single
-    // atomic syscall (`O_EXCL` / `CREATE_NEW`): whoever creates the file wins
-    // and everyone else gets `AlreadyExists` and moves to the next name. The
-    // previous code tested `exists()` and then copied, so two drops that
-    // computed the same name — trivially, since the name carried a
-    // second-resolution timestamp that was never re-checked — both saw the
-    // name as free and the second overwrote an image the document already
-    // linked to.
-    //
-    // Residual races: `O_EXCL` is not reliable on old NFSv2 mounts, and
-    // nothing stops an outside process from deleting our file after we create
-    // it. Neither is a same-app data-loss path, which is what this guards.
-    // Streaming into the handle we just created, rather than `fs::copy`, also
-    // means the copy no longer inherits the source's permission bits — a
-    // read-only original used to produce a read-only file in `img/`.
+    // `create_new` claims the name atomically (`O_EXCL` / `CREATE_NEW`), so
+    // two concurrent drops cannot overwrite each other's image. Streaming into
+    // our own handle, rather than `fs::copy`, keeps a read-only source's mode
+    // bits off the copy.
     let mut dest_name = file_name.to_string();
     let mut attempt: u32 = 0;
     loop {
@@ -931,13 +1111,7 @@ fn copy_file_to_img_blocking(
         }
     }
 
-    let rel_path = if image_directory.is_empty() {
-        dest_name
-    } else {
-        format!("{}/{}", image_directory, dest_name)
-    };
-
-    Ok(rel_path)
+    Ok(image_rel_path(image_directory, &dest_name))
 }
 
 /// Async because `fs::copy` streams the whole file. On a network or removable
@@ -945,17 +1119,24 @@ fn copy_file_to_img_blocking(
 /// stall every window until the copy completes — the same reason its sibling
 /// `copy_file_to_img` already runs on the blocking pool.
 #[tauri::command]
+#[specta::specta]
 pub async fn copy_file(src: String, dest: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        fs::copy(src, dest).map(|_| ()).map_err(|e| e.to_string())
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()))
+    blocking(move || copy_file_blocking(Path::new(&src), Path::new(&dest))).await
+}
+
+/// `fs::copy` truncates `dest` before reading `src`, so copying a file onto
+/// itself would empty it. That copy is a no-op, and is skipped as one.
+fn copy_file_blocking(src: &Path, dest: &Path) -> Result<(), String> {
+    if is_same_file(src, dest) {
+        return Ok(());
+    }
+    fs::copy(src, dest).map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn list_directory_contents(path: String) -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
         let dir = Path::new(&path);
         if !dir.exists() || !dir.is_dir() {
             return Err("Not a directory".to_string());
@@ -975,7 +1156,6 @@ pub async fn list_directory_contents(path: String) -> Result<Vec<String>, String
         Ok(entries)
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 #[cfg(test)]
@@ -983,6 +1163,47 @@ pub(crate) mod tests {
     use super::*;
     use crate::fs_safety::tests::temp_path;
     use std::path::PathBuf;
+
+    /// Compiles only when `command` returns a future: Tauri runs a sync command
+    /// on the main thread, which freezes every window until it returns.
+    pub(crate) fn runs_off_the_main_thread<F: std::future::Future>(_command: F) {}
+
+    #[test]
+    fn clipboard_read_image_runs_off_the_main_thread() {
+        // The resize and PNG encode of a screenshot-sized image. Built, never run.
+        let _ = || runs_off_the_main_thread(clipboard_read_image(false));
+    }
+
+    // The window colour at startup comes from the word `save_theme` wrote, so
+    // the reader has to know every word the writer can send, and the words
+    // already in users' theme.txt files keep their meaning.
+    #[test]
+    fn the_startup_reader_reads_back_every_appearance_save_theme_writes() {
+        for appearance in [Appearance::System, Appearance::Light, Appearance::Dark] {
+            assert_eq!(Appearance::from_saved(appearance.as_str()), appearance);
+        }
+        assert_eq!(Appearance::from_saved("dark"), Appearance::Dark);
+        assert_eq!(Appearance::from_saved("light"), Appearance::Light);
+        assert_eq!(
+            Appearance::from_saved("vscode:Ayu Dark"),
+            Appearance::System
+        );
+    }
+
+    #[test]
+    fn an_imported_theme_is_written_only_when_its_name_and_json_are_safe() {
+        let themes = temp_path("install-theme").join("themes");
+        write_vscode_theme(&themes, "ayu-dark", r#"{"type":"dark"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(themes.join("ayu-dark.json")).unwrap(),
+            r#"{"type":"dark"}"#
+        );
+
+        assert!(write_vscode_theme(&themes, "../escape", "{}").is_err());
+        assert!(write_vscode_theme(&themes, "broken", "not json").is_err());
+        assert!(!themes.join("broken.json").exists());
+        let _ = fs::remove_dir_all(themes.parent().unwrap());
+    }
 
     #[test]
     fn zip_entry_reads_stop_at_the_limit_even_when_the_header_understates_size() {
@@ -1003,20 +1224,145 @@ pub(crate) mod tests {
     fn export_data_url_uses_mime_from_extension_case_insensitively() {
         assert_eq!(
             mime_type_for_export_path(Path::new("diagram.PNG")),
-            "image/png"
+            Some("image/png")
         );
         assert_eq!(
             mime_type_for_export_path(Path::new("photo.JpEg")),
-            "image/jpeg"
+            Some("image/jpeg")
         );
         assert_eq!(
             mime_type_for_export_path(Path::new("vector.svg")),
-            "image/svg+xml"
+            Some("image/svg+xml")
         );
-        assert_eq!(
-            mime_type_for_export_path(Path::new("unknown.bin")),
-            "application/octet-stream"
-        );
+        assert_eq!(mime_type_for_export_path(Path::new("unknown.bin")), None);
+    }
+
+    /// Image types that inlined as octet-stream before export was limited to
+    /// the table keep inlining, now under their own type.
+    #[test]
+    fn export_data_url_knows_the_less_common_image_types() {
+        for (name, mime) in [
+            ("scan.tif", "image/tiff"),
+            ("scan.TIFF", "image/tiff"),
+            ("photo.heic", "image/heic"),
+            ("photo.heif", "image/heif"),
+            ("photo.avif", "image/avif"),
+            ("photo.jxl", "image/jxl"),
+        ] {
+            assert_eq!(
+                mime_type_for_export_path(Path::new(name)),
+                Some(mime),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_data_url_inlines_images_only() {
+        // `![](../../.ssh/id_rsa)` was read and base64-embedded into the
+        // exported HTML as `application/octet-stream`.
+        let root = temp_path("export-data-url");
+        fs::create_dir_all(&root).unwrap();
+        let key = root.join("id_rsa");
+        let image = root.join("pic.png");
+        fs::write(&key, b"secret").unwrap();
+        fs::write(&image, b"png").unwrap();
+
+        let read = |path: &PathBuf| {
+            tauri::async_runtime::block_on(read_file_as_data_url(
+                path.to_string_lossy().into_owned(),
+            ))
+        };
+        assert!(read(&key).is_err());
+        assert_eq!(read(&image).unwrap(), "data:image/png;base64,cG5n");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_to_a_share_trusts_its_host_like_a_read_does() {
+        // Save As into `\\host\share\` left the host untrusted until the
+        // file was reopened, so its relative images were refused. The write
+        // itself fails here (no such share); the attempt already touched it.
+        let doc = "//markpad-saved.invalid/share/doc.md";
+        assert!(!crate::asset_protocol::is_trusted_host(doc));
+        let _ = tauri::async_runtime::block_on(save_file_content(
+            doc.to_owned(),
+            String::new(),
+            "UTF-8".to_owned(),
+        ));
+        assert!(crate::asset_protocol::is_trusted_host(
+            "//markpad-saved.invalid/share/pic.png"
+        ));
+    }
+
+    #[test]
+    fn a_link_to_a_program_is_launchable_and_a_data_file_is_not() {
+        let root = temp_path("launchable");
+        fs::create_dir_all(root.join("folder")).unwrap();
+        for name in [
+            "data.csv",
+            "report.pdf",
+            "notes.txt",
+            "tool.jar",
+            "Setup.JAR",
+        ] {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        let launchable = |name: &str| is_launchable(&root.join(name));
+
+        assert!(!launchable("data.csv"));
+        assert!(!launchable("report.pdf"));
+        assert!(!launchable("notes.txt"));
+        assert!(!launchable("folder"));
+        assert!(launchable("tool.jar"));
+        assert!(launchable("Setup.JAR"));
+        // Windows drops trailing dots and spaces from a name, so `x.jar.`
+        // opens `x.jar`.
+        assert!(launchable("tool.jar. "));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let program = root.join("program");
+            fs::write(&program, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(launchable("program"));
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!launchable("program"));
+
+            // A symlink opens its target.
+            std::os::unix::fs::symlink(root.join("tool.jar"), root.join("innocent")).unwrap();
+            assert!(launchable("innocent"));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            fs::create_dir_all(root.join("Calculator.app")).unwrap();
+            assert!(launchable("Calculator.app"));
+            assert!(launchable("setup.command"));
+            assert!(launchable("run.terminal"));
+        }
+
+        #[cfg(target_os = "windows")]
+        for name in [
+            "x.exe", "x.bat", "x.cmd", "x.ps1", "x.vbs", "x.lnk", "x.msi", "x.scr", "x.hta",
+        ] {
+            assert!(launchable(name), "{name}");
+        }
+
+        // Not programs, but their handlers run script the file carries.
+        #[cfg(target_os = "windows")]
+        for name in ["x.chm", "x.diagcab"] {
+            assert!(launchable(name), "{name}");
+        }
+
+        #[cfg(target_os = "linux")]
+        for name in ["x.desktop", "x.AppImage"] {
+            assert!(launchable(name), "{name}");
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1025,6 +1371,80 @@ pub(crate) mod tests {
             file_bytes_to_data_url("image/png", b"Markpad"),
             "data:image/png;base64,TWFya3BhZA==",
         );
+    }
+
+    #[test]
+    fn renaming_onto_an_existing_file_refuses_and_keeps_both() {
+        // Tab rename called `fs::rename` straight through, and rename replaces
+        // an existing target without asking: renaming a.md to b.md in a folder
+        // that already held b.md destroyed b.md.
+        let root = temp_path("rename-existing");
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.md");
+        let b = root.join("b.md");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+
+        assert!(rename_file_blocking(&a, &b).is_err());
+        assert_eq!(fs::read(&a).unwrap(), b"a");
+        assert_eq!(fs::read(&b).unwrap(), b"b");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_rename_never_leaves_the_files_folder() {
+        // The new name is typed into the tab's Rename prompt and joined onto
+        // the old folder, so a separator in it would move the file.
+        let root = temp_path("rename-separator");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let a = root.join("a.md");
+        fs::write(&a, b"a").unwrap();
+
+        assert!(rename_file_blocking(&a, &root.join("sub").join("x.md")).is_err());
+        assert!(rename_file_blocking(&a, &root.join("..")).is_err());
+        assert_eq!(fs::read(&a).unwrap(), b"a");
+        assert!(!root.join("sub").join("x.md").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_case_only_rename_still_goes_through() {
+        // On a case-insensitive volume `A.md` already "exists" — it is a.md
+        // itself — so the existing-target check must compare identity, not
+        // just ask whether the new name resolves.
+        let root = temp_path("rename-case");
+        fs::create_dir_all(&root).unwrap();
+        let lower = root.join("a.md");
+        let upper = root.join("A.md");
+        fs::write(&lower, b"a").unwrap();
+
+        rename_file_blocking(&lower, &upper).unwrap();
+        let names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["A.md"]);
+        assert_eq!(fs::read(&upper).unwrap(), b"a");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copying_a_file_onto_itself_leaves_it_intact() {
+        // "Save image as" onto the image's own path: `fs::copy` opens the
+        // destination with truncate before reading the source, so the file
+        // came out empty.
+        let root = temp_path("copy-self");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("pic.png");
+        fs::write(&file, b"image bytes").unwrap();
+
+        copy_file_blocking(&file, &file).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"image bytes");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1152,5 +1572,49 @@ pub(crate) mod tests {
         }
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_linux_gates_self_update() {
+        // Windows runs the downloaded NSIS installer and macOS replaces the
+        // bundle, so neither may be gated; on Linux only an AppImage updates.
+        if cfg!(target_os = "linux") {
+            assert!(self_update_supported_for(true));
+            assert!(!self_update_supported_for(false));
+        } else {
+            assert!(self_update_supported_for(false));
+            assert!(self_update_supported_for(true));
+        }
+    }
+
+    #[test]
+    fn the_retained_clipboard_handle_is_never_dropped() {
+        // #729: arboard gives up X11 clipboard ownership when its last handle
+        // drops, so the handle retained for the copy command must outlive it.
+        use std::cell::Cell;
+        use std::sync::atomic::AtomicBool;
+
+        struct Handle<'a>(&'a Cell<u32>);
+        impl Drop for Handle<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Cell::new(0);
+        let made = Cell::new(0);
+        let retained = AtomicBool::new(false);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(Handle(&drops))
+        };
+
+        // A display not reachable yet is not recorded as retained.
+        retain_forever::<Handle>(&retained, || None);
+        retain_forever(&retained, make);
+        retain_forever(&retained, make);
+
+        assert_eq!(made.get(), 1, "one handle, built once");
+        assert_eq!(drops.get(), 0, "and never dropped");
     }
 }

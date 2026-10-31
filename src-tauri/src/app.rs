@@ -1,12 +1,11 @@
-//! The Tauri application itself: the builder chain, the macOS menu, and the
-//! command registry.
-//!
-//! Split out of `lib.rs`; the code is unchanged.
+//! The Tauri application itself: the builder chain and the command registry.
+//! The macOS menu bar is built by each window's frontend (`appMenu.ts`).
 
 use crate::window_runtime::{AppState, WatcherState};
 use crate::{asset_protocol, commands, tab_transfer, window_runtime};
 use std::fs;
-use tauri::{Emitter, Manager};
+use tauri::{Manager, Runtime};
+use tauri_specta::{collect_commands, collect_events, Event};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -24,14 +23,19 @@ pub fn run() {
         );
     }
 
+    let specta = bindings_builder();
+    let invoke_handler = specta.invoke_handler();
     tauri::Builder::default()
+        // The frontend installs the menu; Tauri's default would answer ⌘W and
+        // friends natively until it does.
+        .enable_macos_default_menu(false)
         .manage(AppState::new())
         .manage(WatcherState::new())
+        .manage(crate::folder::FolderWatcherState::new())
         .manage(tab_transfer::TabTransferBroker::new())
-        // Replaces Tauri's own `asset:` handler, which reads the file on the
-        // thread the webview calls it on — see `asset_protocol` for why that
-        // freezes every window on an unreachable path. Registering the scheme
-        // here is what suppresses the built-in one.
+        // Replaces Tauri's own `asset:` handler so UNC hosts go through
+        // `asset_protocol`'s trust rule. Registering the scheme here is what
+        // suppresses the built-in one.
         .register_asynchronous_uri_scheme_protocol("asset", |ctx, request, responder| {
             let scope = ctx.app_handle().asset_protocol_scope();
             tauri::async_runtime::spawn_blocking(move || {
@@ -45,191 +49,63 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             window_runtime::handle_single_instance(app, args, cwd);
         }))
+        // After single-instance, which ends a second launch in its setup, and
+        // before window-state reads its file: adoption moves files, geometry
+        // included, and only the instance that stays may touch them.
+        .plugin(
+            tauri::plugin::Builder::<_, ()>::new("launch-session")
+                .setup(|app, _| {
+                    window_runtime::adopt_remembered_window(app);
+                    Ok(())
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_prevent_default::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
-                .with_state_flags(
-                    tauri_plugin_window_state::StateFlags::SIZE
-                        | tauri_plugin_window_state::StateFlags::POSITION
-                        | tauri_plugin_window_state::StateFlags::MAXIMIZED
-                        | tauri_plugin_window_state::StateFlags::VISIBLE
-                        | tauri_plugin_window_state::StateFlags::FULLSCREEN,
-                )
-                // Detached tab windows share one saved state instead of
-                // accumulating a state entry per generated label.
-                .map_label(|label| {
-                    if label.starts_with("window-") {
-                        "secondary"
-                    } else {
-                        label
-                    }
-                })
+                .with_state_flags(window_runtime::geometry_flags())
+                // No `map_label`: a secondary window keeps its label across
+                // relaunches, so each one gets its own size and position back.
+                // ponytail: entries of windows that never come back stay in
+                // the plugin's file (~200 bytes each, no removal API); prune it
+                // before the plugin loads if that ever matters.
                 .build(),
         )
-        .setup(|app| {
-            let args: Vec<String> = std::env::args().collect();
-
-            let label = "main";
-
-            let mut window_builder = tauri::WebviewWindowBuilder::new(
-                app,
-                label,
-                tauri::WebviewUrl::App("index.html".into()),
-            )
-            .title("Markpad")
-            .inner_size(900.0, 650.0)
-            .min_inner_size(400.0, 300.0)
-            .visible(false)
-            // Half of "a cold start does not steal focus"; the other half is
-            // `show_window`. Windows maps `show()` to `SW_SHOW`, which
-            // activates, so dropping the `set_focus` call there is not enough
-            // on its own. This sets tao's one-shot `MARKER_DONT_FOCUS`, which
-            // makes the FIRST show use `SW_SHOWNOACTIVATE` and is then cleared,
-            // so every later show still comes to the front. On macOS and Linux
-            // it is a no-op: tao only reads `focused` for a window that is
-            // built visible, and this one is not.
-            .focused(false)
-            .resizable(true)
-            .shadow(false)
-            .center();
-
-            #[cfg(target_os = "macos")]
-            {
-                window_builder = window_builder
-                    .decorations(true)
-                    .title_bar_style(tauri::TitleBarStyle::Overlay)
-                    .hidden_title(true);
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            {
-                window_builder = window_builder.decorations(false);
-            }
-
-            let window = window_builder.build()?;
-
-            #[cfg(target_os = "macos")]
-            {
-                use tauri::menu::{
-                    MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
-                };
-
-                let app_name = app.package_info().name.clone();
-
-                let check_item =
-                    MenuItemBuilder::with_id("check-updates", "Check for Updates…").build(app)?;
-                let settings_item = MenuItemBuilder::with_id("menu-app-settings", "Settings…")
-                    .accelerator("CmdOrCtrl+,")
-                    .build(app)?;
-
-                let app_submenu = SubmenuBuilder::new(app, &app_name)
-                    .item(&PredefinedMenuItem::about(
-                        app,
-                        Some(&format!("About {}", app_name)),
-                        None,
-                    )?)
-                    .separator()
-                    .item(&settings_item)
-                    .item(&check_item)
-                    .separator()
-                    .item(&PredefinedMenuItem::services(app, None)?)
-                    .separator()
-                    .item(&PredefinedMenuItem::hide(app, None)?)
-                    .separator()
-                    .item(
-                        &MenuItemBuilder::with_id("menu-app-quit", format!("Quit {}", app_name))
-                            .accelerator("CmdOrCtrl+Q")
-                            .build(app)?,
-                    )
-                    .build()?;
-
-                // WKWebView declines ⌘X/⌘C/⌘V/⌘A/⌘Z in plain inputs and hands
-                // them to the main menu, so without an Edit submenu those keys
-                // are dead in every native field (settings, modals). Monaco is
-                // unaffected either way: it preventDefault()s the key first, so
-                // the menu never sees it and its own paste handler still runs.
-                let edit_submenu = SubmenuBuilder::new(app, "Edit")
-                    .item(&PredefinedMenuItem::undo(app, None)?)
-                    .item(&PredefinedMenuItem::redo(app, None)?)
-                    .separator()
-                    .item(&PredefinedMenuItem::cut(app, None)?)
-                    .item(&PredefinedMenuItem::copy(app, None)?)
-                    .item(&PredefinedMenuItem::paste(app, None)?)
-                    .item(&PredefinedMenuItem::select_all(app, None)?)
-                    .build()?;
-
-                // ⌘M and ⌃⌘F are window-server actions, not document actions:
-                // there is no web API the in-window controls could bind them
-                // to, so they only exist as long as a menu item carries them.
-                // Full Screen belongs in a View menu by convention, but View
-                // would hold that one item and nothing else — Markpad's view
-                // actions are all in-window (#281) — so it rides here instead.
-                let window_submenu = SubmenuBuilder::new(app, "Window")
-                    .item(&PredefinedMenuItem::minimize(app, None)?)
-                    .separator()
-                    .item(&PredefinedMenuItem::fullscreen(app, None)?)
-                    .build()?;
-
-                let menu = MenuBuilder::new(app)
-                    .items(&[&app_submenu, &edit_submenu, &window_submenu])
-                    .build()?;
-
-                app.set_menu(menu)?;
-            }
-
-            let config_dir = app.path().app_config_dir()?;
-            let theme_path = config_dir.join("theme.txt");
-            let theme_pref =
-                fs::read_to_string(theme_path).unwrap_or_else(|_| "system".to_string());
-
-            // An APPEARANCE, written by `save_theme` — see the note there. It
-            // used to be the raw theme setting, which meant every `vscode:<name>`
-            // theme landed in the fallback arm below and asked the OS instead: a
-            // dark VS Code theme on a light desktop flashed a white window on
-            // every launch. A file left over from that older format still lands
-            // there, and self-corrects as soon as the frontend applies its theme.
-            let bg_color = match theme_pref.as_str() {
-                "dark" => Some(tauri::window::Color(24, 24, 24, 255)),
-                "light" => Some(tauri::window::Color(253, 253, 253, 255)),
-                _ => {
-                    if let Ok(t) = window.theme() {
-                        match t {
-                            tauri::Theme::Dark => Some(tauri::window::Color(24, 24, 24, 255)),
-                            _ => Some(tauri::window::Color(253, 253, 253, 255)),
-                        }
-                    } else {
-                        Some(tauri::window::Color(253, 253, 253, 255))
-                    }
-                }
-            };
-
-            let _ = window.set_background_color(bg_color);
-
-            let _ = window.set_shadow(true);
-
-            // Same vetting as `send_markdown_path`, which reads the same argv:
-            // the frontend consumes BOTH channels, so a path this one lets
-            // through reaches `loadMarkdown` no matter what the other decides.
-            let startup_files =
-                window_runtime::startup_paths(&args, &std::env::current_dir().unwrap_or_default());
-
-            if let Some(path) = startup_files.first() {
-                let _ = window.emit("file-path", path.as_str());
-                window_runtime::bring_to_front(&window);
-            }
-
-            Ok(())
+        .setup(move |app| {
+            specta.mount_events(app);
+            setup(app)
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(invoke_handler)
+        .on_window_event(window_runtime::handle_window_event)
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, _event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = _event {
+                for path in opened_file_paths(urls) {
+                    window_runtime::deliver_opened_path(_app_handle, path);
+                }
+            }
+        });
+}
+
+/// Every command and Rust-emitted event the frontend can reach. Tauri dispatches
+/// through it, and the `export_bindings` test writes the same list to
+/// `src/lib/bindings.ts`, so a command or event renamed or retyped on one side
+/// is a TypeScript error on the other.
+fn bindings_builder() -> tauri_specta::Builder<tauri::Wry> {
+    tauri_specta::Builder::<tauri::Wry>::new()
+        .commands(collect_commands![
             commands::clipboard_write_text,
             commands::clipboard_read_text,
             commands::clipboard_read_image,
+            commands::clipboard_read_file_list,
             commands::open_markdown_preview,
             commands::render_markdown,
             commands::markdown_semantic_spans,
-            commands::list_heading_anchors,
+            commands::markdown_outline,
             window_runtime::send_markdown_path,
             commands::read_file_content_checked,
             commands::canonicalize_path,
@@ -239,9 +115,14 @@ pub fn run() {
             commands::print_pdf,
             commands::is_win11,
             commands::open_file_folder,
+            commands::is_launchable_path,
             commands::rename_file,
             commands::watch_file,
             window_runtime::unwatch_file,
+            crate::folder::read_folder_entries,
+            crate::folder::watch_folder,
+            crate::folder::unwatch_folder,
+            crate::folder::unwatch_all_folders,
             window_runtime::show_window,
             commands::save_theme,
             commands::get_system_fonts,
@@ -250,6 +131,7 @@ pub fn run() {
             commands::fetch_vscode_theme,
             commands::get_saved_vscode_themes,
             commands::read_vscode_theme,
+            commands::install_vscode_theme,
             commands::delete_vscode_theme,
             commands::save_image,
             commands::copy_file_to_img,
@@ -259,63 +141,186 @@ pub fn run() {
             tab_transfer::claim_detached_tab,
             tab_transfer::complete_detached_tab,
             tab_transfer::cancel_detached_tab,
-            commands::create_transfer_window,
+            tab_transfer::refresh_detached_tab,
+            window_runtime::create_transfer_window,
             window_runtime::set_window_meta,
+            window_runtime::set_window_files,
+            window_runtime::windows_restored,
             window_runtime::list_viewer_windows,
             window_runtime::is_window_tag_taken,
             window_runtime::offer_tab_to_window,
             window_runtime::focus_window,
             window_runtime::list_pinned_tags,
             window_runtime::save_pinned_tag,
+            window_runtime::update_pinned_tag,
+            window_runtime::rename_pinned_tag,
             window_runtime::remove_pinned_tag,
             window_runtime::save_window_state,
             window_runtime::load_window_state,
             window_runtime::clear_window_state,
+            window_runtime::forget_window_state,
+            window_runtime::reopen_remembered_windows,
+            window_runtime::save_unsaved_recovery,
+            window_runtime::claim_unsaved_recovery,
+            window_runtime::clear_unsaved_recovery,
+            window_runtime::set_quitting,
+            window_runtime::keeps_unsaved_on_close,
             window_runtime::save_restore_progress,
             window_runtime::load_restore_progress,
-            window_runtime::clear_restore_progress
+            window_runtime::clear_restore_progress,
         ])
-        .on_window_event(window_runtime::handle_window_event)
-        .on_menu_event(|app, event| {
-            let id = event.id().as_ref();
-            // Emit to the focused webview window's label rather than
-            // `window.emit(...)`, which broadcasts to every webview and
-            // would fire menu actions (New/Close/Save…) in all windows at
-            // once. Falls back to "main" if no window is focused (e.g. menu
-            // fired while the app is in the background).
-            let target = app
-                .webview_windows()
-                .into_values()
-                .find(|w| w.is_focused().unwrap_or(false))
-                .or_else(|| app.get_webview_window("main"));
-            let Some(window) = target else { return };
+        .events(collect_events![
+            crate::folder::FolderChanged,
+            window_runtime::FileChanged,
+            window_runtime::FilePath,
+            window_runtime::WindowsRestored,
+            window_runtime::TabTransferOffer,
+            tab_transfer::TabTransferClaimed,
+        ])
+        // Vocabulary the frontend matches against, so it has one definition.
+        .constant("UNMAPPABLE_CODE", crate::fs_safety::UNMAPPABLE_CODE)
+        .constant("BULLET_MARKER", crate::markdown::BULLET_MARKER)
+        .constant("ORDERED_MARKER", crate::markdown::ORDERED_MARKER)
+        .constant("TASK_BOX", crate::markdown::TASK_BOX)
+        .constant(
+            "MARKDOWN_LINK_EXTENSIONS",
+            crate::markdown::MARKDOWN_LINK_EXTENSIONS,
+        )
+        // Commands reject with their error string, as `invoke` always did.
+        .error_handling(tauri_specta::ErrorHandlingMode::Throw)
+        // One type per Rust type: a command type is either only returned or
+        // round-trips unchanged, so separate serialize/deserialize shapes add
+        // nothing.
+        .disable_serde_phases()
+}
 
-            if id == "menu-app-settings" {
-                let _ = app.emit_to(window.label(), "menu-app-settings", ());
-            } else if id == "check-updates" {
-                let _ = app.emit_to(window.label(), "menu-check-updates", ());
-            } else if id == "menu-app-quit" {
-                let _ = app.emit_to(window.label(), id, ());
-            }
-        })
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|_app_handle, _event| {
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = _event {
-                for url in urls {
-                    if let Ok(path_buf) = url.to_file_path() {
-                        let path_str = path_buf.to_string_lossy().to_string();
+/// Builds the launch window and hands it the launch's first file.
+fn setup<R: Runtime>(app: &mut tauri::App<R>) -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
 
-                        let state = _app_handle.state::<AppState>();
-                        window_runtime::lock_recover(&state.startup_files).push(path_str.clone());
+    let mut window_builder = tauri::WebviewWindowBuilder::new(
+        app,
+        window_runtime::LAUNCH_LABEL,
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("Markpad")
+    .inner_size(900.0, 650.0)
+    .min_inner_size(400.0, 300.0)
+    .visible(false)
+    // Not `.focused(false)`: on a window built hidden it leaves WebView2
+    // on Windows with no drop target, so every file dragged in is
+    // refused (#768, tauri-apps/wry#1639). tao also keeps applying it
+    // after the first show, so minimizing a maximized window flashes it
+    // at its restored size (#776, tauri-apps/tao#1338). `show_window` skipping
+    // `set_focus` is what keeps a cold start from stealing focus.
+    .resizable(true)
+    .shadow(false)
+    .center();
 
-                        if let Some(window) = window_runtime::pick_delivery_window(_app_handle) {
-                            let _ = _app_handle.emit_to(window.label(), "file-path", path_str);
-                            window_runtime::bring_to_front(&window);
-                        }
-                    }
+    #[cfg(target_os = "macos")]
+    {
+        window_builder = window_builder
+            .decorations(true)
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        window_builder = window_builder.decorations(false);
+    }
+
+    let window = window_builder.build()?;
+
+    let config_dir = app.path().app_config_dir()?;
+    let theme_path = config_dir.join("theme.txt");
+    let theme_pref = fs::read_to_string(theme_path).unwrap_or_else(|_| "system".to_string());
+
+    // An APPEARANCE, written by `save_theme` — see the note there. It
+    // used to be the raw theme setting, which meant every `vscode:<name>`
+    // theme landed in the fallback arm below and asked the OS instead: a
+    // dark VS Code theme on a light desktop flashed a white window on
+    // every launch. A file left over from that older format still lands
+    // there, and self-corrects as soon as the frontend applies its theme.
+    let bg_color = match commands::Appearance::from_saved(&theme_pref) {
+        commands::Appearance::Dark => Some(tauri::window::Color(24, 24, 24, 255)),
+        commands::Appearance::Light => Some(tauri::window::Color(253, 253, 253, 255)),
+        commands::Appearance::System => {
+            if let Ok(t) = window.theme() {
+                match t {
+                    tauri::Theme::Dark => Some(tauri::window::Color(24, 24, 24, 255)),
+                    _ => Some(tauri::window::Color(253, 253, 253, 255)),
                 }
+            } else {
+                Some(tauri::window::Color(253, 253, 253, 255))
             }
-        });
+        }
+    };
+
+    let _ = window.set_background_color(bg_color);
+
+    let _ = window.set_shadow(true);
+
+    // Same vetting as `send_markdown_path`, which reads the same argv:
+    // the frontend consumes BOTH channels, so a path this one lets
+    // through reaches `loadMarkdown` no matter what the other decides.
+    //
+    // Not sent here when a window the launch reopens is restoring it: then
+    // it belongs in that window, and `send_markdown_path` routes it there
+    // (#1029). Sending it here as well opened a second copy in this one.
+    let startup_files =
+        window_runtime::startup_paths(&args, &std::env::current_dir().unwrap_or_default());
+
+    if let Some(path) = startup_files
+        .first()
+        .filter(|path| !window_runtime::reopened_window_restores(app.handle(), path))
+    {
+        let _ = window_runtime::FilePath(path.clone()).emit(&window);
+        window_runtime::bring_to_front(&window);
+    }
+
+    Ok(())
+}
+
+/// The file paths in a macOS open-document event, every one of them.
+#[cfg(target_os = "macos")]
+fn opened_file_paths(urls: Vec<tauri::Url>) -> Vec<String> {
+    urls.into_iter()
+        .filter_map(|url| url.to_file_path().ok())
+        .map(|path| path.to_string_lossy().to_string())
+        .collect()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_open_document_event_yields_every_file_path() {
+        let urls = [
+            "file:///n/a.md",
+            "file:///n/b.md",
+            "https://example.com/c.md",
+        ]
+        .map(|url| tauri::Url::parse(url).unwrap())
+        .to_vec();
+        assert_eq!(opened_file_paths(urls), vec!["/n/a.md", "/n/b.md"]);
+    }
+}
+
+#[cfg(test)]
+mod bindings_tests {
+    /// Writes `src/lib/bindings.ts`. CI runs `cargo test` and then fails on any
+    /// diff in that file, so a Rust change without regenerated bindings is red.
+    #[test]
+    fn export_bindings() {
+        super::bindings_builder()
+            // `usize`/`u64` lengths and counts, all far below 2^53.
+            .dangerously_cast_bigints_to_number()
+            .export(
+                specta_typescript::Typescript::default(),
+                "../src/lib/bindings.ts",
+            )
+            .expect("export TypeScript bindings");
+    }
 }

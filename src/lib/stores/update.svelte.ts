@@ -1,7 +1,9 @@
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { getVersion } from '@tauri-apps/api/app';
-import { invoke } from '@tauri-apps/api/core';
+import { commands } from '../bindings.js';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import type { ViewerWindowEntry } from '../utils/viewerWindows.js';
 
 type UpdatePhase =
 	| 'idle'
@@ -14,23 +16,6 @@ type UpdatePhase =
 
 type ErrorSource = 'check' | 'download' | 'install';
 
-// Match only messages that genuinely indicate the updater plugin lacks an
-// endpoint / pubkey configuration. We deliberately do NOT match the bare
-// word "endpoint" — real network errors (e.g. "request to endpoint failed:
-// connection refused") would otherwise be silently rebranded as
-// "not configured" and hide actual connectivity failures.
-function looksLikeNotConfigured(msg: string): boolean {
-	const lower = msg.toLowerCase();
-	return (
-		lower.includes('not configured') ||
-		lower.includes('updater plugin') ||
-		lower.includes('plugins.updater') ||
-		lower.includes('no updater') ||
-		lower.includes('missing pubkey') ||
-		/no.*endpoint|endpoint.*not.*set/.test(lower)
-	);
-}
-
 class UpdateStore {
 	phase = $state<UpdatePhase>('idle');
 	show = $state(false);
@@ -40,12 +25,9 @@ class UpdateStore {
 	total = $state(0);
 	errorMsg = $state('');
 	errorSource = $state<ErrorSource>('check');
-	// Set when the underlying updater error indicates the plugin has no
-	// endpoint / pubkey configured (i.e. PR-1 ships before signing infra).
-	// The dialog renders a localised hint instead of the raw plugin message
-	// when this is true.
-	errorIsNotConfigured = $state(false);
 	notes = $state('');
+	/** Windows open beside this one when an install was last asked for (#767). */
+	otherWindows = $state<ViewerWindowEntry[]>([]);
 	#pending: Update | null = null;
 	#checkToken = 0;
 
@@ -60,13 +42,18 @@ class UpdateStore {
 		this.#checkToken++;
 		this.show = false;
 		this.phase = 'idle';
+		this.#clearResult();
+	}
+
+	/** Forget the last check's result, so a new one starts clean. */
+	#clearResult() {
 		this.errorMsg = '';
 		this.errorSource = 'check';
-		this.errorIsNotConfigured = false;
 		this.notes = '';
 		this.latest = '';
 		this.downloaded = 0;
 		this.total = 0;
+		this.otherWindows = [];
 		this.#pending = null;
 	}
 
@@ -75,14 +62,7 @@ class UpdateStore {
 
 		const token = ++this.#checkToken;
 		this.phase = 'checking';
-		this.errorMsg = '';
-		this.errorSource = 'check';
-		this.errorIsNotConfigured = false;
-		this.notes = '';
-		this.latest = '';
-		this.downloaded = 0;
-		this.total = 0;
-		this.#pending = null;
+		this.#clearResult();
 
 		try {
 			// Ask whether this install can update itself BEFORE checking, not
@@ -93,7 +73,7 @@ class UpdateStore {
 			// binary. Being offered an update that cannot be installed is worse
 			// than not being offered one, so the question is asked first and the
 			// dialog says where updates actually come from. See #570.
-			if (!(await invoke<boolean>('self_update_supported'))) {
+			if (!(await commands.selfUpdateSupported())) {
 				if (token !== this.#checkToken) return;
 				this.phase = 'package-managed';
 				return;
@@ -122,19 +102,12 @@ class UpdateStore {
 			}
 		} catch (e) {
 			if (token !== this.#checkToken) return;
-			const raw = e instanceof Error ? e.message : String(e);
-			this.errorIsNotConfigured = looksLikeNotConfigured(raw);
-			// Surface the raw message only when the error is not the
-			// "not configured" case — the dialog shows a localised hint
-			// instead in that case.
-			this.errorMsg = this.errorIsNotConfigured ? '' : raw;
-			// errorSource was already set to 'check' at the top of runCheck();
-			// no reassignment needed here.
+			this.errorMsg = e instanceof Error ? e.message : String(e);
 			this.phase = 'error';
 		}
 	}
 
-	async startDownload() {
+	async startDownload(settleForExit: () => Promise<boolean>) {
 		if (this.phase !== 'available' || !this.#pending) return;
 
 		const update = this.#pending;
@@ -142,6 +115,25 @@ class UpdateStore {
 		this.phase = 'downloading';
 		this.downloaded = 0;
 		this.total = 0;
+
+		// An install ends every window at once, and only this one reviews its
+		// unsaved tabs and writes the session. So the others close first, each
+		// through its own close review, and the update waits on offer (#767).
+		// No list to go on is how this behaved before it asked.
+		const windows = (await commands.listViewerWindows().catch(() => null)) ?? [];
+		this.otherWindows = windows.filter((window) => window.label !== getCurrentWindow().label);
+		if (this.otherWindows.length > 0) {
+			this.phase = 'available';
+			return;
+		}
+
+		// Installing ends the process without closing the window, so the close
+		// path's work — unsaved tabs, the restore snapshot — runs first (#761).
+		// Cancelling it keeps the update on offer.
+		if (!(await settleForExit())) {
+			this.phase = 'available';
+			return;
+		}
 
 		// Two separate try blocks so the error attribution is precise:
 		// downloadAndInstall failures map to errorSource='download' (the
@@ -159,7 +151,6 @@ class UpdateStore {
 		} catch (e) {
 			this.errorMsg = e instanceof Error ? e.message : String(e);
 			this.errorSource = 'download';
-			this.errorIsNotConfigured = false;
 			this.phase = 'error';
 			return;
 		}
@@ -169,7 +160,6 @@ class UpdateStore {
 		} catch (e) {
 			this.errorMsg = e instanceof Error ? e.message : String(e);
 			this.errorSource = 'install';
-			this.errorIsNotConfigured = false;
 			this.phase = 'error';
 		}
 	}

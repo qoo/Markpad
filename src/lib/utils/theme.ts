@@ -1,4 +1,4 @@
-import { semanticTokenRules } from './editorTheme.js';
+import { semanticTokenRules, VSCODE_THEME_NAME } from './editorTheme.js';
 
 // Values taken from an imported VS Code theme end up concatenated into a global
 // `<style>` block. Anything that is not a colour literal could close the rule and
@@ -73,6 +73,51 @@ export function sanitizeThemeColors(colors: unknown): Record<string, string> {
 export type MonacoTokenRule = { token: string; foreground?: string; fontStyle?: string };
 
 /**
+ * The constructs the preview takes from an imported theme, and the variable
+ * each is written to.
+ *
+ * The preview renders what the editor tokenizes, but as HTML with the markup
+ * gone: `**bold**` arrives as `<strong>`, `##` as an `<h2>`. So the colours
+ * reach it through CSS rather than through Monaco, and they reach the
+ * construct's *text*, which is all that is left of it (#682).
+ *
+ * A kind the theme does not name is simply absent here, and the stylesheet's
+ * own fallback stands — which is what keeps the built-in themes' preview, and
+ * every preview that was rendered before an import, exactly as it was.
+ */
+export const PREVIEW_KIND_VARS: ReadonlyArray<readonly [kind: string, cssVar: string]> = [
+	['heading', '--md-heading'],
+	['strong', '--md-strong'],
+	['emph', '--md-emph'],
+	['code', '--md-code'],
+	['link', '--md-link'],
+	['strike', '--md-strike'],
+	['quote', '--md-quote'],
+];
+
+/** The colour the theme gave each construct, by the kind the extractor emits. */
+function kindColorsOf(rules: readonly MonacoTokenRule[]): Map<string, string> {
+	const byKind = new Map<string, string>();
+	for (const rule of rules) {
+		// Read off the scope the theme wrote, which `monacoTokenRules` keeps
+		// beside every alias it derives, so a language-qualified spelling like
+		// `markup.bold.markdown` is matched by the same prefix rule.
+		const alias = markdownAliasFor(rule.token);
+		if (alias && rule.foreground) byKind.set(alias.kind, rule.foreground);
+	}
+	return byKind;
+}
+
+/**
+ * The colour an imported theme gives each Markdown construct, for a caller that
+ * needs the colours rather than Monaco's rules — the preview, which renders the
+ * same constructs as HTML.
+ */
+export function markdownKindColors(tokenColors: unknown): Map<string, string> {
+	return kindColorsOf(monacoTokenRules(tokenColors));
+}
+
+/**
  * Every rule an imported theme's editor gets, semantic layer included.
  *
  * The layer needs a rule for every kind it emits or it erases the theme. A
@@ -104,16 +149,7 @@ export type MonacoTokenRule = { token: string; foreground?: string; fontStyle?: 
  */
 export function importedThemeRules(tokenColors: unknown, isDark: boolean): MonacoTokenRule[] {
 	const themeRules = monacoTokenRules(tokenColors);
-
-	/** The colour the theme gave each construct, by the kind the extractor emits. */
-	const byKind = new Map<string, string>();
-	for (const rule of themeRules) {
-		// Read off the scope the theme wrote, which `monacoTokenRules` keeps
-		// beside every alias it derives, so a language-qualified spelling like
-		// `markup.bold.markdown` is matched by the same prefix rule.
-		const alias = markdownAliasFor(rule.token);
-		if (alias && rule.foreground) byKind.set(alias.kind, rule.foreground);
-	}
+	const byKind = kindColorsOf(themeRules);
 
 	const base = semanticTokenRules(isDark ? 'dark' : 'light').map((rule) => {
 		const foreground = byKind.get(rule.token.split('.')[0]);
@@ -230,7 +266,7 @@ export function monacoTokenRules(tokenColors: unknown): MonacoTokenRule[] {
 	return rules;
 }
 
-export async function parseAndApplyVscodeTheme(themeJsonStr: string, name: string) {
+export async function parseAndApplyVscodeTheme(themeJsonStr: string, name: string, isCurrent: () => boolean = () => true) {
 	const cleanJson = themeJsonStr.replace(/\\"|"(?:\\"|[^"])*"|(\/\/.*|\/\*[\s\S]*?\*\/)/g, (m, g) => (g ? '' : m));
 	let theme;
 	try {
@@ -280,6 +316,16 @@ export async function parseAndApplyVscodeTheme(themeJsonStr: string, name: strin
 	cssVars['--hljs-variable'] = cssVars['--color-fg-default'];
 	cssVars['--hljs-type'] = cssVars['--color-fg-default'];
 
+	// `tokenColors` reached the editor and nothing else, so an imported theme
+	// arrived on one half of the window and stopped (#682). The values are hex
+	// literals `monacoTokenRules` already validated, and are re-checked below
+	// with the rest.
+	const kindColors = markdownKindColors(theme.tokenColors);
+	for (const [kind, cssVar] of PREVIEW_KIND_VARS) {
+		const foreground = kindColors.get(kind);
+		if (foreground) cssVars[cssVar] = `#${foreground}`;
+	}
+
 	let styleTag = document.getElementById('vscode-theme-style');
 	if (!styleTag) {
 		styleTag = document.createElement('style');
@@ -312,7 +358,10 @@ export async function parseAndApplyVscodeTheme(themeJsonStr: string, name: strin
 		// this module unloadable outside a browser (and it is already bundled by the
 		// editor, so the dynamic import resolves from cache).
 		const monaco = await import('monaco-editor');
-		if (monaco) {
+		// The first import loads Monaco, which is slow enough for the reader to
+		// have picked another theme meanwhile; `setTheme` is global and would
+		// repaint the editor with this one.
+		if (monaco && isCurrent()) {
 			const rules = importedThemeRules(theme.tokenColors, isDark);
 
 			// Monaco only understands hex colours here; anything else makes
@@ -322,21 +371,45 @@ export async function parseAndApplyVscodeTheme(themeJsonStr: string, name: strin
 				if (isHexColor(value)) monacoColors[key] = value;
 			}
 
-			monaco.editor.defineTheme('vscode-custom', {
+			monaco.editor.defineTheme(VSCODE_THEME_NAME, {
 				base: isDark ? 'vs-dark' : 'vs',
 				inherit: true,
 				rules: rules,
 				colors: monacoColors,
 			});
 
-			monaco.editor.setTheme('vscode-custom');
+			monaco.editor.setTheme(VSCODE_THEME_NAME);
 		}
 	} catch (e) {
 		console.error('Monaco theme application failed:', e);
 	}
 }
 
+/** Bumped by every theme application, so a load still in flight can tell it lost. */
+let latestThemeLoad = 0;
+
+/**
+ * Reads and applies a VS Code theme, unless another theme is applied first.
+ *
+ * Both awaits (the read, and Monaco's first import inside the parse) leave room
+ * for the reader to choose again; a load that finishes after that must not paint
+ * over the newer choice, nor report a failure that would reset it. Resolves to
+ * whether this load is still the one on screen; rejects only if it is.
+ */
+export async function loadVscodeTheme(name: string, read: (name: string) => Promise<string>): Promise<boolean> {
+	const load = ++latestThemeLoad;
+	const isCurrent = () => load === latestThemeLoad;
+	try {
+		const json = await read(name);
+		if (isCurrent()) await parseAndApplyVscodeTheme(json, name, isCurrent);
+	} catch (e) {
+		if (isCurrent()) throw e;
+	}
+	return isCurrent();
+}
+
 export function clearVscodeTheme() {
+	latestThemeLoad++;
 	const styleTag = document.getElementById('vscode-theme-style');
 	if (styleTag) styleTag.remove();
 	document.documentElement.style.removeProperty('--color-whitespace');

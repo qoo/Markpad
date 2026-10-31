@@ -1,16 +1,18 @@
 <script lang="ts">
 	import { type Tab, tabManager } from '../stores/tabs.svelte.js';
 	import ContextMenu, { type ContextMenuItem } from './ContextMenu.svelte';
-	import { invoke } from '@tauri-apps/api/core';
-	import { emitTo } from '@tauri-apps/api/event';
+	import { commands } from '../bindings.js';
+	import { emitToWindow } from '../windowEvents.js';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { t } from '../utils/i18n.js';
 	import { settings } from '../stores/settings.svelte.js';
 	import { getTabFileActions, hasRealFilePath } from '../utils/tabFileActions.js';
 	import { isHomePath } from '../utils/homeTab.js';
 	import { modifierFor, shortcutLabel } from '../utils/shortcuts.js';
+	import { windowDisplay, type ViewerWindowEntry } from '../utils/viewerWindows.js';
+	import { tabMenuItems } from '../utils/tabContextMenu.js';
 
-	let { tab, folderSuffix, isActive, isLast, onclick, onclose } = $props<{
+	let { tab, folderSuffix, isActive, onclick, onclose, vertical = false } = $props<{
 		tab: Tab;
 		/**
 		 * The containing folder, when another tab in this window holds a
@@ -20,9 +22,10 @@
 		 */
 		folderSuffix?: string;
 		isActive: boolean;
-		isLast?: boolean;
 		onclick: () => void;
 		onclose: (e: MouseEvent) => void;
+		/** Drawn as a full-width row of the tab column rather than a chip in the strip (#884). */
+		vertical?: boolean;
 	}>();
 
 	let tabContextMenu = $state<{
@@ -68,25 +71,12 @@
 
 	function copyTabPath() {
 		if (!hasRealFilePath(tab.path)) return;
-		invoke('clipboard_write_text', { text: tab.path }).catch(console.error);
+		commands.clipboardWriteText(tab.path).catch(console.error);
 	}
 
 	function openTabFileLocation() {
 		if (!hasRealFilePath(tab.path)) return;
-		invoke('open_file_folder', { path: tab.path }).catch(console.error);
-	}
-
-	type ViewerWindowEntry = {
-		label: string;
-		number: number;
-		tag_name: string | null;
-		active_tab_title: string;
-		tab_count: number;
-	};
-
-	function windowDisplay(window: ViewerWindowEntry, lang: typeof settings.language): string {
-		const identity = window.tag_name ?? `${t('menu.window', lang)} ${window.number}`;
-		return window.active_tab_title ? `${identity} · ${window.active_tab_title}` : identity;
+		commands.openFileFolder(tab.path).catch(console.error);
 	}
 
 	async function handleContextMenu(e: MouseEvent) {
@@ -94,10 +84,6 @@
 		e.stopPropagation();
 
 		const currentLang = settings.language;
-		// ContextMenu prints `shortcut` into the same `<span class="menu-shortcut">`
-		// the app menu uses, so a literal here sits a keystroke away from the app
-		// menu's registry-derived chord and disagrees with it on macOS.
-		const modifier = modifierFor(settings.osType);
 		const fileActionItems: ContextMenuItem[] = getTabFileActions(tab.path).map((action) => ({
 			label: t(action.labelKey, currentLang),
 			disabled: action.disabled,
@@ -106,14 +92,14 @@
 		const selfLabel = getCurrentWindow().label;
 		let moveToWindowItems: ContextMenuItem[] = [];
 		try {
-			const windows = (await invoke('list_viewer_windows')) as ViewerWindowEntry[];
+			const windows = (await commands.listViewerWindows()) as ViewerWindowEntry[];
 			moveToWindowItems = windows
 				.filter((window) => window.label !== selfLabel)
 				.map((window) => ({
 					label: `${t('menu.moveToWindow', currentLang)} ${windowDisplay(window, currentLang)}`,
 					disabled: isHomePath(tab.path),
-					onHover: () => emitTo(window.label, 'window-identify', windowDisplay(window, currentLang)),
-					onClick: () => emitTo(selfLabel, 'menu-tab-move', { tabId: tab.id, targetLabel: window.label }),
+					onHover: () => emitToWindow(window.label, 'window-identify', windowDisplay(window, currentLang)),
+					onClick: () => emitToWindow(selfLabel, 'menu-tab-move', { tabId: tab.id, targetLabel: window.label }),
 				}));
 		} catch (error) {
 			console.error('Failed to list viewer windows', error);
@@ -123,32 +109,15 @@
 			show: true,
 			x: e.clientX,
 			y: e.clientY,
-			items: [
-				{ label: t('menu.newFile', currentLang), shortcut: shortcutLabel('file-new', modifier), onClick: () => emitTo(getCurrentWindow().label, 'menu-tab-new') },
-				{ label: t('menu.undoCloseTab', currentLang), shortcut: shortcutLabel('tab-undo-close', modifier), onClick: () => emitTo(getCurrentWindow().label, 'menu-tab-undo') },
-				{
-					label: t('menu.rename', currentLang),
-					// Rename renames the file on disk; untitled and home tabs have
-					// no file, and the handler previously no-oped silently.
-					disabled: !hasRealFilePath(tab.path),
-					onClick: () => emitTo(getCurrentWindow().label, 'menu-tab-rename', tab.id),
-				},
-				{ separator: true },
-				...fileActionItems,
-				{ separator: true },
-				{
-					label: t('menu.moveToNewWindow', currentLang),
-					// Moving the only tab would just churn windows, and the home
-					// tab is recreatable anywhere; both stay in place.
-					disabled: isHomePath(tab.path) || tabManager.tabs.length < 2,
-					onClick: () => emitTo(getCurrentWindow().label, 'menu-tab-detach', tab.id),
-				},
-				...moveToWindowItems,
-				{ separator: true },
-				{ label: t('menu.closeFile', currentLang), shortcut: shortcutLabel('file-close', modifier), onClick: () => emitTo(getCurrentWindow().label, 'menu-tab-close', tab.id) },
-				{ label: t('menu.closeOtherTabs', currentLang), onClick: () => emitTo(getCurrentWindow().label, 'menu-tab-close-others', tab.id) },
-				{ label: t('menu.closeTabsToRight', currentLang), onClick: () => emitTo(getCurrentWindow().label, 'menu-tab-close-right', tab.id) },
-			],
+			items: tabMenuItems({
+				tab,
+				language: currentLang,
+				osType: settings.osType,
+				tabCount: tabManager.tabs.length,
+				fileActionItems,
+				moveToWindowItems,
+				emit: (event, payload) => emitToWindow(selfLabel, event, payload),
+			}),
 		};
 	}
 
@@ -175,7 +144,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	class="tab {isActive ? 'active' : ''}"
-	class:last={isLast}
+	class:vertical
 	role="group"
 	title={tabTooltip(tab)}
 	oncontextmenu={handleContextMenu}
@@ -231,10 +200,13 @@
 			color 0.25s cubic-bezier(0.05, 0.95, 0.05, 0.95);
 	}
 
-	.tab.last {
-		border-right: none;
+	.tab.vertical {
+		width: 100%;
+		min-width: 0;
+		max-width: none;
+		height: 30px;
+		box-sizing: border-box;
 	}
-
 
 	.tab:hover {
 		background-color: var(--color-neutral-muted);

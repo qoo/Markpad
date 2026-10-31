@@ -1,25 +1,22 @@
 <script lang="ts">
 	import { getCurrentWindow } from '@tauri-apps/api/window';
-	import { invoke } from '@tauri-apps/api/core';
+	import { commands } from '../bindings.js';
 	import { openUrl } from '@tauri-apps/plugin-opener';
-	import { fly, slide } from 'svelte/transition';
-	import { flip } from 'svelte/animate';
+	import { fly } from 'svelte/transition';
 	import iconUrl from '../../assets/icon.png';
 	import TabList from './TabList.svelte';
 	import { tabManager } from '../stores/tabs.svelte.js';
 	import { settings } from '../stores/settings.svelte.js';
 	import { t } from '../utils/i18n.js';
-	import { getConfiguredTitlebarToolbarIds, visibleTitlebarActionIds } from '../utils/titlebarToolbar.js';
-	import { modifierFor, shortcutLabel } from '../utils/shortcuts.js';
-	import { platformOf } from '../utils/platform.js';
-	import { hasExportableDocument, hasRealFilePath } from '../utils/tabFileActions.js';
+	import { getConfiguredTitlebarToolbarIds, visibleTitlebarActionIds, type ViewMode, viewModeOf } from '../utils/titlebarToolbar.js';
+	import { shortcutLabel } from '../utils/shortcuts.js';
+	import { TitleBarPlatform } from '../stores/titleBarPlatform.svelte.js';
+	import { canExportTab } from '../utils/tabFileActions.js';
+	import { openNewWindow, openPinnedTagWindow } from '../utils/pinnedTagWindow.js';
 	import { getVersion } from '@tauri-apps/api/app';
+	import { TAG_COLORS, TitleBarPopovers, containClick, scopeLine } from '../stores/titleBarPopovers.svelte.js';
 
-	let currentLanguage = $state(settings.language);
-
-	$effect(() => {
-		currentLanguage = settings.language;
-	});
+	let currentLanguage = $derived(settings.language);
 
 	let {
 		isFocused,
@@ -29,10 +26,11 @@
 
 		windowTitle,
 		showHome,
-		onselectFile,
 		onnewFile,
 		onopenFile,
+		onopenFolder,
 		onmergeAllWindows,
+		onclosetag,
 		onsaveFile,
 		onsaveFileAs,
 		onreloadFromDisk,
@@ -47,12 +45,10 @@
 		canGoBack = false,
 		canGoForward = false,
 
-		ontoggleEdit,
 		ontoggleEditorToolbar,
-		ontoggleSplit,
+		onsetViewMode,
 		onswapPanes,
 		isEditing,
-		ondetach,
 		ontabclick,
 		zoomLevel,
 		onresetZoom,
@@ -75,10 +71,11 @@
 
 		windowTitle: string;
 		showHome: boolean;
-		onselectFile?: () => void;
 		onnewFile?: () => void;
 		onopenFile?: () => void;
+		onopenFolder?: () => void;
 		onmergeAllWindows?: () => void;
+		onclosetag?: () => void;
 		onsaveFile?: () => void;
 		onsaveFileAs?: () => void;
 		onreloadFromDisk?: () => void;
@@ -93,12 +90,10 @@
 		canGoBack?: boolean;
 		canGoForward?: boolean;
 
-		ontoggleEdit: () => void;
 		ontoggleEditorToolbar?: () => void;
-		ontoggleSplit?: () => void;
+		onsetViewMode: (mode: ViewMode) => void;
 		onswapPanes?: () => void;
 		isEditing: boolean;
-		ondetach: (tabId: string) => void;
 		ontabclick?: () => void;
 		zoomLevel?: number;
 		onresetZoom?: () => void;
@@ -122,6 +117,40 @@
 	let innerWidth = $state(1000);
 	let isCollapsed = $derived(innerWidth <= 450 || settings.zenMode);
 
+	const titleBarPlatform = new TitleBarPlatform();
+	let isMac = $derived(titleBarPlatform.isMac);
+	let modifier = $derived(titleBarPlatform.modifier);
+
+	let isWin11 = $state(false);
+	const popovers = new TitleBarPopovers();
+
+	export function openTagEditor() {
+		popovers.openTagEditor();
+	}
+
+	$effect(() => {
+		commands.isWin11()
+			.then((res) => {
+				isWin11 = res as boolean;
+			})
+			.catch(() => {
+				isWin11 = false;
+			});
+	});
+
+	let isMaximized = $state(false);
+	$effect(() => {
+		const sync = () => appWindow.isMaximized().then((v) => (isMaximized = v)).catch(() => {});
+		sync();
+		const unlisten = appWindow.onResized(sync);
+		return () => {
+			unlisten.then((f) => f()).catch(() => {});
+		};
+	});
+	// Windows and Linux only: on macOS the top of the screen is the menu bar, so
+	// a maximized window's tabs never sit on the screen edge (#823).
+	let isMaximizedOnScreenEdge = $derived(isMaximized && !isMac);
+
 	// Only a maximized window keeps tabs and toolbar on one row. Any smaller
 	// window truncates tab titles long before the toolbar runs out of room,
 	// so the toolbar moves to its own row under the tabs instead. Below 700px
@@ -129,15 +158,6 @@
 	// offered on the Home screen (no tab strip to protect) or in Zen mode
 	// (which wants less chrome, not a taller title bar).
 	const STACK_BREAKPOINT = 700;
-	let isMaximized = $state(false);
-	$effect(() => {
-		const refresh = () => appWindow.isMaximized().then((value) => (isMaximized = value)).catch(() => {});
-		refresh();
-		const unlisten = appWindow.onResized(refresh);
-		return () => {
-			unlisten.then((fn) => fn()).catch(() => {});
-		};
-	});
 	let isStacked = $derived(
 		(!isMaximized || innerWidth <= STACK_BREAKPOINT) &&
 			!settings.zenMode &&
@@ -157,143 +177,6 @@
 		document.documentElement.style.setProperty('--titlebar-height', `${height}px`);
 	});
 
-	const DEBUG_MACOS = false;
-
-	// The platform comes from `settings.osType` — the Rust `get_os_type` answer
-	// the rest of the app already reads — rather than from this component's own
-	// user-agent sniff for "Macintosh", which was a second source that could
-	// disagree with it. `platformOf` covers the window before that
-	// command answers; see the comment on it for why the title bar cannot simply
-	// read `settings.osType` directly without flashing Windows chrome on a Mac.
-	//
-	// `$derived` rather than plain consts: the source is now reactive state, and
-	// `osType` can change once after mount (unknown → resolved). At plain consts
-	// the title bar would keep whatever the fallback said and never correct
-	// itself on a machine where the two do differ.
-	let platform = $derived(DEBUG_MACOS ? 'macos' : platformOf(settings.osType));
-	let isMac = $derived(platform === 'macos');
-	let useNativeMacChrome = $derived(isMac && !DEBUG_MACOS);
-	let modifier = $derived(modifierFor(platform));
-
-	let isWin11 = $state(false);
-	const tagColors = ['#5f6368', '#1a73e8', '#d93025', '#f9ab00', '#188038', '#d01884', '#a142f4', '#007b83'];
-	let tagEditorOpen = $state(false);
-	let tagDraftName = $state('');
-	let tagDraftColor = $state(tagColors[1]);
-	let tagError = $state('');
-
-	function openTagEditor() {
-		tagDraftName = tabManager.windowTag?.name ?? '';
-		tagDraftColor = tabManager.windowTag?.color ?? tagColors[1];
-		tagError = '';
-		tagEditorOpen = true;
-	}
-
-	/**
-	 * Whether a *different* live window already carries this name.
-	 *
-	 * Asked here — at Save/Enter, the moment the user names the window — and
-	 * nowhere else. In particular not at session restore: a snapshot written by
-	 * an older build can legitimately contain two windows under one name, and
-	 * refusing it there would clear a tag the user set, silently, at a moment
-	 * they are not even looking at the popover. Leaving a restored duplicate
-	 * alone costs at most a confusing pair of chips; rejecting it costs state
-	 * the user cannot get back.
-	 *
-	 * A backend that cannot answer means the user's own save goes through. The
-	 * check exists to stop one window from quietly overwriting another's pinned
-	 * documents, and an IPC failure is not evidence that it would.
-	 */
-	async function tagNameTakenElsewhere(name: string): Promise<boolean> {
-		try {
-			return (await invoke('is_window_tag_taken', { name })) === true;
-		} catch (error) {
-			console.error('Failed to check window tag exclusivity', error);
-			return false;
-		}
-	}
-
-	async function applyTag() {
-		const name = tagDraftName.trim();
-		if (!name) {
-			// The same exit as Remove Tag, not a second one. This branch used to
-			// call `setWindowTag(null)` on its own, which drops the tag from the
-			// window but leaves its entry in `pinned-tags.json` — so a cleared
-			// PINNED tag went on offering itself from the Home screen as a saved
-			// session under a name no window held any more. `clearTag` is the
-			// path that already unpins first.
-			clearTag();
-			tagError = '';
-			return;
-		}
-		if (await tagNameTakenElsewhere(name)) {
-			// Refused in place, with the popover still open on the name that was
-			// refused: this is a correction the user makes in the field they are
-			// already in, not news to be delivered somewhere else.
-			tagError = t('menu.windowTagTaken', currentLanguage);
-			return;
-		}
-		tabManager.setWindowTag({ name, color: tagDraftColor, pinned: tabManager.windowTag?.pinned });
-		tagEditorOpen = false;
-		tagError = '';
-	}
-
-	/**
-	 * Right-click the chip: the same popover left-click opens.
-	 *
-	 * The chip borrows Chrome's tab-group chip visually, but not the state that
-	 * makes Chrome's left/right division necessary. There, left-click collapses
-	 * and expands the group, so the commands need somewhere else to live. A
-	 * window tag has nothing to collapse — it scopes the whole window — so
-	 * left-click has no second job, and putting Pin/Remove behind a right-click
-	 * would only hide them behind a gesture with no affordance advertising it.
-	 * The one thing right-click does owe the user is not raising the platform
-	 * menu over the title bar, hence `preventDefault`.
-	 *
-	 * It opens but never closes, unlike the left-click toggle. `openTagEditor`
-	 * re-seeds the draft from the stored tag, so re-opening an open popover
-	 * would throw away a name the user is in the middle of typing; and a
-	 * gesture whose whole purpose is "show me the tag's controls" should not
-	 * sometimes hide them. `stopPropagation` for the same reason the chip's
-	 * left-click has one: `handleGlobalDismiss` is wired to window
-	 * `contextmenu`, and would otherwise dismiss the popover this just opened.
-	 */
-	function openTagEditorFromContextMenu(event: MouseEvent) {
-		event.preventDefault();
-		event.stopPropagation();
-		if (!tagEditorOpen) openTagEditor();
-	}
-
-	function clearTag() {
-		const tag = tabManager.windowTag;
-		if (tag?.pinned) invoke('remove_pinned_tag', { name: tag.name }).catch(console.error);
-		tabManager.setWindowTag(null);
-		tagEditorOpen = false;
-	}
-
-	function togglePinnedTag() {
-		const tag = tabManager.windowTag;
-		if (!tag) return;
-		if (tag.pinned) {
-			invoke('remove_pinned_tag', { name: tag.name }).catch(console.error);
-			tabManager.setWindowTag({ ...tag, pinned: false });
-			return;
-		}
-		const files = tabManager.tabs.filter((tab) => hasRealFilePath(tab.path)).map((tab) => tab.path);
-		invoke('save_pinned_tag', { name: tag.name, color: tag.color, files }).catch(console.error);
-		tabManager.setWindowTag({ ...tag, pinned: true });
-	}
-
-	$effect(() => {
-		invoke('is_win11')
-			.then((res) => {
-				isWin11 = res as boolean;
-			})
-			.catch(() => {
-				isWin11 = false;
-			});
-	});
-
 	let tooltip = $state({
 		visible: false,
 		text: '',
@@ -304,7 +187,7 @@
 	});
 
 	function showTooltip(e: MouseEvent, text: string, shortcut: string | undefined = '', force: boolean = false) {
-		if (!force && (kebabMenuOpen || homeMenuOpen)) return;
+		if (!force && (popovers.kebabMenuOpen || popovers.homeMenuOpen)) return;
 		const target = e.currentTarget as HTMLElement;
 		const rect = target.getBoundingClientRect();
 		const windowWidth = window.innerWidth;
@@ -346,7 +229,7 @@
 			}
 
 			const kebabBtn = document.querySelector('.kebab-btn') as HTMLElement;
-			if (kebabBtn && !kebabMenuOpen && !homeMenuOpen && !themeMenuOpen) {
+			if (kebabBtn && !popovers.kebabMenuOpen && !popovers.homeMenuOpen && !popovers.themeMenuOpen) {
 				const rect = kebabBtn.getBoundingClientRect();
 				tooltip.text = `${zoomLevel}%`;
 				tooltip.shortcut = '';
@@ -376,6 +259,18 @@
 		}),
 	);
 
+	// Edit and preview sit on the sides their panes take in split view (#1041).
+	let viewModes = $derived.by(() => {
+		const modes: { id: ViewMode; label: string; shortcut?: string }[] = [
+			{ id: 'edit', label: t('menu.editor', currentLanguage), shortcut: 'view-toggle-edit' },
+			{ id: 'split', label: t('menu.splitView', currentLanguage), shortcut: 'view-toggle-split' },
+			{ id: 'preview', label: t('settings.preview', currentLanguage) },
+		];
+		return settings.splitEditorSide === 'right' ? modes.reverse() : modes;
+	});
+
+	let currentViewMode = $derived(viewModeOf({ isEditing, isSplit: Boolean(tabManager.activeTab?.isSplit) }));
+
 	let configuredActionIds = $derived.by(() =>
 		getConfiguredTitlebarToolbarIds(
 			visibleActionIds,
@@ -385,15 +280,20 @@
 		),
 	);
 
-	let themeMenuOpen = $state(false);
-	let kebabMenuOpen = $state(false);
-	let homeMenuOpen = $state(false);
+	let pinnedTags = $state<Array<{ name: string; color: string }>>([]);
+
+	$effect(() => {
+		if (!popovers.homeMenuOpen) return;
+		commands.listPinnedTags()
+			.then((tags) => (pinnedTags = tags))
+			.catch(console.error);
+	});
 	let appVersion = $state('');
 	let savedVscodeThemes = $state<string[]>([]);
 	
 	$effect(() => {
-		if (themeMenuOpen) {
-			invoke('get_saved_vscode_themes')
+		if (popovers.themeMenuOpen) {
+			commands.getSavedVscodeThemes()
 				.then((themes) => {
 					savedVscodeThemes = themes as string[];
 				})
@@ -411,70 +311,34 @@
 
 	function handleSetTheme(t: string) {
 		if (onSetTheme) onSetTheme(t);
-		themeMenuOpen = false;
+		popovers.themeMenuOpen = false;
 	}
 
-	function handleGlobalDismiss() {
-		themeMenuOpen = false;
-		kebabMenuOpen = false;
-		homeMenuOpen = false;
-		// The tag editor is dismissed here rather than committed: `applyTag` is
-		// what writes a tag, and it is reached only from Save or Enter. The
-		// draft is not preserved, because `openTagEditor` re-seeds it from the
-		// stored tag on every open.
-		tagEditorOpen = false;
-	}
-
-	$effect(() => {
-		if (themeMenuOpen || kebabMenuOpen || homeMenuOpen || tagEditorOpen) {
-			window.addEventListener('click', handleGlobalDismiss);
-			window.addEventListener('contextmenu', handleGlobalDismiss);
-			window.addEventListener('blur', handleGlobalDismiss);
-		}
-		return () => {
-			window.removeEventListener('click', handleGlobalDismiss);
-			window.removeEventListener('contextmenu', handleGlobalDismiss);
-			window.removeEventListener('blur', handleGlobalDismiss);
-		};
-	});
+	$effect(() => popovers.listenForDismiss(window));
 </script>
 
 <svelte:window bind:innerWidth />
 
-<div class="custom-title-bar {isScrolled ? 'scrolled' : ''} {!isMac ? 'windows' : ''} {useNativeMacChrome ? 'native-mac' : ''}">
+<div class="custom-title-bar {isScrolled ? 'scrolled' : ''} {!isMac ? 'windows' : ''} {isMac ? 'native-mac' : ''}" class:maximized={isMaximizedOnScreenEdge}>
 	{#if !isMac && !isWin11}
 		<div class="window-top-border"></div>
 	{/if}
 	<div class="window-controls-left" data-tauri-drag-region>
-		{#if isMac && !useNativeMacChrome}
-			<div class="macos-traffic-lights" class:visible={isMac}>
-				<button class="mac-btn mac-close" onclick={() => appWindow.close()} aria-label={t('common.close', currentLanguage)}>
-						<svg width="6" height="6" viewBox="0 0 6 6" class="mac-icon"
-								><path d="M0.5 0.5L5.5 5.5M5.5 0.5L0.5 5.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
-					</button>
-					<button class="mac-btn mac-minimize" onclick={() => appWindow.minimize()} aria-label={t('common.minimize', currentLanguage)}>
-						<svg width="6" height="6" viewBox="0 0 6 6" class="mac-icon"><path d="M0.5 3H5.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
-					</button>
-					<button class="mac-btn mac-maximize" onclick={() => appWindow.toggleMaximize()} aria-label={t('common.maximize', currentLanguage)}>
-						<svg width="6" height="6" viewBox="0 0 6 6" class="mac-icon"><path d="M0.5 3H5.5M3 0.5V5.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
-					</button>
-			</div>
-		{/if}
 		<div class="home-menu-container" role="presentation">
 			<button
-				class="icon-home-btn {showHome || homeMenuOpen ? 'active' : ''}"
+				class="icon-home-btn {popovers.homeMenuOpen ? 'active' : ''}"
 				onclick={(e) => {
 					e.stopPropagation();
-					homeMenuOpen = !homeMenuOpen;
-					if (homeMenuOpen) {
-						themeMenuOpen = false;
-						kebabMenuOpen = false;
+					popovers.homeMenuOpen = !popovers.homeMenuOpen;
+					if (popovers.homeMenuOpen) {
+						popovers.themeMenuOpen = false;
+						popovers.kebabMenuOpen = false;
 						hideTooltip();
 					}
 				}}
 				aria-label={t('tooltip.menu', currentLanguage)}
 			onmouseenter={(e) => {
-							if (!homeMenuOpen) showTooltip(e, t('tooltip.menu', currentLanguage));
+							if (!popovers.homeMenuOpen) showTooltip(e, t('tooltip.menu', currentLanguage));
 						}}
 				onmousedown={(e) => e.preventDefault()}
 				onmouseleave={hideTooltip}>
@@ -484,30 +348,31 @@
 					class="window-icon"
 					style:filter={theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'none' : 'invert(0.7)'} />
 			</button>
-			{#if homeMenuOpen}
+			{#if popovers.homeMenuOpen}
 				<div
 					class="home-dropdown-menu"
 					role="menu"
 					tabindex="-1"
 					transition:fly={{ y: 5, duration: 150 }}
-					onclick={(e) => e.stopPropagation()}
+					onclick={containClick}
 					onkeydown={(e) => {
-						if (e.key === 'Escape') homeMenuOpen = false;
+						if (e.key === 'Escape') popovers.homeMenuOpen = false;
 					}}>
 					<button
 				class="home-menu-item"
 				onclick={() => {
-					homeMenuOpen = false;
+					popovers.homeMenuOpen = false;
 					ontoggleHome();
 				}}>
 				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
 					><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
 				{t('menu.home', currentLanguage)}
+				<span class="menu-shortcut">{shortcutLabel('app-home', modifier)}</span>
 			</button>
 					<button
 				class="home-menu-item"
 				onclick={() => {
-					homeMenuOpen = false;
+					popovers.homeMenuOpen = false;
 					onnewFile?.();
 				}}>
 				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -523,7 +388,18 @@
 			<button
 				class="home-menu-item"
 				onclick={() => {
-					homeMenuOpen = false;
+					popovers.homeMenuOpen = false;
+					openNewWindow().catch(console.error);
+				}}>
+				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+					><rect x="3" y="4" width="18" height="16" rx="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line></svg>
+				{t('menu.newWindow', currentLanguage)}
+				<span class="menu-shortcut">{shortcutLabel('file-new-window', modifier)}</span>
+			</button>
+			<button
+				class="home-menu-item"
+				onclick={() => {
+					popovers.homeMenuOpen = false;
 					onopenFile?.();
 				}}>
 				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -536,11 +412,21 @@
 				{t('menu.openFile', currentLanguage)}
 				<span class="menu-shortcut">{shortcutLabel('file-open', modifier)}</span>
 			</button>
+			<button
+				class="home-menu-item"
+				onclick={() => {
+					popovers.homeMenuOpen = false;
+					onopenFolder?.();
+				}}>
+				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+					><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+				{t('folder.openFolder', currentLanguage)}
+			</button>
 					{#if currentFile !== '' || (tabManager.activeTab && tabManager.activeTab.isEditing)}
 						<button
 						class="home-menu-item"
 						onclick={() => {
-							homeMenuOpen = false;
+							popovers.homeMenuOpen = false;
 							onsaveFile?.();
 						}}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -553,7 +439,7 @@
 					<button
 						class="home-menu-item"
 						onclick={() => {
-							homeMenuOpen = false;
+							popovers.homeMenuOpen = false;
 							onsaveFileAs?.();
 						}}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -567,7 +453,7 @@
 						<button
 							class="home-menu-item"
 							onclick={() => {
-								homeMenuOpen = false;
+								popovers.homeMenuOpen = false;
 								onreloadFromDisk?.();
 							}}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -577,21 +463,12 @@
 						</button>
 					{/if}
 					{/if}
-					<!--
-						`rawContent`, not `content`: the exports read the Markdown buffer
-						(`exportAsHtml` returns null on an empty `ctx.rawContent`), while
-						`content` is the rendered-preview HTML, refreshed only while the
-						preview is on screen. In plain edit mode with the TOC closed —
-						the default state of a new file — `content` is still empty for a
-						buffer that has never been rendered, so gating on it hid an export
-						that would have produced a file.
-					-->
-					{#if hasExportableDocument(currentFile, tabManager.activeTab?.rawContent)}
+					{#if canExportTab(tabManager.activeTab)}
 						<div class="home-menu-divider"></div>
 						<button
 						class="home-menu-item"
 						onclick={() => {
-							homeMenuOpen = false;
+							popovers.homeMenuOpen = false;
 							onexportHtml?.();
 						}}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -601,7 +478,7 @@
 					<button
 						class="home-menu-item"
 						onclick={() => {
-							homeMenuOpen = false;
+							popovers.homeMenuOpen = false;
 							onexportPdf?.();
 						}}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -613,25 +490,36 @@
 					<div class="home-menu-divider"></div>
 					<button
 						class="home-menu-item"
-						onclick={() => {
-							homeMenuOpen = false;
-							openTagEditor();
-						}}>
+						onclick={() => popovers.openTagEditorFromHomeMenu()}>
 						{t('menu.setWindowTag', currentLanguage)}
 					</button>
 					<button
 						class="home-menu-item"
 						onclick={() => {
-							homeMenuOpen = false;
+							popovers.homeMenuOpen = false;
 							onmergeAllWindows?.();
 						}}>
 						{t('menu.mergeAllWindows', currentLanguage)}
 					</button>
+					{#if pinnedTags.length > 0}
+						<div class="home-menu-divider"></div>
+						{#each pinnedTags as tag (tag.name)}
+							<button
+								class="home-menu-item"
+								onclick={() => {
+									popovers.homeMenuOpen = false;
+									openPinnedTagWindow(tag.name).catch(console.error);
+								}}>
+								<span class="pinned-tag-dot" style:--tag-color={tag.color}></span>
+								{tag.name}
+							</button>
+						{/each}
+					{/if}
 					<div class="home-menu-divider"></div>
 					<button
 					class="home-menu-item"
 					onclick={() => {
-						homeMenuOpen = false;
+						popovers.homeMenuOpen = false;
 						onexit?.();
 					}}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -643,7 +531,7 @@
 					<button
 						class="home-menu-footer"
 						onclick={() => {
-							homeMenuOpen = false;
+							popovers.homeMenuOpen = false;
 							openUrl('https://github.com/alecdotdev/Markpad')
 								.catch(() => window.open('https://github.com/alecdotdev/Markpad', '_blank'));
 						}}>
@@ -658,48 +546,67 @@
 			<button
 				class="window-tag-chip"
 				style:--tag-color={tabManager.windowTag.color}
-				oncontextmenu={openTagEditorFromContextMenu}
-				onclick={(event) => {
-					event.stopPropagation();
-					if (tagEditorOpen) tagEditorOpen = false;
-					else openTagEditor();
-				}}>
+				oncontextmenu={(event) => popovers.openTagEditorFromContextMenu(event)}
+				onclick={(event) => popovers.toggleTagEditor(event)}>
 				{tabManager.windowTag.name}
 			</button>
 		{/if}
-		{#if tagEditorOpen}
+		{#if popovers.tagEditorOpen}
 			<div
 				class="tag-editor"
 				role="dialog"
 				tabindex="-1"
-				onclick={(event) => event.stopPropagation()}
-				onkeydown={(event) => {
-					if (event.key === 'Escape') tagEditorOpen = false;
-					else if (event.key === 'Enter') applyTag();
-				}}>
+				onclick={containClick}
+				onkeydown={(event) => popovers.editorKeydown(event)}>
 				<!-- svelte-ignore a11y_autofocus -->
 				<input
 					autofocus
 					spellcheck="false"
 					placeholder={t('menu.windowTagPlaceholder', currentLanguage)}
-					bind:value={tagDraftName}
-					oninput={() => (tagError = '')} />
-				{#if tagError}<p class="tag-error" role="alert">{tagError}</p>{/if}
+					bind:value={popovers.tagDraftName}
+					oninput={() => popovers.nameEdited()} />
+				{#if popovers.tagError}<p class="tag-error" role="alert">{popovers.tagError}</p>{/if}
 				<div class="tag-colors">
-					{#each tagColors as color}
-						<button class:selected={tagDraftColor === color} style:--tag-color={color} onclick={() => (tagDraftColor = color)} aria-label={color}></button>
+					{#each TAG_COLORS as color}
+						<button class:selected={popovers.tagDraftColor === color} style:--tag-color={color} onclick={() => (popovers.tagDraftColor = color)} aria-label={color}></button>
 					{/each}
 				</div>
-				<button class="tag-save-btn" onclick={applyTag}>{t('settings.save', currentLanguage)}</button>
-				{#if tabManager.windowTag}<button class="tag-action-btn" onclick={togglePinnedTag}>{t(tabManager.windowTag.pinned ? 'menu.unpinWindowTag' : 'menu.pinWindowTag', currentLanguage)}</button>{/if}
-				{#if tabManager.windowTag}<button class="tag-action-btn danger" onclick={clearTag}>{t('menu.windowTagClear', currentLanguage)}</button>{/if}
+				{#if popovers.tagActions}
+					<div class="home-menu-divider"></div>
+					<button class="home-menu-item" onclick={() => popovers.togglePinnedTag()}>
+						{#if popovers.tagActions.pinned}
+							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+								><path d="M12 17v5" /><path d="M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89" /><path d="m2 2 20 20" /><path
+									d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11" /></svg>
+						{:else}
+							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+								><path d="M12 17v5" /><path
+									d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
+						{/if}
+						{t(popovers.tagActions.pinned ? 'menu.unpinWindowTag' : 'menu.pinWindowTag', currentLanguage)}
+					</button>
+					{#if popovers.tagActions.canClose}
+						<button class="home-menu-item" onclick={() => { popovers.tagEditorOpen = false; onclosetag?.(); }}>
+							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+								><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /><path d="m15 9-6 6" /><path d="m9 9 6 6" /></svg>
+							{t('menu.closeWindowTag', currentLanguage)}
+						</button>
+					{/if}
+					<div class="home-menu-divider"></div>
+					<button class="home-menu-item" onclick={() => popovers.clearTag()}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+							><path d="M21 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6" /><path d="m21 3-9 9" /><path d="M15 3h6v6" /></svg>
+						{t('menu.windowTagClear', currentLanguage)}
+					</button>
+				{/if}
 			</div>
 		{/if}
 	</div>
 
-	{#if tabManager.tabs.length > 0 && settings.showTabs}
-		<div class="tab-area" class:tagged={tabManager.windowTag !== null} style:--tag-color={tabManager.windowTag?.color}>
-			<TabList onnewTab={() => tabManager.addNewTab()} {ondetach} {showHome} {ontabclick} {oncloseTab} />
+	<!-- With the tabs in a side column (#884) the bar shows the window title, as it does with tabs hidden. -->
+	{#if tabManager.tabs.length > 0 && settings.tabPlacement === 'top'}
+		<div class="tab-area" class:tagged={scopeLine(tabManager.windowTag).tagged} style:--tag-color={scopeLine(tabManager.windowTag).color}>
+			<TabList onnewTab={() => tabManager.addNewTab()} {showHome} {ontabclick} {oncloseTab} />
 		</div>
 	{:else}
 		<div class="window-title-container" data-tauri-drag-region>
@@ -714,17 +621,17 @@
 	{#snippet toolbarRow()}
 		{#snippet kebabButton()}
 			<button
-				class="kebab-btn {kebabMenuOpen ? 'active' : ''}"
+				class="kebab-btn {popovers.kebabMenuOpen ? 'active' : ''}"
 				onclick={(e) => {
 					e.stopPropagation();
-					kebabMenuOpen = !kebabMenuOpen;
-					if (kebabMenuOpen) {
-						themeMenuOpen = false;
+					popovers.kebabMenuOpen = !popovers.kebabMenuOpen;
+					if (popovers.kebabMenuOpen) {
+						popovers.themeMenuOpen = false;
 						hideTooltip();
 					}
 				}}
 				onmouseenter={(e) => {
-							if (!kebabMenuOpen) showTooltip(e, t('tooltip.more', currentLanguage));
+							if (!popovers.kebabMenuOpen) showTooltip(e, t('tooltip.more', currentLanguage));
 						}}
 				onmousedown={(e) => e.preventDefault()}
 				onmouseleave={hideTooltip}
@@ -739,13 +646,31 @@
 
 	{#snippet actionItems(ids: string[])}
 			{#each ids as id (id)}
-				{#if id === 'back'}
+				{#if id === 'home'}
+					<button
+						class="title-action-btn {showHome ? 'active' : ''}"
+						onclick={() => {
+							hideTooltip();
+							popovers.kebabMenuOpen = false;
+							ontoggleHome();
+						}}
+						aria-label={t('menu.home', currentLanguage)}
+						onmouseenter={(e) => showTooltip(e, t('menu.home', currentLanguage), shortcutLabel('app-home', modifier))}
+						onmousedown={(e) => e.preventDefault()}
+						onmouseleave={hideTooltip}
+						transition:fly={{ x: 10, duration: 200 }}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+							><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+						<span class="action-label">{t('menu.home', currentLanguage)}</span>
+						<span class="menu-shortcut">{shortcutLabel('app-home', modifier)}</span>
+					</button>
+				{:else if id === 'back'}
 					<button
 						class="title-action-btn"
 						disabled={!canGoBack}
 						onclick={() => {
 							hideTooltip();
-							kebabMenuOpen = false;
+							popovers.kebabMenuOpen = false;
 							onback?.();
 						}}
 						aria-label={t('tooltip.back', currentLanguage)}
@@ -765,7 +690,7 @@
 						disabled={!canGoForward}
 						onclick={() => {
 							hideTooltip();
-							kebabMenuOpen = false;
+							popovers.kebabMenuOpen = false;
 							onforward?.();
 						}}
 						aria-label={t('tooltip.forward', currentLanguage)}
@@ -784,7 +709,7 @@
 						class="title-action-btn"
 						onclick={() => {
 							hideTooltip();
-							kebabMenuOpen = false;
+							popovers.kebabMenuOpen = false;
 							onopenSettings?.();
 						}}
 						aria-label={t('tooltip.settings', currentLanguage)}
@@ -859,7 +784,7 @@
 						class="title-action-btn"
 						style:opacity={settings.zenMode ? 0.3 : 1}
 						style:pointer-events={settings.zenMode ? 'none' : 'auto'}
-						onclick={() => settings.toggleTabs()}
+						onclick={() => { settings.showTabs = !settings.showTabs; }}
 						aria-label={t('tooltip.tabs', currentLanguage).replace('{{action}}', settings.showTabs ? t('tooltip.hide', currentLanguage) : t('tooltip.show', currentLanguage))}
 											onmouseenter={(e) => showTooltip(e, t('tooltip.tabs', currentLanguage).replace('{{action}}', settings.showTabs ? t('tooltip.hide', currentLanguage) : t('tooltip.show', currentLanguage)), shortcutLabel('toggle-tabs', modifier))}
 						onmousedown={(e) => e.preventDefault()}
@@ -878,7 +803,7 @@
 						class="title-action-btn"
 						onclick={() => {
 							hideTooltip();
-							kebabMenuOpen = false;
+							popovers.kebabMenuOpen = false;
 							onfind?.();
 						}}
 						aria-label={t('tooltip.find', currentLanguage)}
@@ -909,30 +834,37 @@
 								x2="18"
 								y2="10"></line
 							></svg>
-						<span class="action-label">{t('menu.openLocation', currentLanguage)}</span>
+						<span class="action-label">{t('menu.openFileLocation', currentLanguage)}</span>
 					</button>
-				{:else if id === 'split'}
-					<button
-						class="title-action-btn {tabManager.activeTab?.isSplit ? 'active' : ''}"
-						onclick={() => ontoggleSplit?.()}
-						aria-label={t('tooltip.toggleSplitView', currentLanguage)}
-											onmouseenter={(e) => showTooltip(e, t('tooltip.splitView', currentLanguage), shortcutLabel('view-toggle-split', modifier))}
-						onmousedown={(e) => e.preventDefault()}
-						onmouseleave={hideTooltip}
-						transition:fly={{ x: 10, duration: 200 }}>
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-							><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line><rect
-								x="13"
-								y="2"
-								width="9"
-								height="20"
-								rx="2"
-								ry="2"
-								transform="rotate(0 13 2)"></rect
-							></svg>
-						<span class="action-label">{t('menu.splitView', currentLanguage)}</span>
-						<span class="menu-shortcut">{shortcutLabel('view-toggle-split', modifier)}</span>
-					</button>
+				{:else if id === 'viewMode'}
+					<div class="view-mode-group" role="group" aria-label={t('menu.view', currentLanguage)} transition:fly={{ x: 10, duration: 200 }}>
+						{#each viewModes as mode (mode.id)}
+							<button
+								class="title-action-btn {currentViewMode === mode.id ? 'active' : ''}"
+								aria-pressed={currentViewMode === mode.id}
+								onclick={() => {
+									hideTooltip();
+									popovers.kebabMenuOpen = false;
+									onsetViewMode(mode.id);
+								}}
+								aria-label={mode.label}
+								onmouseenter={(e) => showTooltip(e, mode.label, mode.shortcut ? shortcutLabel(mode.shortcut, modifier) : '')}
+								onmousedown={(e) => e.preventDefault()}
+								onmouseleave={hideTooltip}>
+								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+									{#if mode.id === 'preview'}
+										<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>
+									{:else if mode.id === 'split'}
+										<rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="12" y1="3" x2="12" y2="21"></line>
+									{:else}
+										<path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+									{/if}
+								</svg>
+								<span class="action-label">{mode.label}</span>
+								{#if mode.shortcut}<span class="menu-shortcut">{shortcutLabel(mode.shortcut, modifier)}</span>{/if}
+							</button>
+						{/each}
+					</div>
 				{:else if id === 'swap'}
 					<button
 						class="title-action-btn"
@@ -980,7 +912,7 @@
 						class="title-action-btn"
 						onclick={() => {
 							hideTooltip();
-							kebabMenuOpen = false;
+							popovers.kebabMenuOpen = false;
 							onreloadFromDisk?.();
 						}}
 						aria-label={t('tooltip.reloadFromDisk', currentLanguage)}
@@ -1007,19 +939,6 @@
 							></svg>
 						<span class="action-label">{t('menu.autoReload', currentLanguage)}</span>
 					</button>
-				{:else if id === 'edit'}
-					<button
-						class="title-action-btn {isEditing ? 'active' : ''}"
-						onclick={ontoggleEdit}
-						aria-label={t('tooltip.editFile', currentLanguage)}
-											onmouseenter={(e) => showTooltip(e, t('tooltip.editFile', currentLanguage), shortcutLabel('view-toggle-edit', modifier))}
-						onmousedown={(e) => e.preventDefault()}
-						onmouseleave={hideTooltip}>
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-							><path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" /></svg>
-						<span class="action-label">{t('menu.editor', currentLanguage)}</span>
-						<span class="menu-shortcut">{shortcutLabel('view-toggle-edit', modifier)}</span>
-					</button>
 				{:else if id === 'editorToolbar'}
 					<button
 						class="title-action-btn {settings.showEditorToolbar ? 'active' : ''}"
@@ -1036,15 +955,15 @@
 				{:else if id === 'theme'}
 					<div class="theme-dropdown-container">
 						<button
-							class="title-action-btn {themeMenuOpen ? 'active' : ''}"
+							class="title-action-btn {popovers.themeMenuOpen ? 'active' : ''}"
 							onclick={(e) => {
 								e.stopPropagation();
-								themeMenuOpen = !themeMenuOpen;
-								if (themeMenuOpen) hideTooltip();
+								popovers.themeMenuOpen = !popovers.themeMenuOpen;
+								if (popovers.themeMenuOpen) hideTooltip();
 							}}
 							aria-label={t('tooltip.changeTheme', currentLanguage)}
 														onmouseenter={(e) => {
-														if (!themeMenuOpen) showTooltip(e, t('tooltip.changeTheme', currentLanguage));
+														if (!popovers.themeMenuOpen) showTooltip(e, t('tooltip.changeTheme', currentLanguage));
 												}}
 							onmousedown={(e) => e.preventDefault()}
 							onmouseleave={hideTooltip}
@@ -1071,7 +990,7 @@
 							{/if}
 							<span class="action-label">{t('menu.changeTheme', currentLanguage)}</span>
 						</button>
-						{#if themeMenuOpen}
+						{#if popovers.themeMenuOpen}
 							<div
 								class="theme-menu"
 								role="menu"
@@ -1079,7 +998,7 @@
 								transition:fly={{ y: 5, duration: 150 }}
 								onclick={(e) => e.stopPropagation()}
 								onkeydown={(e) => {
-									if (e.key === 'Escape') themeMenuOpen = false;
+									if (e.key === 'Escape') popovers.themeMenuOpen = false;
 								}}>
 								<button class="theme-option {theme === 'system' ? 'selected' : ''}" onclick={() => handleSetTheme('system')}> {t('theme.followSystem', currentLanguage)} </button>
 								<button class="theme-option {theme === 'light' ? 'selected' : ''}" onclick={() => handleSetTheme('light')}> {t('theme.defaultLight', currentLanguage)} </button>
@@ -1099,10 +1018,10 @@
 			{/each}
 		{/snippet}
 
-		{#if isCollapsed}
-			{#if configuredActionIds.visibleIds.length > 0}
+		{#snippet actionMenu(ids: string[])}
+			{#if ids.length > 0}
 				{@render kebabButton()}
-				{#if kebabMenuOpen}
+				{#if popovers.kebabMenuOpen}
 					<div
 						class="title-actions show-dropdown"
 						data-tauri-drag-region
@@ -1111,34 +1030,22 @@
 						transition:fly={{ y: 5, duration: 150 }}
 						onclick={(e) => e.stopPropagation()}
 						onkeydown={(e) => {
-							if (e.key === 'Escape') kebabMenuOpen = false;
+							if (e.key === 'Escape') popovers.kebabMenuOpen = false;
 						}}>
-						{@render actionItems(configuredActionIds.visibleIds)}
+						{@render actionItems(ids)}
 					</div>
 				{/if}
 			{/if}
+		{/snippet}
+
+		{#if isCollapsed}
+			{@render actionMenu(configuredActionIds.visibleIds)}
 		{:else}
 			<div class="title-actions inline" data-tauri-drag-region>
 				{@render actionItems(configuredActionIds.barIds)}
 			</div>
 
-			{#if configuredActionIds.menuIds.length > 0}
-				{@render kebabButton()}
-				{#if kebabMenuOpen}
-					<div
-						class="title-actions show-dropdown"
-						data-tauri-drag-region
-						role="menu"
-						tabindex="-1"
-						transition:fly={{ y: 5, duration: 150 }}
-						onclick={(e) => e.stopPropagation()}
-						onkeydown={(e) => {
-							if (e.key === 'Escape') kebabMenuOpen = false;
-						}}>
-						{@render actionItems(configuredActionIds.menuIds)}
-					</div>
-				{/if}
-			{/if}
+			{@render actionMenu(configuredActionIds.menuIds)}
 		{/if}
 	{/snippet}
 
@@ -1249,8 +1156,8 @@
 	 * with `background-color`, so nothing else in the strip is using this
 	 * channel and the two readings do not compete.
 	 *
-	 * Above `.scroll-shadow` (20) and `.new-tab-btn` (21) in TabList, which
-	 * would otherwise cover the ends of the line.
+	 * Above `.new-tab-btn` (21) in TabList, which would otherwise cover the
+	 * end of the line.
 	 */
 	.tab-area.tagged::after {
 		content: '';
@@ -1412,11 +1319,6 @@
 		display: none;
 	}
 
-	.actions-wrapper {
-		display: flex;
-		gap: 4px;
-	}
-
 	.title-action-btn {
 		width: 28px;
 		height: 28px;
@@ -1518,6 +1420,32 @@
 		background: var(--color-canvas-subtle);
 	}
 
+	/* One bordered control, so the three modes read as a set (#806). */
+	.view-mode-group {
+		display: flex;
+		align-items: center;
+		gap: 1px;
+		padding: 1px;
+		border: 1px solid var(--color-border-default);
+		border-radius: 6px;
+	}
+
+	.view-mode-group .title-action-btn {
+		width: 26px;
+		height: 24px;
+	}
+
+	.title-actions.show-dropdown .view-mode-group {
+		flex-direction: column;
+		align-items: stretch;
+		margin: 2px 0;
+	}
+
+	.title-actions.show-dropdown .view-mode-group .title-action-btn {
+		width: 100%;
+		height: auto;
+	}
+
 	.title-action-btn:hover {
 		background: var(--color-canvas-subtle);
 		color: var(--color-fg-default);
@@ -1564,16 +1492,18 @@
 		background: var(--color-canvas-subtle);
 	}
 
+	/*
+	 * The title takes the space between the left controls and the action
+	 * cluster rather than being positioned over the whole bar. Centred on the
+	 * window, it sat under the toolbar buttons once the window was narrower
+	 * than the title plus both clusters, and the buttons are above it (#884).
+	 */
 	.window-title-container {
-		position: absolute;
-		left: 0;
-		right: 0;
-		top: 0;
-		bottom: 0;
+		flex: 1;
+		min-width: 0;
 		display: flex;
 		justify-content: center;
 		align-items: center;
-		z-index: 5;
 	}
 
 	.window-title {
@@ -1583,13 +1513,7 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		display: block;
-		max-width: calc(100vw - 450px);
-	}
-
-	@media (max-width: 800px) {
-		.window-title {
-			max-width: calc(100vw - 260px);
-		}
+		max-width: 100%;
 	}
 
 	.title-text {
@@ -1637,89 +1561,6 @@
 
 	.close-btn:hover {
 		background: #e81123 !important;
-	}
-
-	.zoom-indicator {
-		background: var(--color-canvas-subtle);
-		color: var(--color-fg-muted);
-		border: 1px solid var(--color-border-default);
-		border-radius: 4px;
-		padding: 2px 8px;
-		font-size: 11px;
-		cursor: pointer;
-		margin-right: 8px;
-		display: flex;
-		align-items: center;
-		height: 24px;
-		align-self: center;
-		transition: all 0.1s;
-	}
-
-	.zoom-indicator:hover {
-		background: var(--color-btn-hover-bg);
-		color: var(--color-fg-default);
-		border-color: var(--color-border-muted);
-	}
-
-
-	.macos-traffic-lights {
-		display: flex;
-		gap: 8px;
-		margin-right: 12px;
-		align-items: center;
-		padding-left: 2px;
-	}
-
-	.mac-btn {
-		width: 12px;
-		height: 12px;
-		border-radius: 50%;
-		border: 1px solid rgba(0, 0, 0, 0.1);
-		display: flex;
-		justify-content: center;
-		align-items: center;
-		padding: 0;
-		cursor: default;
-		outline: none;
-		position: relative;
-		overflow: hidden;
-	}
-
-	.mac-close {
-		background-color: #ff5f57;
-		border-color: #e0443e;
-	}
-
-	.mac-minimize {
-		background-color: #febc2e;
-		border-color: #d3a125;
-	}
-
-	.mac-maximize {
-		background-color: #28c840;
-		border-color: #1ca431;
-	}
-
-	.mac-icon {
-		opacity: 0;
-		color: #4d0000;
-		transition: opacity 0.1s;
-	}
-
-	.mac-minimize .mac-icon {
-		color: #995700;
-	}
-
-	.mac-maximize .mac-icon {
-		color: #006500;
-	}
-
-	.macos-traffic-lights:hover .mac-icon {
-		opacity: 0.6;
-	}
-
-	.mac-btn:active {
-		filter: brightness(0.9);
 	}
 
 	.custom-tooltip {
@@ -1868,19 +1709,15 @@
 
 	.window-tag-container { position: relative; display: flex; align-items: center; margin-left: 4px; }
 	.window-tag-chip { border: 0; border-radius: 10px; background: var(--tag-color); color: #fff; padding: 3px 10px; font: 600 11px var(--win-font); cursor: pointer; }
-	.tag-editor { position: absolute; top: 28px; left: 0; z-index: 20000; width: 180px; padding: 10px; display: flex; flex-direction: column; gap: 8px; background: var(--color-canvas-default); border: 1px solid var(--color-border-default); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .2); font-family: var(--win-font); }
+	.tag-editor { position: absolute; top: 28px; left: 0; z-index: 20000; width: 200px; padding: 10px; display: flex; flex-direction: column; gap: 8px; background: var(--color-canvas-default); border: 1px solid var(--color-border-default); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .2); font-family: var(--win-font); }
 	.tag-editor input { box-sizing: border-box; width: 100%; padding: 6px 8px; color: var(--color-fg-default); background: var(--color-canvas-default); border: 1px solid var(--color-border-default); border-radius: 6px; font-family: var(--win-font); font-size: 12px; outline: none; }
 	.tag-editor input:focus { border-color: var(--color-accent-fg); }
 	.tag-error { margin: 0; color: var(--color-danger-fg); font-size: 11px; line-height: 1.4; }
 	.tag-colors { display: flex; justify-content: space-between; padding: 2px 0; }
 	.tag-colors button { width: 18px; height: 18px; padding: 0; border: 2px solid transparent; border-radius: 50%; background: var(--tag-color); cursor: pointer; transition: transform 0.1s ease, border-color 0.1s ease; }
 	.tag-colors button:hover { transform: scale(1.15); }
+	.pinned-tag-dot { width: 10px; height: 10px; margin: 0 2px; flex-shrink: 0; border-radius: 50%; background: var(--tag-color); }
 	.tag-colors button.selected { border-color: var(--color-fg-default); transform: scale(1.15); }
-	.tag-save-btn { width: 100%; padding: 6px 12px; background: var(--color-accent-emphasis); color: #ffffff; border: none; border-radius: 6px; font-family: var(--win-font); font-size: 12px; font-weight: 600; cursor: pointer; transition: background-color 0.15s ease; }
-	.tag-save-btn:hover { background: color-mix(in srgb, var(--color-accent-emphasis) 85%, #000); }
-	.tag-action-btn { width: 100%; padding: 5px 10px; background: transparent; color: var(--color-fg-muted); border: 1px solid var(--color-border-default); border-radius: 6px; font-family: var(--win-font); font-size: 11px; cursor: pointer; transition: background-color 0.15s ease, color 0.15s ease; }
-	.tag-action-btn:hover { background: var(--color-canvas-subtle); color: var(--color-fg-default); }
-	.tag-action-btn.danger:hover { background: color-mix(in srgb, var(--color-danger-fg) 15%, transparent); color: var(--color-danger-fg); border-color: var(--color-danger-fg); }
 
 	.home-menu-item {
 		display: flex;

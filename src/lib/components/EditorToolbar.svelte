@@ -2,6 +2,8 @@
 	import { onMount } from 'svelte';
 	import { fly } from 'svelte/transition';
 	import { getVisibleEditorToolbarTools, type EditorToolbarTool } from '../utils/editorToolbar.js';
+	import { settings } from '../stores/settings.svelte.js';
+	import { t } from '../utils/i18n.js';
 
 	let {
 		modifier = 'Ctrl',
@@ -61,9 +63,13 @@
 		return tool.shortcut ? tool.shortcut(modifier) : '';
 	}
 
+	function toolName(tool: EditorToolbarTool) {
+		return t(tool.labelKey, settings.language);
+	}
+
 	function handleMouseEnter(e: MouseEvent, tool: EditorToolbarTool) {
 		if (tool.id === 'insert-table-simple' && tablePickerOpen) return;
-		onshowTooltip?.(e, tool.name, getShortcutText(tool), 'below');
+		onshowTooltip?.(e, toolName(tool), getShortcutText(tool), 'below');
 	}
 
 	function handleHideMouseEnter(e: MouseEvent) {
@@ -140,7 +146,7 @@
 		onkeydown={(e) => { if (e.key === 'Escape') tablePickerOpen = false; }}
 		onclick={(e) => e.stopPropagation()}>
 		<div class="table-grid-header">
-			<span class="table-grid-title">Insert Table</span>
+			<span class="table-grid-title">{t('menu.insertTable', settings.language)}</span>
 			<span class="table-grid-dims">
 				{hoverRows > 0 && hoverCols > 0 ? `${hoverCols} × ${hoverRows}` : 'Select size'}
 			</span>
@@ -193,7 +199,7 @@
 						type="button"
 						class="toolbar-btn"
 						class:active={tablePickerOpen}
-						aria-label="Insert Table"
+						aria-label={t('menu.insertTable', settings.language)}
 						onmouseenter={(e) => handleMouseEnter(e, tool)}
 						onmouseleave={() => onhideTooltip?.()}
 						onfocus={(e) => handleMouseEnter(e as unknown as MouseEvent, tool)}
@@ -215,7 +221,7 @@
 				<button
 					type="button"
 					class="toolbar-btn"
-					aria-label={getShortcutText(tool) ? `${tool.name} (${getShortcutText(tool)})` : tool.name}
+					aria-label={getShortcutText(tool) ? `${toolName(tool)} (${getShortcutText(tool)})` : toolName(tool)}
 					onmouseenter={(e) => handleMouseEnter(e, tool)}
 					onmouseleave={() => onhideTooltip?.()}
 					onfocus={(e) => handleMouseEnter(e as unknown as MouseEvent, tool)}
@@ -270,7 +276,7 @@
 										tablePickerOpen = true;
 									}}>
 									<span class="overflow-item-icon">{@render renderToolIcon(tool.id)}</span>
-									<span class="overflow-item-name">{tool.name}</span>
+									<span class="overflow-item-name">{toolName(tool)}</span>
 									{#if getShortcutText(tool)}
 										<span class="overflow-item-shortcut">{getShortcutText(tool)}</span>
 									{/if}
@@ -284,7 +290,7 @@
 										onaction(tool.id);
 									}}>
 									<span class="overflow-item-icon">{@render renderToolIcon(tool.id)}</span>
-									<span class="overflow-item-name">{tool.name}</span>
+									<span class="overflow-item-name">{toolName(tool)}</span>
 									{#if getShortcutText(tool)}
 										<span class="overflow-item-shortcut">{getShortcutText(tool)}</span>
 									{/if}

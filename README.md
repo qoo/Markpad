@@ -1,7 +1,7 @@
 <div align="center">
   <img src="src-tauri/icons/128x128.png" width="128" alt="Markpad Icon" />
   <h1>Markpad</h1>
-  <p><b>The Notepad equivalent for Markdown</b></p>
+  <p><b>Light as Notepad, elegant as Markdown.</b></p>
   
   [![GitHub Release](https://img.shields.io/github/v/release/sftwrdotdev/Markpad?style=flat-square)](https://github.com/sftwrdotdev/Markpad/releases/latest)
 
@@ -24,12 +24,13 @@
 
 **Editing**
 - Monaco (VS Code editor) with Vim support
-- Split view, kept in sync line for line
+- Split view, with optional line-for-line scroll sync
 - Heading completion for links, and a customisable formatting toolbar
 - Paste an image straight into the document; drag files in to open them
 
 **Documents**
 - Tabs, multiple windows, window tags, and a session that comes back
+- A Home page with recent files, and pinned tags that reopen a saved group of files
 - Auto-reload when a file changes on disk
 - Export to HTML, print to PDF
 - Wikilinks, embeds and callouts alongside standard Markdown. See
@@ -37,7 +38,7 @@
 
 **More**
 - Windows, macOS and Linux
-- ~10MB of memory, no telemetry, free and open source
+- No telemetry, free and open source
 - 26 interface languages
 
 ## Download
@@ -48,6 +49,12 @@
 
 ```powershell
 choco install markpad-app
+```
+
+#### macOS (Homebrew)
+
+```bash
+brew install --cask markpad
 ```
 
 #### Linux (Snap)
@@ -73,7 +80,7 @@ Every file below is on the [latest release](https://github.com/sftwrdotdev/Markp
 
 The two Windows files differ only in that one installs and one does not — `-setup.exe` puts Markpad in Program Files and the Start menu; the plain `.exe` runs from wherever you put it.
 
-> After a direct `.dmg` (macOS), `*-setup.exe` (Windows NSIS) or `.AppImage` (Linux) install, Markpad self-updates from GitHub releases via the in-app *Check for Updates…* entry (macOS app menu, or Settings elsewhere). Chocolatey and Snap keep Markpad current through those package managers instead.
+> After a direct `.dmg` or Homebrew (macOS), `*-setup.exe` (Windows NSIS) or `.AppImage` (Linux) install, Markpad self-updates from GitHub releases via the in-app *Check for Updates…* entry (macOS app menu, or Settings elsewhere). Chocolatey and Snap keep Markpad current through those package managers instead.
 >
 > **`.deb` and `.rpm` are one-time installs.** `tauri-plugin-updater` cannot replace a package-managed install, and there is no apt or dnf repository to update from — upgrading means downloading a newer package from the releases page. *Check for Updates…* recognises a package-managed install and tells you so.
 

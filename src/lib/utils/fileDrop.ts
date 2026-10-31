@@ -38,6 +38,16 @@ function isDroppableImage(path: string): boolean {
 	return extension !== undefined && DROPPABLE_IMAGE_EXTENSIONS.includes(extension);
 }
 
+/**
+ * Which pane a drop is routed as, given the pane the pointer was tracked over.
+ * Anywhere but the editor — the preview, or outside both panes (the tab strip,
+ * the title bar) — answers as the preview does: a document opens, anything else
+ * is reported. The same in every view mode.
+ */
+export function dropPaneFor(target: DropPane | null, hasEditor: boolean): DropPane {
+	return target === 'editor' && hasEditor ? 'editor' : 'preview';
+}
+
 export function routeDroppedFile(path: string, pane: DropPane): DropAction {
 	// An image goes INTO the text, and only where there is text to go into.
 	// On the preview there is no caret, so it is reported rather than inserted.
@@ -46,4 +56,36 @@ export function routeDroppedFile(path: string, pane: DropPane): DropAction {
 	if (hasMarkdownLinkExtension(path)) return 'open';
 
 	return 'unsupported';
+}
+
+/**
+ * Which label a pane's drop zone shows while `paths` hover over the window.
+ * Asked of the same routing the drop itself uses, so the zone cannot promise
+ * an embed for a document the drop will open (#928).
+ */
+export function dropZoneLabel(paths: readonly string[], pane: DropPane): 'embed' | 'open' {
+	return paths.some((path) => routeDroppedFile(path, pane) === 'insert') ? 'embed' : 'open';
+}
+
+export interface DropActions {
+	insert(path: string): void;
+	open(path: string): void;
+	unsupported(path: string): void;
+}
+
+/**
+ * Act on a drop: every path is routed through `routeDroppedFile` for the pane
+ * the drop resolves to, and each of the three answers is acted on. The editor's
+ * branch used to look for an image and silently discard everything else, so a
+ * `.md` dropped there did nothing at all while the same drop on the preview
+ * opened it.
+ */
+export function handleDrop(
+	paths: readonly string[],
+	target: DropPane | null,
+	hasEditor: boolean,
+	actions: DropActions,
+): void {
+	const pane = dropPaneFor(target, hasEditor);
+	for (const path of paths) actions[routeDroppedFile(path, pane)](path);
 }

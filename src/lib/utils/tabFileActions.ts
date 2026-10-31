@@ -1,10 +1,11 @@
 import { isHomePath } from './homeTab.js';
+import type { TranslationKey } from './i18n.js';
 
 type TabFileActionId = 'copy-path' | 'open-location';
 
 type TabFileAction = {
 	id: TabFileActionId;
-	labelKey: string;
+	labelKey: TranslationKey;
 	disabled: boolean;
 };
 
@@ -19,19 +20,27 @@ export function hasRealFilePath(path: string): boolean {
 }
 
 /**
- * True when there is a document worth exporting: a file on disk, or an untitled
- * buffer someone has typed into.
+ * True when there is a document worth exporting: a buffer with something in it,
+ * saved or not.
  *
- * Shared by the Export menu items, which are hidden without it, and by the
- * Export as PDF chord (#673), which would otherwise print a blank page for a
- * document the menu says cannot be exported. Two spellings of one condition is
- * how the menu and the keyboard come to disagree.
- *
- * `currentFile` rather than the tab's path because that is what both call
- * sites already hold, and it is the same string.
+ * Shared by the Export menu items, which are hidden without it, by the Export as
+ * PDF chord (#673), and by the HTML export itself, so the menu and the exports
+ * cannot disagree. A path alone does not count: a saved empty file has nothing
+ * to print or export.
  */
-export function hasExportableDocument(currentFile: string, rawContent: string | undefined): boolean {
-	return currentFile !== '' || !!rawContent;
+export function hasExportableDocument(rawContent: string | undefined): boolean {
+	return !!rawContent;
+}
+
+/**
+ * The Home menu's export gate for a tab. It reads the Markdown buffer, not
+ * `content`: that is the rendered-preview HTML, refreshed only while the
+ * preview is on screen, so in plain edit mode with the TOC closed — the
+ * default state of a new file — it is still empty for a buffer that exports
+ * fine.
+ */
+export function canExportTab(tab: { rawContent: string } | null | undefined): boolean {
+	return hasExportableDocument(tab?.rawContent);
 }
 
 export function getTabFileActions(path: string): TabFileAction[] {

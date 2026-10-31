@@ -100,6 +100,15 @@ jobs:
             os-name: 'windows'
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    # The release profile's LTO and single codegen unit are most of the build
+    # step's compile time and change nothing this job checks; build.yml keeps
+    # them. Job-level so rust-cache hashes them into its key: set on the step
+    # alone, master would restore an exact hit, skip the save, and every pull
+    # request would recompile its dependencies against the cached LTO ones.
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v7
 
@@ -187,12 +196,15 @@ jobs:
       # test.yml runs the suites on Linux only, so a Windows- or macOS-only
       # regression in the cfg-gated code paths reaches a release build
       # unchallenged. Running them here makes the platform matrix prove
-      # behaviour, not just that the tree compiles.
+      # behaviour, not just that the tree compiles. Linux is skipped: test.yml
+      # already ran both on the same Ubuntu.
       - name: run frontend behavior tests
+        if: matrix.os-name != 'linux'
         shell: bash
         run: npm test
 
       - name: run cargo test
+        if: matrix.os-name != 'linux'
         working-directory: src-tauri
         run: cargo test
 
@@ -269,3 +281,4 @@ jobs:
             src-tauri/target/*/release/bundle/macos/*.app
             src-tauri/target/release/*.exe
           if-no-files-found: warn
+          retention-days: 7

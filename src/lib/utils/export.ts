@@ -1,5 +1,5 @@
 import { save } from '@tauri-apps/plugin-dialog';
-import { invoke } from '@tauri-apps/api/core';
+import { commands } from '../bindings.js';
 import { getMarkdownBodyWithoutFrontMatter, parseFrontMatter } from './frontMatter.js';
 import { processMarkdownHtml } from './markdown.js';
 import {
@@ -9,11 +9,7 @@ import {
 	rewriteMarkdownHrefForExport,
 } from './exportHtml.js';
 import { sanitizeMarkdownHtml } from './sanitize.js';
-import {
-	loadRichContentLibraries,
-	renderRichContent,
-	type RichContentLibraries,
-} from './richContent.js';
+import { renderRichContent, type RichContentLibraries } from './richContent.js';
 import {
 	absolutizeKatexFontUrls,
 	collectUsedKatexFamilies,
@@ -21,9 +17,37 @@ import {
 	inlineKatexFontFaces,
 	katexFontUrlsToEmbed,
 } from './exportFonts.js';
+import { MERMAID_PRINT_THEME } from './mermaidPrint.js';
 import { normalizePreviewMaxWidth } from './previewWidth.js';
+import { hasExportableDocument } from './tabFileActions.js';
 
-interface ExportContext {
+/**
+ * The Preview settings the live preview wears as inline styles: the font on
+ * its article, the rest as variables on `.markdown-container`. Both exports
+ * ship the article's children into an element outside that container, so
+ * anything not named here stops at the screen (#932). Families are finished
+ * `font-family` values; sizes are pixels.
+ */
+export interface ExportAppearance {
+	fontFamily: string;
+	fontSize: number;
+	codeFontFamily: string;
+	codeFontSize: number;
+	highlightColor: string;
+}
+
+/** `appearance` as the declarations the exported article carries. */
+function appearanceDeclarations(appearance: ExportAppearance): [string, string][] {
+	return [
+		['font-family', appearance.fontFamily],
+		['font-size', `${appearance.fontSize}px`],
+		['--code-font', appearance.codeFontFamily],
+		['--code-font-size', `${appearance.codeFontSize}px`],
+		['--highlight-color', appearance.highlightColor],
+	];
+}
+
+export interface ExportContext {
 	rawContent: string;
 	tabTitle: string;
 	tabPath: string;
@@ -35,6 +59,9 @@ interface ExportContext {
 	 * `exportContentMaxWidth`.
 	 */
 	contentWidth: number | null;
+	appearance: ExportAppearance;
+	/** Every Newline Breaks the Line. Off, the export drops the soft `<br>`s the preview hides. */
+	newlineBreaks: boolean;
 	/**
 	 * Mermaid's theme name for the appearance this export is being made in.
 	 * Unlike the PDF route — paper is always white, so that one forces a light
@@ -43,14 +70,13 @@ interface ExportContext {
 	 */
 	mermaidTheme: string;
 	/**
-	 * The libraries the preview is already using, handed in the same way
-	 * `renderDiagramsForPrint` takes `mermaid` and `sanitizeSvg`. Passing the
-	 * viewer's own instances is what guarantees the exported document was
-	 * produced by the same highlight.js language registry and the same KaTeX
-	 * the user was looking at. `null` (an export triggered before the lazy load
-	 * finished) falls back to the shared loader.
+	 * Stand-ins for tests. Omitted, `renderRichContent` loads what the
+	 * document needs through the same per-window instances the preview uses,
+	 * so the export gets the same highlight.js language registry and KaTeX.
 	 */
-	libraries: RichContentLibraries | null;
+	libraries?: RichContentLibraries;
+	/** The front-matter panel's heading in the UI language (`frontMatter.properties`). */
+	frontMatterTitle?: string;
 }
 
 type ExportHtmlResult = {
@@ -59,10 +85,15 @@ type ExportHtmlResult = {
 	missingImages: number;
 };
 
-export interface PdfExportContext {
-	tabPath: string;
+export interface PdfExportContext extends ExportContext {
 	osType: 'macos' | 'windows' | 'linux' | 'unknown';
+	/** The empty `#print-root` article in the viewer's markup, filled here. */
+	printRoot: HTMLElement;
+	/** Called once the export is committed, after a Windows reader has picked a path. */
+	onStart?: () => void;
 }
+
+const IMAGE_LOAD_TIMEOUT_MS = 3000;
 
 // An exported file leaves the app: it is opened in the user's default browser
 // straight from the export prompt, mailed on, dropped in a shared folder. None
@@ -132,6 +163,7 @@ export interface ExportDocumentInput {
 	articleHtml: string;
 	/** See `ExportContext.contentWidth` and `exportContentMaxWidth`. */
 	contentWidth: number | null;
+	appearance: ExportAppearance;
 }
 
 /**
@@ -150,9 +182,8 @@ export interface ExportDocumentInput {
  * child of `<body>`, so a percentage cap resolves to the width it already has —
  * but `none` says the intended thing without depending on that reasoning, and
  * it cannot interact with `box-sizing` the way a percentage can. `margin: 0
- * auto` then centres nothing (there is no slack to distribute) and the
- * `padding: 40px !important` still holds the text off the window edge, which is
- * exactly how the preview behaves in full-width mode.
+ * auto` then centres nothing (there is no slack to distribute) and the page
+ * margin padding still holds the text off the window edge.
  *
  * The value is normalized here rather than trusted, because this is the seam
  * where it stops being a number and becomes a CSS declaration: `previewMaxWidth`
@@ -170,6 +201,12 @@ export function exportContentMaxWidth(contentWidth: number | null): string {
  * image embedding) so the shape of the artefact can be asserted directly.
  */
 export function buildExportDocument(input: ExportDocumentInput): string {
+	// Named, not embedded: a reader without a family gets its fallback. A
+	// family name is free text, and `</style>` inside it would end the block it
+	// is written into, so `<` goes in as the CSS escape for the same character.
+	const appearance = appearanceDeclarations(input.appearance)
+		.map(([property, value]) => `\t${property}: ${value.replace(/</g, '\\3c ')};`)
+		.join('\n');
 	return `<!DOCTYPE html>
 <html lang="en"${exportThemeAttribute(input.theme)}>
 <head>
@@ -188,12 +225,27 @@ html, body {
 	padding: 0;
 }
 .markdown-body {
-	padding: 40px !important;
 	max-width: ${exportContentMaxWidth(input.contentWidth)};
+${appearance}
 	margin: 0 auto;
 	height: auto !important;
 	overflow: visible !important;
 	min-height: 100%;
+}
+@media screen {
+	.markdown-body {
+		padding: var(--page-margin, 1cm) !important;
+	}
+}
+/* The copied print sheet hides everything outside #app, because the app prints
+   #print-root inside it. An exported file has no #app: its article is the page.
+   The :not(#app) is there for weight, to outrank that rule. Its padding is left
+   to the print sheet, so paper gets the same margins as the app's PDF; the
+   screen rule above uses the same margin, so the file looks the same both ways. */
+@media print {
+	body > .markdown-body:not(#app) {
+		display: block !important;
+	}
 }
 .lang-label {
 	display: none !important;
@@ -240,7 +292,7 @@ html, body {
 	overflow: visible !important;
 }
 .markdown-alert-content.is-collapsed {
-	grid-template-rows: 1fr !important;
+	grid-template-rows: minmax(0, 1fr) !important;
 	opacity: 1 !important;
 	overflow: visible !important;
 }
@@ -304,16 +356,14 @@ ${input.articleHtml}
  */
 async function renderExportRichContent(root: HTMLElement, ctx: ExportContext): Promise<void> {
 	try {
-		const libraries = ctx.libraries ?? (await loadRichContentLibraries());
 		await renderRichContent({
 			// One root, and always the whole thing: an exported file is a string,
 			// so there is no previous DOM to keep any of. The preview's split from
 			// this — same render, same filter, same detached parse, then either
-			// serialize it or diff it into the article — is the whole reason
-			// `blockPatch.ts` takes an already-sanitized string and produces nodes
-			// rather than owning a render of its own.
+			// serialize it or patch it into the article block by block, which is
+			// `previewPatch.ts`.
 			roots: [root],
-			libraries,
+			libraries: ctx.libraries,
 			mermaidTheme: ctx.mermaidTheme,
 			onError: (error) => console.error('Rich content failed to render for HTML export', error),
 			// `onCopyCode` is deliberately not passed: an exported file cannot
@@ -327,9 +377,16 @@ async function renderExportRichContent(root: HTMLElement, ctx: ExportContext): P
 	}
 }
 
-async function buildExportArticle(ctx: ExportContext): Promise<{ root: HTMLElement; embeddedImages: number; missingImages: number }> {
+async function buildExportArticle(
+	ctx: ExportContext,
+	// A file that leaves the app has to carry its images; one printed from this
+	// window does not, and `asset:` resolves here exactly as it does in the
+	// preview. Base64 of every image in the document, for paper, is a cost with
+	// nothing on the other side of it.
+	{ embedImages = true }: { embedImages?: boolean } = {},
+): Promise<{ root: HTMLElement; embeddedImages: number; missingImages: number }> {
 	const body = getMarkdownBodyWithoutFrontMatter(ctx.rawContent);
-	const rendered = (await invoke('render_markdown', { content: body })) as string;
+	const rendered = await commands.renderMarkdown(body, null);
 	// The export used to write `rendered` to disk untouched. comrak runs with
 	// `unsafe_ = true`, so a script the preview had filtered out was still live
 	// in the exported file — and the exported file has no CSP of the app's, gets
@@ -354,7 +411,7 @@ async function buildExportArticle(ctx: ExportContext): Promise<{ root: HTMLEleme
 	// export routes cannot disagree about what is in the file.
 	const processed = processMarkdownHtml(safeHtml, ctx.tabPath, new Set());
 	const wrapper = document.createElement('div');
-	wrapper.innerHTML = renderStaticFrontMatterPanel(parseFrontMatter(ctx.rawContent)) + processed;
+	wrapper.innerHTML = renderStaticFrontMatterPanel(parseFrontMatter(ctx.rawContent), ctx.frontMatterTitle) + processed;
 
 	// Highlight, typeset and draw before the link and image passes, so those see
 	// the markup that actually ships. The renderer works on this detached
@@ -362,6 +419,10 @@ async function buildExportArticle(ctx: ExportContext): Promise<{ root: HTMLEleme
 	// contains can be produced by the file itself, because the policy above
 	// grants it no script privilege, so all of it has to be baked in here.
 	await renderExportRichContent(wrapper, ctx);
+
+	if (!ctx.newlineBreaks) {
+		for (const br of Array.from(wrapper.querySelectorAll('br.softbreak'))) br.remove();
+	}
 
 	for (const link of Array.from(wrapper.querySelectorAll('a[href]'))) {
 		const href = link.getAttribute('href');
@@ -371,7 +432,7 @@ async function buildExportArticle(ctx: ExportContext): Promise<{ root: HTMLEleme
 
 	let embeddedImages = 0;
 	let missingImages = 0;
-	for (const img of Array.from(wrapper.querySelectorAll('img[src]'))) {
+	for (const img of embedImages ? Array.from(wrapper.querySelectorAll('img[src]')) : []) {
 		const src = img.getAttribute('src');
 		if (!src) continue;
 
@@ -379,7 +440,7 @@ async function buildExportArticle(ctx: ExportContext): Promise<{ root: HTMLEleme
 		if (!localPath) continue;
 
 		try {
-			const dataUrl = (await invoke('read_file_as_data_url', { path: localPath })) as string;
+			const dataUrl = await commands.readFileAsDataUrl(localPath);
 			img.setAttribute('src', dataUrl);
 			embeddedImages += 1;
 		} catch (e) {
@@ -420,7 +481,7 @@ async function embedExportFonts(styles: string, root: HTMLElement): Promise<stri
 }
 
 export async function exportAsHtml(ctx: ExportContext): Promise<ExportHtmlResult | null> {
-	if (!ctx.rawContent) return null;
+	if (!hasExportableDocument(ctx.rawContent)) return null;
 
 	const defaultName = ctx.tabPath ? ctx.tabPath.replace(/\.[^.]+$/, '.html') : 'export.html';
 
@@ -452,10 +513,11 @@ export async function exportAsHtml(ctx: ExportContext): Promise<ExportHtmlResult
 		styles,
 		articleHtml: article.root.innerHTML,
 		contentWidth: ctx.contentWidth,
+		appearance: ctx.appearance,
 	});
 
 	try {
-		await invoke('save_file_content', { path: selected, content: fullHtml, encoding: 'UTF-8' });
+		await commands.saveFileContent(selected, fullHtml, 'UTF-8');
 		return {
 			path: selected,
 			embeddedImages: article.embeddedImages,
@@ -467,18 +529,94 @@ export async function exportAsHtml(ctx: ExportContext): Promise<ExportHtmlResult
 	}
 }
 
-export async function exportAsPdf(ctx: PdfExportContext) {
-	if (ctx.osType !== 'windows') {
-		await invoke('print_pdf');
-		return;
+/**
+ * Prints the same article the HTML export writes to disk.
+ *
+ * The PDF used to be `window.print()` over the live window, so the paper was
+ * whatever was on screen — title bar, tab strip, splitter, find highlights,
+ * fold state, screen theme — and `@media print` was a list of app parts being
+ * subtracted back out, one entry longer with every new part. Fifteen issues
+ * over five months were that list missing an entry (#668). Now the document is
+ * rendered from `rawContent` into `#print-root`, the print sheet reveals that
+ * element and hides the rest of the body, and a new UI part cannot reach paper
+ * at all.
+ *
+ * `printRoot` is handed in rather than created here: it lives in the viewer's
+ * markup, where the component's own `.markdown-body` rules reach it.
+ */
+/**
+ * Resolves to the written file on Windows, where the app writes it. Elsewhere
+ * the print sheet owns the path, so there is none to report.
+ */
+export async function exportAsPdf(ctx: PdfExportContext): Promise<string | null> {
+	// Windows writes the file itself, so it asks for the path first: a reader
+	// who cancels the dialog should not have waited for a render.
+	let windowsTarget = '';
+	if (ctx.osType === 'windows') {
+		const defaultName = ctx.tabPath ? ctx.tabPath.replace(/\.[^.]+$/, '.pdf') : 'export.pdf';
+		const selected = await save({
+			filters: [{ name: 'PDF', extensions: ['pdf'] }],
+			defaultPath: defaultName,
+		});
+		if (!selected) return null;
+		windowsTarget = selected;
+	}
+	ctx.onStart?.();
+
+	// Whatever the last export left behind, this one starts empty.
+	ctx.printRoot.replaceChildren();
+
+	// Paper is white whatever the screen is wearing, so the diagrams are drawn
+	// for paper. The rest of the appearance comes from the light palette
+	// `#print-root` carries in styles.css.
+	const article = await buildExportArticle(
+		{ ...ctx, mermaidTheme: MERMAID_PRINT_THEME },
+		{ embedImages: false },
+	);
+	ctx.printRoot.replaceChildren(...Array.from(article.root.childNodes));
+	ctx.printRoot.style.setProperty('--preview-max-width', exportContentMaxWidth(ctx.contentWidth));
+	for (const [property, value] of appearanceDeclarations(ctx.appearance)) {
+		ctx.printRoot.style.setProperty(property, value);
 	}
 
-	const defaultName = ctx.tabPath ? ctx.tabPath.replace(/\.[^.]+$/, '.pdf') : 'export.pdf';
-	const selected = await save({
-		filters: [{ name: 'PDF', extensions: ['pdf'] }],
-		defaultPath: defaultName,
-	});
-	if (!selected) return;
+	// Taken down when the printing is over, not when the command returns:
+	// `print_pdf` opens the platform's print sheet and comes back while it is
+	// still up, so clearing the article in a `finally` would race the sheet for
+	// the page it is about to render — and losing that race prints nothing at
+	// all. `afterprint` is the event that actually says the job is done; a
+	// platform that never sends it leaves the article mounted, hidden, until
+	// the next export replaces it.
+	window.addEventListener('afterprint', () => ctx.printRoot.replaceChildren(), { once: true });
 
-	await invoke('export_pdf_windows', { path: selected });
+	// Print before the images have decoded and they arrive on paper as empty
+	// boxes — the failure that made a screen-printed PDF look plausible and
+	// ship half a document.
+	await waitForImages(ctx.printRoot);
+	if (ctx.osType !== 'windows') {
+		await commands.printPdf();
+		return null;
+	}
+	await commands.exportPdfWindows(windowsTarget);
+	return windowsTarget;
+}
+
+/** Resolves when every image in `root` has loaded, failed, or run out of time. */
+async function waitForImages(root: HTMLElement): Promise<void> {
+	const pending = Array.from(root.querySelectorAll('img')).filter((img) => !img.complete);
+	if (pending.length === 0) return;
+	await Promise.race([
+		Promise.all(
+			pending.map(
+				(img) =>
+					new Promise<void>((resolve) => {
+						img.addEventListener('load', () => resolve(), { once: true });
+						img.addEventListener('error', () => resolve(), { once: true });
+					}),
+			),
+		),
+		// An unreachable image must not hold the export open indefinitely: a
+		// document printed without one picture beats a menu item that does
+		// nothing.
+		new Promise<void>((resolve) => setTimeout(resolve, IMAGE_LOAD_TIMEOUT_MS)),
+	]);
 }

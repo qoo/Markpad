@@ -1,6 +1,6 @@
 [package]
 name = "Markpad"
-version = "2.7.6"
+version = "2.9.1"
 description = "Simple Markdown viewer and text editor"
 authors = ["Alec Ames <dev@alecames.com>"]
 license = "BSD-3-Clause"
@@ -49,17 +49,34 @@ zip = { version = "2.1", default-features = false, features = ["deflate", "time"
 opener = { version = "0.7", features = ["reveal"] }
 font-kit = "0.14"
 base64 = "0.22"
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 chardetng = "1"
 encoding_rs = "0.8"
+# Typed Rust<->TS bindings (src/lib/bindings.ts, written by the
+# `export_bindings` test). Release candidates, so every specta crate is pinned
+# exactly: tauri-specta rc.26 requires specta =rc.26, which in turn holds
+# specta-serde and specta-util at 0.0.13 through their own exact pins.
+specta = { version = "=2.0.0-rc.26", features = ["derive"] }
+tauri-specta = { version = "=2.0.0-rc.26", features = ["derive"] }
+
+[dev-dependencies]
+# The TypeScript exporter, for the `export_bindings` test only: a release build
+# carries the commands and events, never the code that writes bindings.ts.
+specta-typescript = "=0.0.13"
+tauri-specta = { version = "=2.0.0-rc.26", features = ["derive", "typescript"] }
+
+[target.'cfg(not(windows))'.dev-dependencies]
+# Mock runtime (`tauri::test`) for tests that need an AppHandle or a window.
+# Not on Windows: see `setup_tests` in app.rs.
+tauri = { version = "2", features = ["test"] }
 
 
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-webview2-com = "0.38.2"
-windows = "0.61.3"
+webview2-com = "0.39.1"
+windows = "0.62.2"
 
 [profile.release]
 panic = "abort" # Strip expensive panic clean-up logic

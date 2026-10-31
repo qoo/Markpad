@@ -8,7 +8,7 @@ description: "Every syntax Markpad renders, what it looks like, and what happens
 **Open this file in Markpad, and read it twice.**
 
 - In **preview**, it shows you what Markpad can do — every feature below is the real thing rather than a description of one.
-- In **the editor** (`Ctrl`/`Cmd` + `E`, or split view), the same page shows you how each one is written.
+- In **the editor** (`Ctrl`/`Cmd` + `E`, or the Preview, Split View and Editor buttons in the title bar), the same page shows you how each one is written.
 
 That is the whole design of this file: the answer to "can it do X?" and the answer to "how do I write X?" are the same paragraph, seen from two sides.
 
@@ -89,6 +89,8 @@ HTML entities work: &copy; &mdash; &hellip; &#8594; &amp;
 ## 2. Headings
 
 Every heading gets an anchor. Hover one in the preview and a link icon appears; right-click it for **Copy Reference**, which writes a link in whichever style this document already uses.
+
+A heading too long for one line wraps into two lines of about the same length, rather than leaving a word or two alone on the second.
 
 ### A third-level heading
 
@@ -266,6 +268,15 @@ An empty cell is written with two pipes — `| 1 || 3 |` — which is why the sp
 |---|---|---|
 | 1 || 3 |
 
+A table wider than the text grows into the side margins instead of scrolling inside the column, and the paragraphs around it keep their width. Digits in a cell all take the same width, so a column of numbers lines up even in a font whose numerals are proportional:
+
+| Year | Jan | Feb | Mar | Apr | May | Jun | Jul | Aug | Sep | Oct | Nov | Dec | Total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2025 | 1,204 | 1,118 | 1,367 | 1,450 | 1,521 | 1,489 | 1,602 | 1,711 | 1,688 | 1,745 | 1,803 | 1,911 | 18,609 |
+| 2026 | 2,016 | 1,974 | 2,208 | 2,311 | 2,390 | 2,447 | 2,519 | 2,606 | 2,688 | — | — | — | 21,159 |
+
+A table inside a list, a quote or a callout stays in the column, and export and PDF keep every table at the column width.
+
 **None of that has to be typed by hand.** With the caret in a table:
 
 | Key | Does |
@@ -337,7 +348,7 @@ A reference-style image, where the destination lives elsewhere in the document:
 
 [dnd]: ../pics/drag-and-drop.png "Dropping a file onto the editor"
 
-Obsidian's embed syntax works for local files too — `![[lightmode.png]]` — resolved the same way. Dragging an image into the editor writes the reference for you; dragging a `.md` file onto either pane opens it in a tab.
+Obsidian's embed syntax works for local files too — `![[lightmode.png]]` — resolved the same way. Dragging an image into the editor writes the reference for you; dragging a `.md` file onto either pane opens it in a tab. An image *file* copied in Finder or Explorer pastes as an image too — it is saved beside the document and referenced, rather than arriving as a path.
 
 **Where a pasted or dropped image lands** is a setting: a folder name, created next to the document. `${filename}` in it stands for the document's own name without its extension, so `${filename}.assets` beside `notes/trip.md` writes into `notes/trip.assets`, and a folder of notes stops sharing one flat `img/`. The token is spelled the way Typora and SoloMD spell it. It expands to a folder *name* rather than a path — separators, `..` and absolute paths are refused — so the images stay beside the document they belong to.
 
@@ -425,7 +436,19 @@ $$
 \end{aligned}
 $$
 
-Rendered by KaTeX. An escaped `\$5` stays a dollar sign rather than opening a formula.
+Chemistry, through KaTeX's mhchem extension:
+
+$$
+\ce{CO2 + C -> 2 CO}
+$$
+
+$$
+\ce{SO4^2- + Ba^2+ -> BaSO4 v}
+$$
+
+Inline as well: $\ce{H2O}$, and a unit written as $\pu{123 kJ//mol}$.
+
+Rendered by KaTeX, with mhchem loaded on the same instance, so `\ce` and `\pu` work wherever a formula does. An escaped `\$5` stays a dollar sign rather than opening a formula.
 
 ## 12. Diagrams
 
@@ -482,6 +505,8 @@ Pandoc and CriticMarkup mark added text with `++`: this sentence has ++an insert
 
 한국어 문장도 마찬가지입니다. **굵게**와 `코드`.
 
+Where Chinese or Japanese meets Latin letters or digits, the preview adds a small gap — 用Rust写的编辑器，第2版 — without a space being written into the file. Text that already has a space is not spaced twice, and code keeps its exact width: `用Rust写`.
+
 In the editor those three paragraphs are treated as prose rather than as code: `Alt`/`Option` + `←`/`→` and double-click stop at word boundaries *inside* a Chinese or Japanese clause instead of swallowing the whole sentence, and neither the fullwidth punctuation nor the ideographic space an IME produces is outlined as a suspicious character.
 
 Symbols and emoji: → ← ↔ ⇒ ∑ ∏ √ ∞ ≈ ≠ ≤ ≥ ± × ÷ °  🚀 📘 ✅ ⚠️
@@ -506,10 +531,10 @@ Some of what Markpad adds is not a spelling to learn but behaviour you get for f
 - **Click a task box** in the preview and the file is edited. The `[ ]` becomes `[x]` on disk, on the right line, even in a nested list.
 - **Hover a heading** and an anchor appears. Right-click it for **Copy Reference**, which writes a link in whichever style this document already uses — `[[…]]` if the document uses wikilinks, `[…](#…)` if it uses standard links.
 - **Right-click any paragraph, list item or heading** and choose **Edit**: the editor opens on exactly those lines, with them selected. `Ctrl`/`Cmd` + `E` does the same for whatever you have selected in the preview.
-- **Fold a heading** with the chevron beside it, and everything under it collapses. The folds are remembered per document.
+- **Fold a heading** with the chevron beside it, and everything under it collapses. The folds are remembered per document. The editor folds the same headings from its own gutter, alongside the list folding it already had.
 - **Scroll either pane of the split view** and the other follows by source line rather than by ratio, so the two stay together even this far down the document. The two panes can trade sides, in Settings.
 - **Copy from the preview** and the formatting comes with it: headings, emphasis, lists, tables and links arrive as themselves in Word, Mail or Docs, and as the Markdown behind them anywhere that takes plain text.
-- **Sticky scroll** keeps the heading you are currently inside pinned to the top of the editor. Toggle it in Settings.
+- **Sticky headings** keep the heading you are currently inside pinned to the top of the editor. Toggle them in Settings.
 - **Open the table of contents** and it follows wherever you scroll, in the preview or in the editor, keeping the current heading centred. Unpinned, it gets out of the way rather than sitting on the text: it collapses when you pick an entry, and when you reach past it to touch what it was covering.
 - **Type `](#` or `[[#`** in the editor and every heading in the document is offered as a completion.
 - **The front matter** at the top of this file — the `title` and `description` between `---` lines — is shown as a panel rather than as text, and is editable there.

@@ -4,8 +4,9 @@ import { settings } from './settings.svelte.js';
 import { hasRealFilePath } from '../utils/tabFileActions.js';
 import { HOME_TAB_PATH, isHomePath } from '../utils/homeTab.js';
 import { buildTransferredTab, type TransferableTab } from '../utils/tabTransfer.js';
-import { canonicalizePath, isSameFilePath } from '../utils/pathIdentity.js';
+import { basename, canonicalizePath, isSameFilePath } from '../utils/pathIdentity.js';
 import { asRendererLine, type RendererLine } from '../utils/lineCoordinates.js';
+import { outgoingTabAnchorLine } from '../utils/editorPosition.js';
 import { retainTabModels } from '../utils/tabModels.js';
 import {
 	canGoBackInHistory,
@@ -23,16 +24,15 @@ export interface Tab {
 	/**
 	 * What the tab strip, the window title and the per-tab close dialog call
 	 * this tab. Derived from `path` at every site that points a tab at a
-	 * document — `addTab`, `restoreState`, `updateTabPath`, `renameTab`,
+	 * document — `addTab`, `restoreState`, `updateTabPath`,
 	 * `navigate`, `goBack`, `goForward` — as the last segment of the path, and
 	 * chosen by `nextUntitledTitle` when there is no path to take a segment
 	 * from.
 	 *
-	 * Five of those sites spell the derivation `path.split(/[/\\]/).pop() ||
-	 * 'Untitled'`, and that English literal is dead code, not an i18n hole. It
-	 * is there because `Array.prototype.pop` is typed `string | undefined`; the
-	 * arm needs a path that is empty or ends in a separator, and every route
-	 * into those five is guarded against both upstream:
+	 * All but `addTab` and `restoreState` spell the derivation `basename(path)
+	 * || 'Untitled'`, and that English literal is dead code, not an i18n hole:
+	 * the arm needs a path that is empty or ends in a separator, and every
+	 * route into those sites is guarded against both upstream:
 	 *
 	 * - `navigate` is only ever handed a link target, and `getMarkdownLinkTarget`
 	 *   refuses an href whose path does not end in one of
@@ -41,12 +41,12 @@ export interface Tab {
 	 * - `goBack`/`goForward` return on `!result.path` before the title is
 	 *   touched, so an empty entry cannot reach it — and every non-empty entry
 	 *   in `history` was put there by one of the other sites.
-	 * - `renameTab` replaces the last segment of a non-empty `tab.path` with a
-	 *   non-empty typed name, and only runs once `fs::rename` has SUCCEEDED on
-	 *   the result, which a destination ending in a separator cannot do.
 	 * - `updateTabPath` is reached from the Save/Save As dialog, which returns
-	 *   a file the user named, and from `loadMarkdown` — and there only when
-	 *   the active tab is an empty untitled one. The app's one unvalidated path
+	 *   a file the user named; from Rename (`renameFile`), which replaces the
+	 *   last segment of a non-empty `tab.path` with a non-empty typed name and
+	 *   runs only once `rename_file` has SUCCEEDED on the result, which a
+	 *   destination ending in a separator cannot do; and from `loadMarkdown` —
+	 *   and there only when the active tab is an empty untitled one. The app's one unvalidated path
 	 *   source, `send_markdown_path`, hands back raw argv filtered only on a
 	 *   leading `-`, so `markpad ~/notes/` really does reach `loadMarkdown`
 	 *   with a trailing separator; it cannot reach THIS branch, because
@@ -99,17 +99,13 @@ export interface Tab {
 	scrollTop: number;
 	/**
 	 * Derived, never assigned: exactly `rawContent !== originalContent`, read
-	 * off the two buffers every time. Each construction site below spells it as
-	 * a getter, which is why this is `readonly` — `tab.isDirty = false` is now
+	 * off the two buffers every time. `makeTab` and `buildTransferredTab` spell
+	 * it as a getter, which is why this is `readonly` — `tab.isDirty = false` is now
 	 * a compile error rather than a fourth opinion about what "changed" means.
 	 *
-	 * It used to be a plain field that nine sites maintained by hand, in three
-	 * different ways, and every one of them was really saying one of two
-	 * things: "this text is the saved text now" (`originalContent = rawContent`,
-	 * which the navigation routes below still say) or nothing at all, because
-	 * the buffers already agreed. A flag that can be set independently of the
-	 * buffers it summarises can be wrong about them, and the tab close dialog,
-	 * the auto-save trigger and the reload guard all believe it.
+	 * A flag that can be set independently of the buffers it summarises can be
+	 * wrong about them, and the tab close dialog, the auto-save trigger and the
+	 * reload guard all believe it.
 	 */
 	readonly isDirty: boolean;
 	isEditing: boolean;
@@ -168,6 +164,37 @@ export interface Tab {
 	 */
 	scrollPercentage: number;
 	anchorLine: RendererLine;
+	/**
+	 * Where the reader was standing before each in-page jump, and where they
+	 * came back from — the two stacks the mouse's back and forward buttons
+	 * walk. Raw preview pixels, in the same space as `scrollTop`: pushed by
+	 * every anchor jump (a heading in the outline, a link into the same
+	 * document), popped by `popScrollHistoryBack` / `popScrollHistoryForward`.
+	 *
+	 * Nothing to do with `history` / `historyIndex` above, which are the FILE
+	 * this tab points at. These two never leave the current document.
+	 *
+	 * Per tab for the reason the position fields above are per tab: an offset
+	 * only means anything in the document it was measured in. One window-wide
+	 * pair meant a back click in a short document scrolled it to an offset
+	 * recorded in a long one, because a tab switch reloads nothing and so reset
+	 * nothing.
+	 *
+	 * Cleared with the rest of the reading position when the tab is repointed
+	 * at another file — see `clearReadingPosition`. A reload of the SAME
+	 * document in place is a separate trigger and clears them separately; see
+	 * `resetScrollHistory` in documentSession.
+	 *
+	 * Neither persisted nor carried between windows: pixels measured in one
+	 * container are wrong in a container of another height, which is already
+	 * why `scrollTop` is the last resort of the restore cascade. A stack of
+	 * them is not worth a schema entry. See `serializeState` and tabTransfer.ts.
+	 *
+	 * Required, like `foldOverrides`: every consumer pushes and pops, so a
+	 * construction site that forgot one would hand them `undefined`.
+	 */
+	scrollHistory: number[];
+	scrollFuture: number[];
 	isSplit: boolean;
 	splitRatio: number;
 	isScrollSynced: boolean;
@@ -217,6 +244,14 @@ export interface Tab {
 	 */
 	isTruncated?: boolean;
 	/**
+	 * A restored tab whose file has not been read yet. Restore reads only the
+	 * active tab; the rest wait here, empty and `isTruncated` so no writer can
+	 * mistake the empty buffer for the document, until they are activated.
+	 * Cleared by the first read that lands (`setTabRawContent`) or taken by
+	 * `takeUnread` when that read departs, so it is never owed twice.
+	 */
+	unread?: boolean;
+	/**
 	 * The `rawContent` the preview in `content` was rendered from — the answer
 	 * to "is what is on screen still this document?".
 	 *
@@ -231,9 +266,7 @@ export interface Tab {
 	 * HTML and is allowed to lag; this says whether it lags.
 	 *
 	 * Optional, and absent is the safe direction: "nothing has been rendered
-	 * from this buffer", which costs one render. It lived on the tab as an
-	 * undeclared `_lastRenderedRawContent` reached through `as any` from two
-	 * files, which is the same field with nothing to check the spelling of it.
+	 * from this buffer", which costs one render.
 	 */
 	previewedRawContent?: string;
 	/**
@@ -288,6 +321,49 @@ export interface Tab {
 	pathKey?: string;
 }
 
+/** How many in-page jumps back a tab remembers. See `Tab.scrollHistory`. */
+const SCROLL_HISTORY_LIMIT = 50;
+
+type TabFields = Pick<Tab, 'id' | 'path' | 'title' | 'history' | 'historyIndex' | 'hasReplacementChars' | 'encoding'> &
+	Partial<
+		Pick<
+			Tab,
+			'rawContent' | 'isEditing' | 'scrollTop' | 'scrollPercentage' | 'anchorLine' | 'isSplit' | 'splitRatio' | 'isScrollSynced' | 'pathKey'
+		>
+	>;
+
+/**
+ * A new tab: the buffers hold `rawContent` (default `''`) and are clean, the
+ * rendered `content` is empty, and every reading-position and layout field is
+ * at rest. `hasReplacementChars` and `encoding` have no default on purpose —
+ * see those fields — so every caller states them.
+ */
+function makeTab(fields: TabFields): Tab {
+	const rawContent = fields.rawContent ?? '';
+	return {
+		content: '',
+		rawContent,
+		originalContent: rawContent,
+		scrollTop: 0,
+		get isDirty() {
+			return this.rawContent !== this.originalContent;
+		},
+		isEditing: false,
+		editorViewState: null,
+		scrollPercentage: 0,
+		anchorLine: asRendererLine(0),
+		scrollHistory: [],
+		scrollFuture: [],
+		isSplit: false,
+		splitRatio: 0.5,
+		isScrollSynced: false,
+		foldOverrides: new Set<string>(),
+		isTruncated: false,
+		unread: false,
+		...fields,
+	};
+}
+
 class TabManager {
 	tabs = $state<Tab[]>([]);
 	activeTabId = $state<string | null>(null);
@@ -319,6 +395,10 @@ class TabManager {
 		return this.tabs.find((t) => t.id === this.activeTabId);
 	}
 
+	private tab(id: string) {
+		return this.tabs.find((t) => t.id === id);
+	}
+
 	setWindowTag(tag: { name: string; color: string; pinned?: boolean } | null) {
 		this.windowTag = tag ? { ...tag, pinned: tag.pinned === true } : null;
 	}
@@ -346,10 +426,18 @@ class TabManager {
 	 * that the user never folded in the text now on screen — the failure this
 	 * per-tab state exists to remove. Scroll degrades (you scroll); a fold
 	 * hides text.
+	 *
+	 * Nor are `scrollHistory`/`scrollFuture`. Those are pixels too, but unlike
+	 * `scrollTop` they are not a position to approximate — they are a record of
+	 * jumps the reader made in a session that has ended, in a window that may
+	 * come back a different size. Restoring them would arm the back button with
+	 * offsets nobody in this session created.
 	 */
-	serializeState(): string {
+	serializeState(extra: Record<string, unknown> = {}): string {
 		const stateData = {
 			version: 2,
+			// What the window keeps besides its tabs, such as its folder.
+			...extra,
 			windowTag: this.windowTag,
 			activeTabId: this.activeTabId,
 			tabs: this.tabs
@@ -364,7 +452,13 @@ class TabManager {
 					isScrollSynced: t.isScrollSynced,
 					scrollTop: t.scrollTop,
 					scrollPercentage: t.scrollPercentage,
-					anchorLine: t.anchorLine
+					// Not `t.anchorLine`: a tab left in edit-only mode in the
+					// background has had no writer since it stopped being active,
+					// and its Monaco view state — which knows where it was, and
+					// which is not in the object above — is about to be dropped.
+					// `outgoingTabAnchorLine` recovers the line from it for that
+					// population and hands back `t.anchorLine` for every other.
+					anchorLine: outgoingTabAnchorLine(t, this.activeTabId)
 				}))
 		};
 		return JSON.stringify(stateData);
@@ -401,37 +495,29 @@ class TabManager {
 			const restored: Tab[] = [];
 			for (const saved of data.tabs) {
 				if (!saved || typeof saved.path !== 'string' || !hasRealFilePath(saved.path)) continue;
-				const filename = saved.path.split('\\').pop()?.split('/').pop() || saved.path;
-				const fileHistory = createFileHistory(saved.path);
-				restored.push({
-					id: typeof saved.id === 'string' ? saved.id : crypto.randomUUID(),
-					path: saved.path,
-					title: typeof saved.title === 'string' && saved.title !== '' ? saved.title : filename,
-					content: '',
-					rawContent: '',
-					originalContent: '',
-					scrollTop: typeof saved.scrollTop === 'number' ? saved.scrollTop : 0,
-					get isDirty() {
-						return this.rawContent !== this.originalContent;
-					},
-					isEditing: saved.isEditing === true,
-					history: fileHistory.history,
-					historyIndex: fileHistory.historyIndex,
-					editorViewState: null,
-					scrollPercentage: typeof saved.scrollPercentage === 'number' ? saved.scrollPercentage : 0,
-					// The brand is phantom, so nothing of it survives JSON — which is
-					// exactly why the read side has to re-declare what came back.
-					// `serializeState` wrote a renderer line; this says so again.
-					anchorLine: asRendererLine(typeof saved.anchorLine === 'number' ? saved.anchorLine : 0),
-					isSplit: saved.isSplit === true,
-					splitRatio: typeof saved.splitRatio === 'number' ? saved.splitRatio : 0.5,
-					isScrollSynced: saved.isScrollSynced === true,
-					// Not persisted — see serializeState.
-					foldOverrides: new Set<string>(),
-					isTruncated: false,
-					hasReplacementChars: false,
-					encoding: 'UTF-8'
-				});
+				const filename = basename(saved.path) || saved.path;
+				restored.push(
+					makeTab({
+						id: typeof saved.id === 'string' ? saved.id : crypto.randomUUID(),
+						path: saved.path,
+						title: typeof saved.title === 'string' && saved.title !== '' ? saved.title : filename,
+						...createFileHistory(saved.path),
+						scrollTop: typeof saved.scrollTop === 'number' ? saved.scrollTop : 0,
+						isEditing: saved.isEditing === true,
+						scrollPercentage: typeof saved.scrollPercentage === 'number' ? saved.scrollPercentage : 0,
+						// The brand is phantom, so nothing of it survives JSON — which is
+						// exactly why the read side has to re-declare what came back.
+						// `serializeState` wrote a renderer line; this says so again.
+						anchorLine: asRendererLine(typeof saved.anchorLine === 'number' ? saved.anchorLine : 0),
+						// `scrollHistory`, `scrollFuture` and `foldOverrides` start empty:
+						// not persisted — see serializeState.
+						isSplit: saved.isSplit === true,
+						splitRatio: typeof saved.splitRatio === 'number' ? saved.splitRatio : 0.5,
+						isScrollSynced: saved.isScrollSynced === true,
+						hasReplacementChars: false,
+						encoding: 'UTF-8',
+					}),
+				);
 			}
 
 			this.tabs = restored;
@@ -445,8 +531,9 @@ class TabManager {
 			// each file directly rather than through `loadMarkdown`, so nothing
 			// else would ever resolve these. Without this a restored window sits
 			// outside the one-tab-per-file rule until every tab happens to be
-			// reopened. Resolving in the background is safe because it only ever
-			// ADDS an identity — no tab is closed or reassigned here.
+			// reopened. Each resolution claims its path again by identity (see
+			// `setTabPathKey`), so two restored tabs on one file settle the way
+			// `claimPath` settles any other pair.
 			for (const tab of restored) {
 				void canonicalizePath(tab.path).then((key) => this.setTabPathKey(tab.id, tab.path, key));
 			}
@@ -540,79 +627,50 @@ class TabManager {
 
 		const id = crypto.randomUUID();
 		const filename =
-			path.split('\\').pop()?.split('/').pop() ||
+			basename(path) ||
 			nextUntitledTitle(
 				this.tabs.map((tab) => tab.title),
 				t('tabs.untitled', settings.language),
 			);
-		const fileHistory = createFileHistory(path);
 
-		this.tabs.push({
-			id,
-			path,
-			title: filename,
-			content: '',
-			rawContent,
-			originalContent: rawContent,
-			scrollTop: 0,
-			get isDirty() {
-				return this.rawContent !== this.originalContent;
-			},
-			isEditing: false,
-			history: fileHistory.history,
-			historyIndex: fileHistory.historyIndex,
-			editorViewState: null,
-			scrollPercentage: 0,
-			anchorLine: asRendererLine(0),
-			isSplit: false,
-			splitRatio: 0.5,
-			isScrollSynced: false,
-			foldOverrides: new Set<string>(),
-			isTruncated: false,
-			hasReplacementChars: false,
-			encoding: 'UTF-8',
-			pathKey
-		});
+		this.tabs.push(
+			makeTab({
+				id,
+				path,
+				title: filename,
+				rawContent,
+				...createFileHistory(path),
+				hasReplacementChars: false,
+				encoding: 'UTF-8',
+				pathKey,
+			}),
+		);
 
 		this.activeTabId = id;
 	}
 
 	addNewTab() {
 		const id = crypto.randomUUID();
-		const content = '';
 
-		this.tabs.push({
-			id,
-			path: '',
-			title: nextUntitledTitle(
-				this.tabs.map((tab) => tab.title),
-				t('tabs.untitled', settings.language),
-			),
-			content,
-			rawContent: content,
-			originalContent: content,
-			scrollTop: 0,
-			get isDirty() {
-				return this.rawContent !== this.originalContent;
-			},
-			isEditing: settings.newFileDefaultMode,
-			// Empty, as `addHomeTab` below already had it. This used to be
-			// `[content]` — a PATH list seeded with the new buffer's text, which
-			// is `''` and so looked harmless, and was not: see
-			// `navigateFileHistory`.
-			history: [],
-			historyIndex: 0,
-			editorViewState: null,
-			scrollPercentage: 0,
-			anchorLine: asRendererLine(0),
-			isSplit: false,
-			splitRatio: 0.5,
-			isScrollSynced: false,
-			foldOverrides: new Set<string>(),
-			isTruncated: false,
-			hasReplacementChars: false,
-			encoding: 'UTF-8'
-		});
+		this.tabs.push(
+			makeTab({
+				id,
+				path: '',
+				title: nextUntitledTitle(
+					this.tabs.map((tab) => tab.title),
+					t('tabs.untitled', settings.language),
+				),
+				isEditing: settings.newFileDefaultMode,
+				// Empty, as `addHomeTab` below already had it. This used to be
+				// `[content]` — a PATH list seeded with the new buffer's text, which
+				// is `''` and so looked harmless, and was not: see
+				// `navigateFileHistory`.
+				history: [],
+				historyIndex: 0,
+				hasReplacementChars: false,
+				encoding: 'UTF-8',
+			}),
+		);
 
 		this.activeTabId = id;
 	}
@@ -625,31 +683,17 @@ class TabManager {
 		}
 
 		const id = crypto.randomUUID();
-		this.tabs.push({
-			id,
-			path: HOME_TAB_PATH,
-			title: t('tabs.home', settings.language),
-			content: '',
-			rawContent: '',
-			originalContent: '',
-			scrollTop: 0,
-			get isDirty() {
-				return this.rawContent !== this.originalContent;
-			},
-			isEditing: false,
-			history: [],
-			historyIndex: 0,
-			editorViewState: null,
-			scrollPercentage: 0,
-			anchorLine: asRendererLine(0),
-			isSplit: false,
-			splitRatio: 0.5,
-			isScrollSynced: false,
-			foldOverrides: new Set<string>(),
-			isTruncated: false,
-			hasReplacementChars: false,
-			encoding: 'UTF-8'
-		});
+		this.tabs.push(
+			makeTab({
+				id,
+				path: HOME_TAB_PATH,
+				title: t('tabs.home', settings.language),
+				history: [],
+				historyIndex: 0,
+				hasReplacementChars: false,
+				encoding: 'UTF-8',
+			}),
+		);
 
 		this.activeTabId = id;
 	}
@@ -677,8 +721,9 @@ class TabManager {
 		// A transferred tab is never read from disk here — its buffer came with
 		// it — so nothing else would ever resolve its path, and it would sit out
 		// the one-tab-per-file rule for as long as it stayed open. Resolving it
-		// in the background cannot undo the claim above, but it does let every
-		// LATER open of the same file recognise this tab.
+		// in the background claims the path again by identity (see
+		// `setTabPathKey`), which catches a resident tab that spells the same
+		// file differently.
 		void canonicalizePath(tab.path).then((key) => this.setTabPathKey(tab.id, tab.path, key));
 		return tab.id;
 	}
@@ -737,17 +782,13 @@ class TabManager {
 	}
 
 	updateTabContent(id: string, content: string) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.content = content;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.content = content;
 	}
 
 	updateTabRawContent(id: string, raw: string) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.rawContent = raw;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.rawContent = raw;
 	}
 
 	/**
@@ -762,12 +803,29 @@ class TabManager {
 	 * the preview read must pass it explicitly.
 	 */
 	setTabRawContent(id: string, raw: string, isTruncated = false) {
-		const tab = this.tabs.find((t) => t.id === id);
+		const tab = this.tab(id);
 		if (tab) {
 			tab.rawContent = raw;
 			tab.originalContent = raw;
 			tab.isTruncated = isTruncated;
+			tab.unread = false;
 		}
+	}
+
+	/** Restore left this tab unread: see `Tab.unread`. A dirty buffer is never touched. */
+	markTabUnread(id: string) {
+		const tab = this.tab(id);
+		if (!tab || tab.isDirty) return;
+		this.markTabContentUnavailable(id);
+		tab.unread = true;
+	}
+
+	/** True once per unread tab: the caller is the one read it is owed. */
+	takeUnread(id: string): boolean {
+		const tab = this.tab(id);
+		if (!tab?.unread) return false;
+		tab.unread = false;
+		return true;
 	}
 
 	/**
@@ -787,7 +845,7 @@ class TabManager {
 	 * failed read of the file it came from.
 	 */
 	markTabContentUnavailable(id: string) {
-		const tab = this.tabs.find((t) => t.id === id);
+		const tab = this.tab(id);
 		if (!tab || tab.isDirty) return;
 		tab.rawContent = '';
 		tab.originalContent = '';
@@ -800,10 +858,8 @@ class TabManager {
 	 * flag, and Save As clears it once the buffer has a UTF-8 file of its own.
 	 */
 	setTabDecodedLossy(id: string, lossy: boolean) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.hasReplacementChars = lossy;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.hasReplacementChars = lossy;
 	}
 
 	/**
@@ -819,10 +875,8 @@ class TabManager {
 	 * together would buy a line and cost the name.
 	 */
 	setTabEncoding(id: string, encoding: string) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.encoding = encoding;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.encoding = encoding;
 	}
 
 	/**
@@ -836,31 +890,92 @@ class TabManager {
 	 * Guarded on the path still matching: the tab may have been navigated
 	 * elsewhere while the resolution was in flight, and a key describing a file
 	 * the tab no longer holds is worse than no key at all.
+	 *
+	 * The claim is made again here, now with the key. Those routes claim the
+	 * path literally, so `C:/n/b.md` arriving beside a tab on `C:\n\b.md` (or
+	 * `readme.md` beside `Readme.md` on macOS, or a symlink beside its target)
+	 * passes as a different file, and two tabs would keep two auto-save timers
+	 * on one file. Every one of them learns its identity through this method, so
+	 * this is the one place that can settle it for all of them.
 	 */
 	setTabPathKey(id: string, path: string, pathKey: string) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab && tab.path === path) tab.pathKey = pathKey;
+		const tab = this.tab(id);
+		if (!tab || tab.path !== path) return;
+		tab.pathKey = pathKey;
+		this.claimPath(path, id, pathKey);
 	}
 
 	updateTabScroll(id: string, scrollTop: number) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.scrollTop = scrollTop;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.scrollTop = scrollTop;
 	}
 
 	updateTabEditorState(id: string, viewState: any) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.editorViewState = viewState;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.editorViewState = viewState;
 	}
 
 	updateTabScrollPercentage(id: string, percentage: number) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.scrollPercentage = percentage;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.scrollPercentage = percentage;
+	}
+
+	/**
+	 * The in-page back/forward stacks — see `Tab.scrollHistory`. Three methods
+	 * rather than a field the viewer reaches into, because the tab they belong
+	 * to is the thing that used to be got wrong: the viewer holds the offsets
+	 * of the document ON SCREEN, and the only way to be sure of that is to name
+	 * the tab on every push and every pop.
+	 *
+	 * `from` is where the reader is standing right now, which the caller has
+	 * and this file does not. Popping records it on the opposite stack, so back
+	 * and forward walk the same path in both directions.
+	 */
+	pushScrollHistory(id: string, from: number) {
+		const tab = this.tab(id);
+		if (!tab) return;
+		tab.scrollHistory.push(from);
+		tab.scrollFuture = [];
+		// A reader who has jumped fifty times is not going back to the first
+		// one, and the stack is per tab now — a window full of documents would
+		// otherwise keep every offset any of them ever had.
+		if (tab.scrollHistory.length > SCROLL_HISTORY_LIMIT) tab.scrollHistory.shift();
+	}
+
+	/**
+	 * Where to scroll back to, or null if this tab has no in-page jump to undo
+	 * — which is the caller's cue to fall through to the FILE history
+	 * (`goBack`), a different thing entirely.
+	 */
+	popScrollHistoryBack(id: string, from: number): number | null {
+		const tab = this.tab(id);
+		if (!tab || tab.scrollHistory.length === 0) return null;
+		tab.scrollFuture.push(from);
+		return tab.scrollHistory.pop()!;
+	}
+
+	/** The mirror of `popScrollHistoryBack`; falls through to `goForward`. */
+	popScrollHistoryForward(id: string, from: number): number | null {
+		const tab = this.tab(id);
+		if (!tab || tab.scrollFuture.length === 0) return null;
+		tab.scrollHistory.push(from);
+		return tab.scrollFuture.pop()!;
+	}
+
+	/**
+	 * This tab still holds the same document, but its text has been replaced
+	 * from disk — a reload, or the "Reload" answer to an external change. The
+	 * offsets describe a document that is gone, so they go with it.
+	 *
+	 * Separate from `clearReadingPosition`, which answers a different question
+	 * (the tab now holds a DIFFERENT document) and is reached from the three
+	 * navigation routes rather than from a load.
+	 */
+	clearScrollHistory(id: string) {
+		const tab = this.tab(id);
+		if (!tab) return;
+		tab.scrollHistory = [];
+		tab.scrollFuture = [];
 	}
 
 	/**
@@ -868,10 +983,8 @@ class TabManager {
 	 * than mutating the old one — see `Tab.foldOverrides`.
 	 */
 	setTabFoldOverrides(id: string, foldOverrides: Set<string>) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.foldOverrides = foldOverrides;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.foldOverrides = foldOverrides;
 	}
 
 	/**
@@ -892,21 +1005,19 @@ class TabManager {
 	 * type error rather than a document that opens in the wrong place.
 	 */
 	updateTabAnchorLine(id: string, line: RendererLine) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.anchorLine = line;
-		}
+		const tab = this.tab(id);
+		if (tab) tab.anchorLine = line;
 	}
 
 	toggleSplit(id: string) {
-		const tab = this.tabs.find((t) => t.id === id);
+		const tab = this.tab(id);
 		if (tab) {
 			this.setSplitEnabled(id, !tab.isSplit);
 		}
 	}
 
 	setSplitEnabled(id: string, enabled: boolean) {
-		const tab = this.tabs.find((t) => t.id === id);
+		const tab = this.tab(id);
 		if (!tab) return;
 
 		tab.isSplit = enabled;
@@ -918,14 +1029,12 @@ class TabManager {
 	}
 
 	setSplitRatio(id: string, ratio: number) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			tab.splitRatio = Math.max(0.1, Math.min(0.9, ratio));
-		}
+		const tab = this.tab(id);
+		if (tab) tab.splitRatio = Math.max(0.1, Math.min(0.9, ratio));
 	}
 
 	toggleScrollSync(id: string) {
-		const tab = this.tabs.find((t) => t.id === id);
+		const tab = this.tab(id);
 		if (tab) {
 			tab.isScrollSynced = !tab.isScrollSynced;
 			this.splitScrollSyncPreference = tab.isScrollSynced;
@@ -953,45 +1062,29 @@ class TabManager {
 		this.activeTabId = this.tabs[nextIndex].id;
 	}
 
+	/** Save As, rename on disk, or an untitled tab picking up the file it loads. */
 	updateTabPath(id: string, path: string, pathKey?: string) {
-		const tab = this.tabs.find((t) => t.id === id);
+		const tab = this.tab(id);
 		if (tab) {
 			// Save As can name a file that is already open here; the write has
 			// happened by the time this runs, so the other tab's buffer is
 			// already stale and must stop claiming the path.
 			this.claimPath(path, id, pathKey);
 			tab.path = path;
+			// The old key described the old name (rename) or nothing (an untitled
+			// buffer), so keeping it would make this tab answer "same file" for a
+			// file it no longer holds. Unset is the honest state until something
+			// resolves the new path.
 			tab.pathKey = pathKey;
-			tab.title = path.split(/[/\\]/).pop() || 'Untitled';
-			// The buffer is not touched here, so nothing about "changed?" changed
-			// either. This used to clear a dirty flag by hand, which was only ever
-			// right because both callers reach here mid-save and set
-			// `originalContent` to the text they just wrote a line later — and
-			// wrong in the window between, where a keystroke landing during the
-			// write would have been marked saved. The other caller repoints an
-			// untitled, empty, already-clean tab at the file it is about to load.
+			tab.title = basename(path) || 'Untitled';
+			// The buffer is not touched here, so nothing about "changed?" changes
+			// either. Clearing the dirty flag here would mark as saved a keystroke
+			// that lands during a save's write: the saving callers set
+			// `originalContent` to the text they wrote themselves, a rename leaves
+			// the buffer as it was, and `loadMarkdown` repoints an untitled, empty,
+			// already-clean tab at the file it is about to load.
 			const fileHistory = replaceCurrentHistoryEntry({
 				targetPath: path,
-				history: tab.history,
-				historyIndex: tab.historyIndex,
-			});
-			tab.history = fileHistory.history;
-			tab.historyIndex = fileHistory.historyIndex;
-		}
-	}
-
-	renameTab(id: string, newPath: string, pathKey?: string) {
-		const tab = this.tabs.find((t) => t.id === id);
-		if (tab) {
-			this.claimPath(newPath, id, pathKey);
-			tab.path = newPath;
-			// The old key described the old name, so keeping it would make this
-			// tab answer "same file" for a file it no longer holds. Unset is the
-			// honest state until something resolves the new path.
-			tab.pathKey = pathKey;
-			tab.title = newPath.split(/[/\\]/).pop() || 'Untitled';
-			const fileHistory = replaceCurrentHistoryEntry({
-				targetPath: newPath,
 				history: tab.history,
 				historyIndex: tab.historyIndex,
 			});
@@ -1010,16 +1103,15 @@ class TabManager {
 	 * The two helpers stay separate because they are separate concerns with
 	 * separate reasons: a stale reading position moves the viewport, a stale
 	 * fold hides text, and each needs its own explanation. What they share is
-	 * this trigger — both doc comments below used to open by restating it, which
-	 * is what an unnamed shared concept looks like. This is its name.
+	 * this trigger.
 	 *
 	 * Not the buffer's TEXT: `rawContent`, `originalContent` and `content` are
 	 * overwritten by the load that follows, not cleared here. Only the saved
 	 * baseline moves, and only so the tab stops reading dirty — see
 	 * `clearUnsavedEdits` below.
 	 *
-	 * Only a change of DOCUMENT gets here. Save As and rename (`updateTabPath`,
-	 * `renameTab`) change the tab's path while the text on screen stays put: the
+	 * Only a change of DOCUMENT gets here. Save As and rename (`updateTabPath`)
+	 * change the tab's path while the text on screen stays put: the
 	 * reader has not moved, and the folds they put in that text still describe
 	 * it. Tests guard both directions.
 	 */
@@ -1062,6 +1154,13 @@ class TabManager {
 	 * source line, and the line the reader left in one file names an unrelated
 	 * block in the next one.
 	 *
+	 * `scrollHistory`/`scrollFuture` are here for the same reason one step
+	 * removed: they are not where the reader IS but where they were standing
+	 * before each jump, and an offset recorded in the document the tab has just
+	 * left is no more meaningful than the position it left. Left behind, the
+	 * next back click in the incoming document scrolls it somewhere the reader
+	 * has never been.
+	 *
 	 * Nothing here scrolls anything; a restore runs on tab activation and on
 	 * editor mount, which is why the symptom of getting this wrong shows up on
 	 * a later tab switch rather than at the moment of the navigation.
@@ -1074,6 +1173,8 @@ class TabManager {
 		tab.anchorLine = asRendererLine(0);
 		tab.scrollPercentage = 0;
 		tab.scrollTop = 0;
+		tab.scrollHistory = [];
+		tab.scrollFuture = [];
 	}
 
 	/**
@@ -1098,7 +1199,7 @@ class TabManager {
 	}
 
 	navigate(id: string, path: string, pathKey?: string) {
-		const tab = this.tabs.find(t => t.id === id);
+		const tab = this.tab(id);
 		if (tab) {
 			if (tab.path === path) return;
 
@@ -1120,58 +1221,48 @@ class TabManager {
 
 			tab.path = path;
 			tab.pathKey = pathKey;
-			tab.title = path.split(/[/\\]/).pop() || 'Untitled';
+			tab.title = basename(path) || 'Untitled';
 			this.forgetPreviousDocument(tab);
 		}
 	}
 
 	canGoBack(id: string): boolean {
-		const tab = this.tabs.find(t => t.id === id);
+		const tab = this.tab(id);
 		return tab ? canGoBackInHistory(tab) : false;
 	}
 
 	canGoForward(id: string): boolean {
-		const tab = this.tabs.find(t => t.id === id);
+		const tab = this.tab(id);
 		return tab ? canGoForwardInHistory(tab) : false;
 	}
 
 	goBack(id: string): string | null {
-		const tab = this.tabs.find(t => t.id === id);
-		if (tab) {
-			const result = goBackInHistory(tab);
-			if (!result.path) return null;
-			const path = result.path;
-			// Back/forward walk this tab's own history, which can lead to a file
-			// that has since been opened in another tab. History holds the paths
-			// as they were typed, not their identities, so this claim compares
-			// literally; the caller loads the file straight afterwards and
-			// `loadMarkdown` resolves the key then.
-			this.claimPath(path, id);
-			tab.historyIndex = result.historyIndex;
-			tab.path = path;
-			tab.pathKey = undefined;
-			tab.title = path.split(/[/\\]/).pop() || 'Untitled';
-			this.forgetPreviousDocument(tab);
-			return path;
-		}
-		return null;
+		return this.step(id, goBackInHistory);
 	}
 
 	goForward(id: string): string | null {
-		const tab = this.tabs.find(t => t.id === id);
-		if (tab) {
-			const result = goForwardInHistory(tab);
-			if (!result.path) return null;
-			const path = result.path;
-			this.claimPath(path, id);
-			tab.historyIndex = result.historyIndex;
-			tab.path = path;
-			tab.pathKey = undefined;
-			tab.title = path.split(/[/\\]/).pop() || 'Untitled';
-			this.forgetPreviousDocument(tab);
-			return path;
-		}
-		return null;
+		return this.step(id, goForwardInHistory);
+	}
+
+	private step(id: string, move: typeof goBackInHistory): string | null {
+		const tab = this.tab(id);
+		if (!tab) return null;
+		const result = move(tab);
+		if (!result.path) return null;
+		const path = result.path;
+		// Back/forward walk this tab's own history, which can lead to a file
+		// that has since been opened in another tab. History holds the paths
+		// as they were typed, not their identities, so this claim compares
+		// literally; the caller loads the file straight afterwards and
+		// `loadMarkdown` resolves the key then, which claims it again by
+		// identity (see `setTabPathKey`).
+		this.claimPath(path, id);
+		tab.historyIndex = result.historyIndex;
+		tab.path = path;
+		tab.pathKey = undefined;
+		tab.title = basename(path) || 'Untitled';
+		this.forgetPreviousDocument(tab);
+		return path;
 	}
 
 	recentlyClosed = $state<string[]>([]);

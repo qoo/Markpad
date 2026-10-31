@@ -1,0 +1,1461 @@
+import assert from 'node:assert/strict';
+
+import { flushSync } from 'svelte';
+import { afterAll, describe, onTestFinished, test } from 'vitest';
+
+import { getSupportedLanguages, type TranslationKey } from '../src/lib/utils/i18n.js';
+import { translations } from './allTranslations.js';
+import { readSource } from './sourceTree.js';
+import { updatedEditorOptions } from '../src/lib/utils/editorOptions.js';
+
+// Plain TypeScript, no runes: safe to import statically, unlike the store below.
+describe('settings persistence', async () => {
+	/*
+	 * `settings.svelte.ts` is a runes module, and this file runs under vitest so
+	 * that it is compiled by the Svelte plugin: `$state` is a real proxy, `$effect`
+	 * really tracks what it reads, and `flushSync()` really runs the pending ones.
+	 *
+	 * That matters here more than anywhere else in the suite. The property this
+	 * file exists to guard — "changing one setting rewrites one localStorage key" —
+	 * IS Svelte's dependency tracking. Under a hand-written `$effect` shim that
+	 * only records its callback, the assertions could describe the intended shape
+	 * but never exercise the mechanism that delivers it.
+	 *
+	 * jsdom supplies `window`, `localStorage` and `navigator` for real; only the
+	 * Tauri backend is stubbed.
+	 */
+	(window as any).__TAURI_INTERNALS__ = { invoke: async () => 'macos' };
+
+	/** jsdom does not fire `storage` for writes made by this same document. */
+	function dispatchStorage(key: string | null, newValue: string | null) {
+		window.dispatchEvent(new StorageEvent('storage', { key, newValue, storageArea: localStorage }));
+	}
+
+	function setNavigatorLanguage(language: string) {
+		Object.defineProperty(globalThis, 'navigator', { value: { language }, configurable: true });
+	}
+
+	// Restored once this block is done: the stand-in navigator would otherwise reach
+	// the other tests in this file.
+	const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+	afterAll(() => {
+		if (originalNavigator) Object.defineProperty(globalThis, 'navigator', originalNavigator);
+	});
+
+	setNavigatorLanguage('en-US');
+
+	const settingsModule = await import('../src/lib/stores/settings.svelte.js');
+	const {
+		CODE_FONT_SIZE_RANGE,
+		DEFAULT_PRE_ZEN_STATE,
+		EDITOR_FONT_SIZE_RANGE,
+		EDITOR_MAX_WIDTH_RANGE,
+		PREVIEW_FONT_SIZE_RANGE,
+		SettingsStore,
+		SIDEBAR_SPLIT_RANGE,
+		TAB_COLUMN_WIDTH_RANGE,
+		ZOOM_LEVEL_RANGE,
+		clampToRange,
+		createSettingsPersistence,
+		detectSystemLanguage,
+		isSupportedLanguage,
+		isThemeSetting,
+		isWithinRange,
+		normalizePreZenState,
+		parseStoredNumber,
+		resolveLanguageTag,
+		resolveTheme,
+		stepWithinRange,
+		wheelZoomFactor,
+		writeStoredSetting,
+	} = settingsModule;
+
+	type PersistedEntry = ReturnType<typeof createSettingsPersistence>[number];
+
+	/**
+	 * A store that is torn down when the test that made it ends.
+	 *
+	 * Every construction installs one write `$effect` per persisted key plus the
+	 * `storage` listener, all into the single jsdom this file shares with the other
+	 * ~25 spec files. A store nobody disposed keeps them: the next `flushSync()`
+	 * anywhere runs its effects too, and they write its values over the live
+	 * store's. `dispose()` is what the store's own `$effect.root()` disposer is
+	 * exposed for — the app never calls it, because its singleton is meant to live
+	 * as long as the window.
+	 */
+	function createStore(): InstanceType<typeof SettingsStore> {
+		const store = new SettingsStore();
+		onTestFinished(() => store.dispose());
+		return store;
+	}
+
+	function resetStorage(seed: Record<string, string> = {}) {
+		localStorage.clear();
+		for (const [key, value] of Object.entries(seed)) localStorage.setItem(key, value);
+	}
+
+	/**
+	 * A stand-in store whose property reads are recorded. Values are plausible so
+	 * that the entries' normalizers behave, but only the *set of property names*
+	 * touched matters.
+	 */
+	function createRecordingStore(): { proxy: InstanceType<typeof SettingsStore>; reads: Set<string> } {
+		const reads = new Set<string>();
+		resetStorage();
+		const real = createStore();
+		const proxy = new Proxy(real, {
+			get(target, property) {
+				if (typeof property === 'string') reads.add(property);
+				// `target`, not the receiver: the compiler turns `x = $state(…)` into a
+				// getter over a `#x` private field, and a getter invoked with the proxy
+				// as `this` throws — private fields are keyed on the real instance.
+				return Reflect.get(target, property);
+			},
+		});
+		return { proxy, reads };
+	}
+
+	/*
+	 * ---------------------------------------------------------------------------
+	 * Task 1 — one localStorage entry per store field.
+	 * ---------------------------------------------------------------------------
+	 */
+
+	test('each persisted entry reads exactly one store field', () => {
+		const entries = createSettingsPersistence();
+		const { proxy, reads } = createRecordingStore();
+
+		for (const entry of entries) {
+			reads.clear();
+			entry.read(proxy);
+			assert.equal(
+				reads.size,
+				1,
+				`entry "${entry.key}" reads ${reads.size} fields (${[...reads].join(', ')}); it must read exactly one`,
+			);
+		}
+	});
+
+	test('no store field is read by two persisted entries', () => {
+		// Svelte's dependency tracking *is* "which properties did this effect read".
+		// With one effect per entry, a field read by two entries would mean changing
+		// it rewrites two keys — the multi-window clobbering bug in miniature. This
+		// asserts the dependency graph is a bijection, not an approximation of one.
+		const entries = createSettingsPersistence();
+		const { proxy, reads } = createRecordingStore();
+		const owner = new Map<string, string>();
+
+		for (const entry of entries) {
+			reads.clear();
+			entry.read(proxy);
+			for (const field of reads) {
+				const previous = owner.get(field);
+				assert.equal(
+					previous,
+					undefined,
+					`field "${field}" is read by both "${previous}" and "${entry.key}"`,
+				);
+				owner.set(field, entry.key);
+			}
+		}
+
+		assert.equal(owner.size, entries.length);
+	});
+
+	test('persisted keys are unique and cover the documented settings surface', () => {
+		const entries = createSettingsPersistence();
+		const keys = entries.map((entry) => entry.key);
+		assert.equal(new Set(keys).size, keys.length, 'duplicate localStorage key');
+		for (const key of ['editor.fontSize', 'editor.language', 'preview.maxWidth', 'editor.preZenState']) {
+			assert.ok(keys.includes(key), `missing persisted key ${key}`);
+		}
+	});
+
+	test('the persisted theme key is the one app.html paints from', () => {
+		// The first-paint script in src/app.html reads the theme before the bundle
+		// loads and picks the background from it; renaming the store's key (to
+		// `editor.theme`, say, matching its neighbours) brings back the white flash
+		// that script exists to prevent, and nothing else in the app would notice.
+		// So the store writes a theme and the page's own script runs on it.
+		const page = new DOMParser().parseFromString(readSource('src/app.html'), 'text/html');
+		const firstPaint = page.head.querySelector('script')!.textContent!;
+		const root = document.documentElement;
+		onTestFinished(() => {
+			root.removeAttribute('data-theme');
+			root.style.backgroundColor = '';
+		});
+
+		resetStorage();
+		const store = createStore();
+		store.theme = 'dark';
+		flushSync();
+		new Function(firstPaint)();
+		assert.equal(root.getAttribute('data-theme'), 'dark');
+		assert.equal(root.style.backgroundColor, 'rgb(24, 24, 24)');
+
+		store.theme = 'light';
+		flushSync();
+		new Function(firstPaint)();
+		assert.equal(root.getAttribute('data-theme'), 'light');
+		assert.equal(root.style.backgroundColor, 'rgb(253, 253, 253)');
+	});
+
+	test('the outline following the editor has no preference of its own', () => {
+		// #169. The outline has always followed the preview unconditionally, and
+		// following the editor is the same feature answering for the other pane: a
+		// switch would make half of one behaviour optional. `editor.tocFollows`
+		// (scroll or cursor) is which editor position it follows, not whether.
+		const keys = createSettingsPersistence().map((entry) => entry.key);
+		assert.deepEqual(keys.filter((key) => /toc/i.test(key) && /editor/i.test(key.replace(/^editor\./, ''))), []);
+	});
+
+	/** Every key currently in localStorage, with its value. */
+	function storageSnapshot(): Map<string, string> {
+		const out = new Map<string, string>();
+		for (let i = 0; i < localStorage.length; i++) {
+			const key = localStorage.key(i)!;
+			out.set(key, localStorage.getItem(key)!);
+		}
+		return out;
+	}
+
+	test('changing one setting rewrites only that setting key', () => {
+		// The regression this guards: a single effect that read every field, so any
+		// one change rewrote all ~30 keys from a stale snapshot.
+		//
+		// This runs the real effects. `new SettingsStore()` installs them inside an
+		// `$effect.root`, `flushSync()` runs the pending ones, and what lands in
+		// localStorage afterwards is decided by Svelte's dependency tracking — not
+		// by this file's idea of it. Under the hand-written `$effect` shim this
+		// suite used to install, the assertion below could not fail: nothing re-ran.
+		resetStorage();
+		const store = createStore();
+		flushSync(); // seeds every key from the store's current values
+
+		const written = (change: () => void) => {
+			const before = storageSnapshot();
+			change();
+			flushSync();
+			return [...storageSnapshot()]
+				.filter(([key, value]) => before.get(key) !== value)
+				.map(([key]) => key)
+				.sort();
+		};
+
+		assert.deepEqual(written(() => (store.minimap = !store.minimap)), ['editor.minimap']);
+		assert.deepEqual(
+			written(() => {
+				store.editorFontSize = 30;
+				store.language = 'ja';
+			}),
+			['editor.fontSize', 'editor.language'],
+		);
+		// A write with no state change is not a write at all.
+		assert.deepEqual(written(() => {}), []);
+	});
+
+	// `the store installs a storage listener that survives on the real window` stood
+	// here. Its body was the first half of `storage events fold another window
+	// changes into this instance` below, verbatim — same reset, same store, same
+	// flush, same `editor.fontSize` write and dispatch, same assertion — and that
+	// test then goes on to do the language key as well. Deleting
+	// `window.addEventListener('storage', …)` from the store turns eight tests in
+	// this file red, that superset among them.
+
+	test('a second window no longer clobbers what the first window just changed', () => {
+		// Window A and window B are separate webviews with separate store instances
+		// over one shared localStorage.
+		const entries = createSettingsPersistence();
+		resetStorage();
+
+		const windowA = createStore();
+		const windowB = createStore(); // holds its own construction-time snapshot
+
+		// A changes font size and language and persists just those two keys.
+		windowA.editorFontSize = 30;
+		windowA.language = 'ja';
+		for (const entry of entries) writeStoredSetting(entry.key, entry.read(windowA));
+
+		// B, still unaware, flips an unrelated toggle and persists only its own key.
+		windowB.minimap = !windowB.minimap;
+		const minimapEntry = entries.find((entry) => entry.key === 'editor.minimap') as PersistedEntry;
+		writeStoredSetting(minimapEntry.key, minimapEntry.read(windowB));
+
+		assert.equal(localStorage.getItem('editor.fontSize'), '30');
+		assert.equal(localStorage.getItem('editor.language'), 'ja');
+
+		// And a fresh window (a restart) sees A's changes intact.
+		const restarted = createStore();
+		assert.equal(restarted.editorFontSize, 30);
+		assert.equal(restarted.language, 'ja');
+	});
+
+	test('the store has no single effect that writes every key', () => {
+		// The same two windows as above, but through the store's own effects. One
+		// effect reading every field would rewrite font size from B's stale copy the
+		// moment B touched anything. (A same-document write fires no storage event,
+		// so B really is unaware here.)
+		resetStorage();
+		const windowA = createStore();
+		const windowB = createStore();
+		flushSync();
+
+		windowA.editorFontSize = 30;
+		flushSync();
+		windowB.minimap = !windowB.minimap;
+		flushSync();
+
+		assert.equal(localStorage.getItem('editor.fontSize'), '30');
+		assert.equal(localStorage.getItem('editor.minimap'), String(windowB.minimap));
+	});
+
+	test('storage events fold another window changes into this instance', () => {
+		resetStorage();
+		const store = createStore();
+		flushSync();
+
+		// Another window wrote the value; localStorage already reflects it when the
+		// event is delivered here.
+		localStorage.setItem('editor.fontSize', '30');
+		dispatchStorage('editor.fontSize', '30');
+		assert.equal(store.editorFontSize, 30);
+
+		localStorage.setItem('editor.language', 'ja');
+		dispatchStorage('editor.language', 'ja');
+		assert.equal(store.language, 'ja');
+	});
+
+	test('a value that arrived from localStorage is not written back', () => {
+		// The anti-echo property. No flag is involved: the write-back is dropped
+		// because compare-and-set finds the value already stored.
+		const entries = createSettingsPersistence();
+		resetStorage();
+		const store = createStore();
+		flushSync();
+		const entry = entries.find((item) => item.key === 'editor.fontSize') as PersistedEntry;
+
+		localStorage.setItem('editor.fontSize', '30');
+		dispatchStorage('editor.fontSize', '30');
+
+		// This is the follow-up effect run that a naive implementation would use to
+		// echo the value straight back to the other window.
+		assert.equal(writeStoredSetting(entry.key, entry.read(store)), false);
+	});
+
+	test('writeStoredSetting is compare-and-set and removes on null', () => {
+		resetStorage();
+		assert.equal(writeStoredSetting('demo.key', 'a'), true);
+		assert.equal(writeStoredSetting('demo.key', 'a'), false);
+		assert.equal(writeStoredSetting('demo.key', 'b'), true);
+		assert.equal(writeStoredSetting('demo.key', null), true);
+		assert.equal(localStorage.getItem('demo.key'), null);
+		assert.equal(writeStoredSetting('demo.key', null), false);
+	});
+
+	test('a cleared localStorage is re-read rather than half-applied', () => {
+		resetStorage({ 'editor.fontSize': '30' });
+		const store = createStore();
+		flushSync();
+		assert.equal(store.editorFontSize, 30);
+
+		localStorage.clear();
+		dispatchStorage(null, null);
+		assert.equal(store.editorFontSize, EDITOR_FONT_SIZE_RANGE.default);
+	});
+
+	test('a disposed store stops writing and stops listening', () => {
+		// `$effect.root()` returns a disposer, and it used to be discarded. In the
+		// app that is correct — the singleton lives as long as the window — but every
+		// store a *test* builds then leaks ~30 live write effects and a `storage`
+		// listener into the one jsdom every spec file shares. Both halves of that
+		// leak are asserted here, because both are cross-test pollution: an
+		// abandoned store answers a later `flushSync()` with its own values, and it
+		// answers a later `storage` event by mutating fields the test still reads.
+		resetStorage();
+		const abandoned = new SettingsStore();
+		flushSync();
+		abandoned.dispose();
+
+		const current = createStore();
+		flushSync();
+		current.editorFontSize = 30;
+		flushSync();
+		assert.equal(localStorage.getItem('editor.fontSize'), '30');
+
+		// The write effects are gone, so touching the disposed store's fields is
+		// inert. Undisposed, its effect re-runs on this flush and puts 12 in the key
+		// the live store just set to 30.
+		abandoned.editorFontSize = 12;
+		flushSync();
+		assert.equal(localStorage.getItem('editor.fontSize'), '30', 'a disposed store still writes to localStorage');
+
+		// ...and so is the `storage` listener: it was registered by an effect inside
+		// the same root, so destroying the root runs that effect's teardown.
+		localStorage.setItem('editor.fontSize', '40');
+		dispatchStorage('editor.fontSize', '40');
+		assert.equal(abandoned.editorFontSize, 12, 'a disposed store is still listening on window');
+		assert.equal(current.editorFontSize, 40, 'and disposing one store must not deafen the others');
+	});
+
+	/*
+	 * ---------------------------------------------------------------------------
+	 * Task 2 — UI bounds and persisted bounds are the same constants.
+	 * ---------------------------------------------------------------------------
+	 */
+
+	test('font size ranges reach the maximum the UI already offers', () => {
+		assert.equal(EDITOR_FONT_SIZE_RANGE.max, 48);
+		assert.equal(PREVIEW_FONT_SIZE_RANGE.max, 48);
+		assert.equal(CODE_FONT_SIZE_RANGE.max, 48);
+		assert.equal(EDITOR_FONT_SIZE_RANGE.min, 10);
+		assert.equal(PREVIEW_FONT_SIZE_RANGE.min, 12);
+		assert.equal(CODE_FONT_SIZE_RANGE.min, 10);
+		assert.deepEqual(
+			{ min: EDITOR_MAX_WIDTH_RANGE.min, max: EDITOR_MAX_WIDTH_RANGE.max, default: EDITOR_MAX_WIDTH_RANGE.default },
+			{ min: 20, max: 500, default: 80 },
+		);
+	});
+
+	test('a size the UI allows survives a restart', () => {
+		// Regression: 30 used to be clamped back to 24 (editor/code) or 28 (preview)
+		// on load, so the value silently shrank on the next launch.
+		resetStorage({
+			'editor.fontSize': '30',
+			'preview.fontSize': '40',
+			'preview.codeFontSize': '48',
+			'editor.maxWidth': '500',
+		});
+		const store = createStore();
+		assert.equal(store.editorFontSize, 30);
+		assert.equal(store.previewFontSize, 40);
+		assert.equal(store.codeFontSize, 48);
+		assert.equal(store.editorMaxWidth, 500);
+	});
+
+	test('values outside the shared range are still clamped on load', () => {
+		resetStorage({ 'editor.fontSize': '900', 'preview.fontSize': '2', 'editor.maxWidth': '5000' });
+		const store = createStore();
+		assert.equal(store.editorFontSize, EDITOR_FONT_SIZE_RANGE.max);
+		assert.equal(store.previewFontSize, PREVIEW_FONT_SIZE_RANGE.min);
+		assert.equal(store.editorMaxWidth, EDITOR_MAX_WIDTH_RANGE.max);
+	});
+
+	/*
+	 * ---------------------------------------------------------------------------
+	 * Task 3 — typed input is validated before it reaches the store.
+	 * ---------------------------------------------------------------------------
+	 */
+
+	test('an empty or unparseable field falls back to the default, never to null', () => {
+		assert.equal(parseStoredNumber('', EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.default);
+		assert.equal(parseStoredNumber('   ', EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.default);
+		assert.equal(parseStoredNumber(null, EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.default);
+		assert.equal(parseStoredNumber('null', EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.default);
+		assert.equal(parseStoredNumber('abc', EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.default);
+		assert.equal(clampToRange(null, EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.default);
+		assert.equal(clampToRange(Number.NaN, EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.default);
+	});
+
+	test('a half-typed value is neither accepted nor clamped mid-keystroke', () => {
+		// Typing "18" passes through "1". Clamping there would jump the field to 10
+		// and fight the user, so in-range is the acceptance test while typing.
+		assert.equal(isWithinRange(1, EDITOR_FONT_SIZE_RANGE), false);
+		assert.equal(isWithinRange(18, EDITOR_FONT_SIZE_RANGE), true);
+		assert.equal(isWithinRange(4, EDITOR_MAX_WIDTH_RANGE), false);
+		assert.equal(isWithinRange(40, EDITOR_MAX_WIDTH_RANGE), true);
+		assert.equal(isWithinRange(Number.NaN, EDITOR_FONT_SIZE_RANGE), false);
+		// ...and committing settles it inside the range.
+		assert.equal(clampToRange(1, EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.min);
+		assert.equal(clampToRange(4, EDITOR_MAX_WIDTH_RANGE), EDITOR_MAX_WIDTH_RANGE.min);
+	});
+
+	test('spin buttons clamp with the same rules as typing', () => {
+		assert.equal(stepWithinRange(EDITOR_FONT_SIZE_RANGE.max, 1, EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.max);
+		assert.equal(stepWithinRange(EDITOR_FONT_SIZE_RANGE.min, -1, EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.min);
+		assert.equal(stepWithinRange(47, 1, EDITOR_FONT_SIZE_RANGE), 48);
+		assert.equal(stepWithinRange(490, 10, EDITOR_MAX_WIDTH_RANGE), 500);
+		// A corrupt current value cannot escape the range either.
+		assert.equal(stepWithinRange(Number.NaN, 1, EDITOR_FONT_SIZE_RANGE), EDITOR_FONT_SIZE_RANGE.default + 1);
+	});
+
+	/*
+	 * ---------------------------------------------------------------------------
+	 * Task 3b — the three values that used to write localStorage on their own.
+	 *
+	 * `theme`, `zoomLevel` and `preview.fullWidth` each had their own `$state` in
+	 * MarkdownViewer.svelte with a bare `localStorage.setItem` beside it. What that
+	 * cost is asserted below, one property per test; that no such write can come
+	 * back is the `local-storage-writes-through-the-store` lint rule
+	 * (eslint.config.js).
+	 * ---------------------------------------------------------------------------
+	 */
+
+	test('a theme picked in one window reaches the others without a restart', () => {
+		// THE BUG. Every other switch in the appearance panel synced live, because
+		// every other switch was a persisted entry and got the `storage` listener for
+		// free. The theme <select> sat in the same panel and did not: it wrote
+		// `localStorage` directly, and nothing in the app listened for `theme`.
+		resetStorage();
+		const store = createStore();
+		// The `storage` listener is only wired up once the effects flush.
+		flushSync();
+		assert.equal(store.theme, 'system');
+
+		// A real `storage` event through the real `window`, so what is exercised is
+		// the listener the store actually registered — not a callback this test
+		// captured and called itself.
+		localStorage.setItem('theme', 'dark');
+		dispatchStorage('theme', 'dark');
+		assert.equal(store.theme, 'dark');
+
+		localStorage.setItem('theme', 'vscode:Ayu Dark');
+		dispatchStorage('theme', 'vscode:Ayu Dark');
+		assert.equal(store.theme, 'vscode:Ayu Dark');
+
+		// And the arriving value is not echoed back at the window that sent it.
+		const entry = createSettingsPersistence().find((item) => item.key === 'theme') as PersistedEntry;
+		assert.equal(writeStoredSetting(entry.key, entry.read(store)), false);
+	});
+
+	test('an unusable stored theme falls back rather than being applied', () => {
+		assert.equal(resolveTheme('dark'), 'dark');
+		assert.equal(resolveTheme('vscode:Ayu Dark'), 'vscode:Ayu Dark');
+		assert.equal(resolveTheme(null), 'system');
+		assert.equal(resolveTheme('midnight'), 'system');
+		// A bare `vscode:` names no theme; `theme.replace('vscode:', '')` would ask
+		// Rust to read the file called "".
+		assert.equal(resolveTheme('vscode:'), 'system');
+		assert.equal(isThemeSetting('vscode:'), false);
+		assert.equal(isThemeSetting(42), false);
+
+		resetStorage({ theme: 'midnight' });
+		assert.equal(createStore().theme, 'system');
+		resetStorage({ theme: 'vscode:Ayu Dark' });
+		assert.equal(createStore().theme, 'vscode:Ayu Dark');
+	});
+
+	test('a corrupt stored zoom level loads as 100, not as NaN', () => {
+		// THE BUG. The viewer read this key with `parseInt(… || '100', 10)` and no
+		// validation, so any value that is not a number became NaN — and NaN is a
+		// trap, not a glitch: the preview renders `zoom: NaN`, and both ways out
+		// (`Math.min(NaN + 10, 500)` on the wheel and on Mod+=) are NaN as well. Only
+		// the reset button could recover the app.
+		for (const stored of ['banana', 'null', '', '   ', 'NaN', 'Infinity']) {
+			resetStorage({ zoomLevel: stored });
+			const store = createStore();
+			assert.equal(store.zoomLevel, ZOOM_LEVEL_RANGE.default, `zoomLevel=${JSON.stringify(stored)}`);
+			assert.ok(Number.isFinite(store.zoomLevel));
+		}
+
+		resetStorage({ zoomLevel: '250' });
+		assert.equal(createStore().zoomLevel, 250, 'a good value still survives a restart');
+		resetStorage({ zoomLevel: '9000' });
+		assert.equal(createStore().zoomLevel, ZOOM_LEVEL_RANGE.max, 'and one out of range is clamped, not dropped');
+	});
+
+	test('the zoom operations are bounded by one range, and recover a corrupt level', () => {
+		// The 25/500 pair used to be written out three times (the viewer's wheel
+		// handler, its keyboard chords, and the editor's own wheel handler) beside a
+		// `100` in three more. These are the operations all of them call now.
+		assert.deepEqual(
+			{ min: ZOOM_LEVEL_RANGE.min, max: ZOOM_LEVEL_RANGE.max, step: ZOOM_LEVEL_RANGE.step, default: ZOOM_LEVEL_RANGE.default },
+			{ min: 25, max: 500, step: 10, default: 100 },
+		);
+
+		resetStorage();
+		const store = createStore();
+		store.zoomIn();
+		assert.equal(store.zoomLevel, 110);
+		store.zoomOut();
+		store.zoomOut();
+		assert.equal(store.zoomLevel, 90);
+		store.resetZoom();
+		assert.equal(store.zoomLevel, ZOOM_LEVEL_RANGE.default);
+
+		store.zoomLevel = ZOOM_LEVEL_RANGE.max;
+		store.zoomIn();
+		assert.equal(store.zoomLevel, ZOOM_LEVEL_RANGE.max, 'zooming in at the top is a no-op, not 510');
+		store.zoomLevel = ZOOM_LEVEL_RANGE.min;
+		store.zoomOut();
+		assert.equal(store.zoomLevel, ZOOM_LEVEL_RANGE.min);
+
+		// The other half of the NaN trap: a level that is already corrupt has to be
+		// escapable with the wheel, not only with the reset button.
+		store.zoomLevel = Number.NaN;
+		store.zoomIn();
+		assert.equal(store.zoomLevel, ZOOM_LEVEL_RANGE.default + ZOOM_LEVEL_RANGE.step);
+	});
+
+	test('a pinch zooms as far as the fingers move, not 10% per event (#831)', () => {
+		resetStorage();
+		const store = createStore();
+
+		// A pinch that doubles the fingers' spread, delivered the way WebKit and
+		// Chromium deliver it: many small ctrl+wheel events, deltaY = -100·ln(step).
+		const events = 40;
+		for (let i = 0; i < events; i++) store.zoomBy(wheelZoomFactor((-100 * Math.log(2)) / events));
+		assert.equal(store.zoomLevel, 200, 'forty events used to be forty 10-point steps, i.e. the 500 ceiling');
+
+		// A slow pinch at the bottom of the range moves by a fraction of a percent
+		// per event. Rounding each one would leave it stuck at 25.
+		store.zoomLevel = ZOOM_LEVEL_RANGE.min;
+		for (let i = 0; i < 20; i++) store.zoomBy(wheelZoomFactor(-1));
+		assert.ok(store.zoomLevel > ZOOM_LEVEL_RANGE.min + 4, `slow pinch stalled at ${store.zoomLevel}`);
+
+		// A mouse notch that reports a large delta is capped near one old step.
+		store.resetZoom();
+		store.zoomBy(wheelZoomFactor(-100));
+		assert.equal(store.zoomLevel, 111);
+		store.zoomBy(wheelZoomFactor(100));
+		assert.equal(store.zoomLevel, 100, 'in then out by one notch comes back to where it was');
+
+		store.zoomBy(1e9);
+		assert.equal(store.zoomLevel, ZOOM_LEVEL_RANGE.max);
+	});
+
+	test('zoom and preview width follow the other windows too', () => {
+		resetStorage();
+		const store = createStore();
+		flushSync();
+
+		localStorage.setItem('zoomLevel', '150');
+		dispatchStorage('zoomLevel', '150');
+		assert.equal(store.zoomLevel, 150);
+
+		// Including garbage another window somehow published: the load path is the
+		// same one the constructor uses, so it validates the same way.
+		localStorage.setItem('zoomLevel', 'banana');
+		dispatchStorage('zoomLevel', 'banana');
+		assert.equal(store.zoomLevel, ZOOM_LEVEL_RANGE.default);
+
+		localStorage.setItem('preview.fullWidth', 'true');
+		dispatchStorage('preview.fullWidth', 'true');
+		assert.equal(store.previewFullWidth, true);
+		store.previewFullWidth = !store.previewFullWidth;
+		assert.equal(store.previewFullWidth, false);
+	});
+
+	test('settings load, persist, and reset the preview width through one normalizer', () => {
+		resetStorage({ 'preview.maxWidth': 'banana' });
+		assert.equal(createStore().previewMaxWidth, 880, 'garbage loads as the default');
+
+		resetStorage({ 'preview.maxWidth': '99999' });
+		const store = createStore();
+		assert.equal(store.previewMaxWidth, 1600, 'an out-of-range width loads clamped');
+
+		store.previewMaxWidth = 1200;
+		flushSync();
+		assert.equal(localStorage.getItem('preview.maxWidth'), '1200');
+		assert.equal(createStore().previewMaxWidth, 1200, 'a restart keeps it');
+
+		store.resetPreviewMaxWidth();
+		flushSync();
+		assert.equal(store.previewMaxWidth, 880);
+		assert.equal(localStorage.getItem('preview.maxWidth'), '880');
+	});
+
+	test('the legacy full-width key is honoured once and then superseded', () => {
+		resetStorage({ isFullWidth: 'true' });
+		assert.equal(createStore().previewFullWidth, true, 'an install upgrading from the old key keeps its setting');
+
+		// The old key is left in place rather than deleted — `read` touches one field
+		// and so cannot remove a second key — and the new one takes precedence from
+		// the first write onwards, which is how `editor.openFileMode` and
+		// `editor.autoSaveEdits` treat theirs.
+		resetStorage({ isFullWidth: 'true', 'preview.fullWidth': 'false' });
+		assert.equal(createStore().previewFullWidth, false);
+	});
+
+	// A rollback to the build before each rename reads the old key, so the store
+	// reads it once and never writes or removes it: the old build still finds the
+	// setting the user had.
+	test.each([
+		{
+			name: 'open file mode',
+			legacy: { 'editor.startInEditor': 'true' } as Record<string, string>,
+			read: (s: InstanceType<typeof SettingsStore>) => s.openFileMode,
+			loaded: 'editor',
+			change: (s: InstanceType<typeof SettingsStore>) => { s.openFileMode = 'split'; },
+			key: 'editor.openFileMode',
+			written: 'split',
+		},
+		{
+			name: 'preview full width',
+			legacy: { isFullWidth: 'true' } as Record<string, string>,
+			read: (s: InstanceType<typeof SettingsStore>) => s.previewFullWidth,
+			loaded: true,
+			change: (s: InstanceType<typeof SettingsStore>) => { s.previewFullWidth = false; },
+			key: 'preview.fullWidth',
+			written: 'false',
+		},
+		{
+			// Both switches on was the contradictory combination: auto-save shown on
+			// and vetoed by the confirmation. It loads as off.
+			name: 'merged auto-save',
+			legacy: { 'editor.autoSave': 'true', 'editor.confirmBeforeSave': 'true' } as Record<string, string>,
+			read: (s: InstanceType<typeof SettingsStore>) => s.autoSave,
+			loaded: false,
+			change: (s: InstanceType<typeof SettingsStore>) => { s.autoSave = true; },
+			key: 'editor.autoSaveEdits',
+			written: 'true',
+		},
+	])('the $name setting reads its old key and writes only its new one', ({ legacy, read, loaded, change, key, written }) => {
+		resetStorage(legacy);
+		const store = createStore();
+		assert.equal(read(store), loaded, 'an install upgrading from the old key keeps its setting');
+
+		change(store);
+		flushSync();
+		assert.equal(localStorage.getItem(key), written);
+		for (const [legacyKey, value] of Object.entries(legacy)) {
+			assert.equal(localStorage.getItem(legacyKey), value, `${legacyKey} is left for a rollback`);
+		}
+	});
+
+	/*
+	 * ---------------------------------------------------------------------------
+	 * Task 4 — language tag resolution.
+	 * ---------------------------------------------------------------------------
+	 */
+
+	test('Norwegian BCP-47 tags resolve to the Norwegian catalogue entry', () => {
+		// `no` is the macrolanguage; browsers report nb/nn.
+		assert.equal(resolveLanguageTag('nb'), 'no');
+		assert.equal(resolveLanguageTag('nb-NO'), 'no');
+		assert.equal(resolveLanguageTag('nn'), 'no');
+		assert.equal(resolveLanguageTag('nn-NO'), 'no');
+		assert.equal(resolveLanguageTag('no'), 'no');
+	});
+
+	test('Dutch is not swallowed by the Norwegian rule', () => {
+		assert.equal(resolveLanguageTag('nl'), 'nl');
+		assert.equal(resolveLanguageTag('nl-NL'), 'nl');
+		assert.equal(resolveLanguageTag('nl-BE'), 'nl');
+	});
+
+	test('Traditional Chinese is detected from the script subtag, not just the region', () => {
+		assert.equal(resolveLanguageTag('zh-Hant'), 'zh-TW');
+		assert.equal(resolveLanguageTag('zh-Hant-TW'), 'zh-TW');
+		assert.equal(resolveLanguageTag('zh-Hant-HK'), 'zh-TW');
+		assert.equal(resolveLanguageTag('zh-TW'), 'zh-TW');
+		assert.equal(resolveLanguageTag('zh-HK'), 'zh-TW');
+		assert.equal(resolveLanguageTag('zh-MO'), 'zh-TW');
+		assert.equal(resolveLanguageTag('zh-Hans'), 'zh-CN');
+		assert.equal(resolveLanguageTag('zh-Hans-CN'), 'zh-CN');
+		assert.equal(resolveLanguageTag('zh'), 'zh-CN');
+		assert.equal(resolveLanguageTag('zh-CN'), 'zh-CN');
+	});
+
+	test('regional variants and unsupported tags resolve predictably', () => {
+		assert.equal(resolveLanguageTag('pt-BR'), 'pt-BR');
+		assert.equal(resolveLanguageTag('pt'), 'pt');
+		assert.equal(resolveLanguageTag('pt-PT'), 'pt');
+		assert.equal(resolveLanguageTag('en_GB'), 'en');
+		assert.equal(resolveLanguageTag('ar'), null);
+		assert.equal(resolveLanguageTag('nog'), null); // used to match startsWith('no')
+		assert.equal(resolveLanguageTag(''), null);
+		assert.equal(resolveLanguageTag(null), null);
+		assert.equal(resolveLanguageTag(undefined), null);
+	});
+
+	test('system detection falls back to English for unsupported locales', () => {
+		setNavigatorLanguage('ar-EG');
+		assert.equal(detectSystemLanguage(), 'en');
+		setNavigatorLanguage('nb-NO');
+		assert.equal(detectSystemLanguage(), 'no');
+		setNavigatorLanguage('en-US');
+	});
+
+	test('a stored language is validated against the catalogue', () => {
+		resetStorage({ 'editor.language': 'klingon' });
+		setNavigatorLanguage('ja-JP');
+		assert.equal(createStore().language, 'en'); // unchanged default, not the bogus code
+
+		resetStorage();
+		assert.equal(createStore().language, 'ja'); // nothing stored -> detect
+		setNavigatorLanguage('en-US');
+	});
+
+	test('the validator accepts exactly the languages the dialog offers', () => {
+		// SUPPORTED_LANGUAGE_CODES is derived from getSupportedLanguages(), so the
+		// first assertion is true by construction *today* — and that is the point.
+		// It is the assertion that fails the moment someone re-forks the catalogue
+		// into this module, which is how the two copies got here in the first place.
+		// The `pt` drift the fork produced was in `name`/`nativeName`, which codes
+		// cannot see; the `one-language-catalogue` lint rule (eslint.config.js)
+		// covers that half.
+		const offered = getSupportedLanguages().map((entry) => entry.code);
+
+		// Not by construction: `translations` and LANGUAGE_BY_PRIMARY_SUBTAG (via
+		// resolveLanguageTag) are hand-maintained beside the catalogue. A language
+		// offered in the <select> with no dictionary renders as raw English, and a
+		// language the tag resolver can produce but the validator rejects makes
+		// detectSystemLanguage's result unstorable.
+		for (const code of offered) {
+			assert.ok(translations[code], `${code} is offered by the language <select> but has no dictionary`);
+		}
+		assert.deepEqual(Object.keys(translations).sort(), [...offered].sort());
+
+		for (const tag of ['nb', 'nn', 'pt-PT', 'pt-BR', 'zh-Hant', 'zh-Hans', 'en_GB']) {
+			const resolved = resolveLanguageTag(tag);
+			assert.ok(resolved && isSupportedLanguage(resolved), `${tag} resolves to ${resolved}, which will not survive a reload`);
+		}
+	});
+
+	/*
+	 * ---------------------------------------------------------------------------
+	 * Task 6 — the zen-mode snapshot is validated like every other stored value.
+	 *
+	 * `editor.preZenState` was the one entry in the table that trusted what it
+	 * found: a bare `JSON.parse` straight onto the field, with a `console.error`
+	 * for the only failure it considered possible. Its neighbours all validate —
+	 * `normalizeEditorToolbarOrder`, `parseStoredNumber`, `isSupportedLanguage`,
+	 * `raw === 'left' || raw === 'right'` — and this is the entry whose unchecked
+	 * value is copied back onto six other settings the moment zen mode ends.
+	 * ---------------------------------------------------------------------------
+	 */
+
+	/** A snapshot whose six values all differ from the store's defaults. */
+	const USER_SNAPSHOT = {
+		renderLineHighlight: 'none',
+		showTabs: false,
+		statusBar: false,
+		minimap: true,
+		lineNumbers: 'off',
+		showToc: true,
+	};
+
+	/** Every way a stored snapshot can be unusable, as it appears in localStorage. */
+	const CORRUPT_SNAPSHOTS: Record<string, string> = {
+		'a field of the wrong type': '{"renderLineHighlight":"none","showTabs":"yes","statusBar":true,"minimap":false,"lineNumbers":"on","showToc":false}',
+		'a missing field': '{"renderLineHighlight":"none","statusBar":true,"minimap":false,"lineNumbers":"on","showToc":false}',
+		'not an object': '"showTabs"',
+		'unparseable JSON': '{"showTabs":',
+	};
+
+	test('a stored zen snapshot is accepted only whole', () => {
+		assert.deepEqual(normalizePreZenState({ ...USER_SNAPSHOT }), USER_SNAPSHOT);
+		// Fields nobody declared are dropped rather than carried onto the store.
+		assert.deepEqual(normalizePreZenState({ ...USER_SNAPSHOT, wordWrap: 'off' }), USER_SNAPSHOT);
+
+		// One field wrong is the whole record wrong: a snapshot this version cannot
+		// read comes from a version whose other five fields it cannot vouch for
+		// either, and a half-applied restore is a state the user never had.
+		assert.equal(normalizePreZenState({ ...USER_SNAPSHOT, showTabs: 'yes' }), null);
+		assert.equal(normalizePreZenState({ ...USER_SNAPSHOT, showTabs: 1 }), null);
+		assert.equal(normalizePreZenState({ ...USER_SNAPSHOT, lineNumbers: 0 }), null);
+		assert.equal(normalizePreZenState({ ...USER_SNAPSHOT, showToc: null }), null);
+		const { showTabs, ...missingShowTabs } = USER_SNAPSHOT;
+		assert.equal(normalizePreZenState(missingShowTabs), null);
+		assert.equal(normalizePreZenState({}), null);
+
+		// And nothing that is not an object gets that far.
+		for (const value of [null, undefined, 42, 'showTabs', true, [USER_SNAPSHOT]]) {
+			assert.equal(normalizePreZenState(value), null, `${JSON.stringify(value)} is not a snapshot`);
+		}
+	});
+
+	test('a corrupt zen snapshot never reaches the settings it would restore', () => {
+		for (const [description, stored] of Object.entries(CORRUPT_SNAPSHOTS)) {
+			resetStorage({ 'editor.preZenState': stored });
+			const store = createStore();
+			assert.equal(store.preZenState, null, description);
+			// The store's own fields are untouched: the record was rejected before
+			// anything could be copied out of it.
+			assert.equal(store.showTabs, true, description);
+			assert.equal(store.statusBar, true, description);
+		}
+
+		resetStorage({ 'editor.preZenState': JSON.stringify(USER_SNAPSHOT) });
+		assert.deepEqual(createStore().preZenState, USER_SNAPSHOT, 'a good snapshot still survives a restart');
+	});
+
+	test('the tab bar comes back on leaving zen mode even when the snapshot is unusable', () => {
+		// THE BUG, end to end. Zen mode had already hidden the tab bar and written
+		// `editor.showTabs=false`; the snapshot that says how to put it back is one
+		// this version cannot read.
+		//
+		// Unvalidated, the missing-field case restored `showTabs = undefined`, whose
+		// write effect stored the *string* `"undefined"` — and `raw === 'true'` is
+		// false forever after, so the tab bar was gone on every later launch too,
+		// with only the settings dialog to bring it back.
+		for (const [description, stored] of Object.entries(CORRUPT_SNAPSHOTS)) {
+			resetStorage({
+				'editor.zenMode': 'true',
+				'editor.showTabs': 'false',
+				'editor.statusBar': 'false',
+				'editor.lineNumbers': 'off',
+				'editor.preZenState': stored,
+			});
+			const store = createStore();
+			flushSync();
+			assert.equal(store.zenMode, true, description);
+			assert.equal(store.showTabs, false, description);
+
+			store.toggleZenMode();
+			flushSync();
+
+			assert.equal(store.zenMode, false, description);
+			assert.equal(store.showTabs, true, `${description}: the tab bar is back`);
+			assert.equal(store.statusBar, true, description);
+			assert.equal(store.lineNumbers, 'on', description);
+			assert.equal(store.renderLineHighlight, 'line', description);
+			assert.equal(store.showToc, false, description);
+
+			// What was persisted is a boolean's spelling, not "undefined"...
+			assert.equal(localStorage.getItem('editor.showTabs'), 'true', description);
+			assert.equal(localStorage.getItem('editor.preZenState'), null, `${description}: the bad record is gone`);
+			// ...so the next launch keeps the tab bar instead of reading it back as false.
+			assert.equal(createStore().showTabs, true, `${description}: and it is still there after a restart`);
+		}
+	});
+
+	test('a good snapshot still restores what the user had, not the defaults', () => {
+		// The other half: the fallback must not be reached while there is a record
+		// to honour, or leaving zen mode would reset six settings every time.
+		resetStorage();
+		const store = createStore();
+		Object.assign(store, USER_SNAPSHOT);
+		flushSync();
+
+		store.toggleZenMode();
+		flushSync();
+		assert.equal(store.showTabs, false);
+		assert.equal(store.minimap, false, 'zen mode flattens everything, including what was already off');
+
+		// Through localStorage and a restart, the way a real session gets there.
+		const restarted = createStore();
+		assert.deepEqual(restarted.preZenState, USER_SNAPSHOT);
+		restarted.toggleZenMode();
+		assert.equal(restarted.zenMode, false);
+		for (const [field, value] of Object.entries(USER_SNAPSHOT)) {
+			assert.equal(Reflect.get(restarted, field), value, `${field} came back as the user left it`);
+		}
+		assert.equal(restarted.preZenState, null, 'the snapshot is spent once it has been restored');
+	});
+
+	test('the line-highlight toggle and zen mode reach the editor as Monaco\'s string enum', () => {
+		// A ternary on the stored 'line' / 'none' can only produce "line": any
+		// non-empty string is truthy. So the store is driven the way the menu and
+		// zen mode drive it, and what reaches an open editor is read back.
+		resetStorage();
+		const store = createStore();
+		const reaching = () => updatedEditorOptions(store, 100, true, false).renderLineHighlight;
+		assert.equal(reaching(), 'line', 'the default draws the line');
+		store.toggleLineHighlight();
+		assert.equal(reaching(), 'none', 'the toggle turns it off');
+		store.toggleLineHighlight();
+		store.toggleZenMode();
+		assert.equal(reaching(), 'none', 'zen mode turns it off');
+		store.toggleZenMode();
+		assert.equal(reaching(), 'line', 'and leaving zen mode brings it back');
+	});
+
+	test('the zen fallback is each setting own default', () => {
+		// DEFAULT_PRE_ZEN_STATE spells out six values the store already declares in
+		// its field initializers. This is what stops the two copies drifting.
+		resetStorage();
+		const fresh = createStore();
+		for (const [field, value] of Object.entries(DEFAULT_PRE_ZEN_STATE)) {
+			assert.equal(Reflect.get(fresh, field), value, `${field} default differs from the zen fallback`);
+		}
+		assert.equal(Object.keys(DEFAULT_PRE_ZEN_STATE).length, 6);
+	});
+
+	test('editor persistence is on by default, persistent, exported, and independent of auto-save', () => {
+		resetStorage();
+		const store = createStore();
+		flushSync();
+		assert.equal(store.persistOpenEditors, true);
+		const autoSave = store.autoSave;
+		store.persistOpenEditors = false;
+		flushSync();
+		assert.equal(localStorage.getItem('editor.persistOpenEditors'), 'false');
+		assert.equal(store.autoSave, autoSave);
+		const exported = settingsModule.parseSettingsFile(settingsModule.exportSettings(store));
+		assert.equal(exported.settings['editor.persistOpenEditors'], false);
+		assert.equal(createStore().persistOpenEditors, false);
+		settingsModule.applySettings(store, { 'editor.persistOpenEditors': true });
+		assert.equal(store.persistOpenEditors, true);
+	});
+
+	test('tab position survives a restart and an unknown value keeps the strip on top (#884)', () => {
+		for (const position of ['left', 'right', 'top'] as const) {
+			resetStorage({ 'editor.tabPosition': position });
+			assert.equal(createStore().tabPosition, position);
+		}
+		for (const stored of ['bottom', '', 'LEFT', 'null']) {
+			resetStorage({ 'editor.tabPosition': stored });
+			assert.equal(createStore().tabPosition, 'top', `editor.tabPosition=${JSON.stringify(stored)}`);
+		}
+		resetStorage();
+		assert.equal(createStore().tabPosition, 'top', 'a fresh install keeps the tabs where they were');
+	});
+
+	test('the tab column width is clamped to its shared range on load and on resize', () => {
+		resetStorage({ 'editor.tabColumnWidth': '9000' });
+		const store = createStore();
+		assert.equal(store.tabColumnWidth, TAB_COLUMN_WIDTH_RANGE.max);
+		store.setTabColumnWidth(10);
+		assert.equal(store.tabColumnWidth, TAB_COLUMN_WIDTH_RANGE.min);
+		resetStorage({ 'editor.tabColumnWidth': 'banana' });
+		assert.equal(createStore().tabColumnWidth, TAB_COLUMN_WIDTH_RANGE.default);
+	});
+
+	test('folder sidebar settings survive a restart and reject unknown values', () => {
+		resetStorage({ 'folder.side': 'right', 'folder.stackOrder': 'folderTop', 'folder.split': '70', 'folder.showAllFiles': 'true' });
+		const store = createStore();
+		assert.equal(store.folderSide, 'right');
+		assert.equal(store.sidebarStackOrder, 'folderTop');
+		assert.equal(store.sidebarSplit, 70);
+		assert.equal(store.folderShowAllFiles, true);
+
+		resetStorage({ 'folder.side': 'middle', 'folder.stackOrder': 'sideways', 'folder.split': '99' });
+		const fallback = createStore();
+		assert.equal(fallback.folderSide, 'left');
+		assert.equal(fallback.sidebarStackOrder, 'openFilesTop');
+		assert.equal(fallback.sidebarSplit, SIDEBAR_SPLIT_RANGE.max);
+		assert.equal(fallback.folderShowAllFiles, false);
+		fallback.setSidebarSplit(1);
+		assert.equal(fallback.sidebarSplit, SIDEBAR_SPLIT_RANGE.min);
+	});
+
+	test('the tab position select offers exactly the values the store accepts', () => {
+		const offered = settingsModule.TAB_POSITION_OPTIONS.map((option) => option.value);
+		assert.deepEqual(offered, ['top', 'left', 'right']);
+		for (const value of offered) {
+			resetStorage({ 'editor.tabPosition': value });
+			assert.equal(createStore().tabPosition, value, `${value} is offered but not kept`);
+		}
+	});
+
+	// #1029: where a file opened from outside goes when several windows are open.
+	test('the external-file target survives a restart and offers exactly the values the store accepts', async () => {
+		const { OPEN_FILE_TARGET_OPTIONS, isOpenFileTarget } = await import('../src/lib/utils/openFileTarget.js');
+		resetStorage();
+		assert.equal(createStore().openFileTarget, 'lastWindow');
+		resetStorage({ 'files.openFileTarget': 'ask' });
+		assert.equal(createStore().openFileTarget, 'ask');
+		resetStorage({ 'files.openFileTarget': 'nextWindow' });
+		assert.equal(createStore().openFileTarget, 'lastWindow');
+		assert.deepEqual(OPEN_FILE_TARGET_OPTIONS.map((option) => option.value), ['lastWindow', 'ask']);
+		assert.ok(OPEN_FILE_TARGET_OPTIONS.every((option) => isOpenFileTarget(option.value)));
+	});
+
+	test('the setting is one control, defaulting to preview', async () => {
+		const { OPEN_FILE_MODE_OPTIONS, isOpenFileMode } = await import('../src/lib/utils/openFileMode.js');
+		resetStorage();
+		assert.equal(createStore().openFileMode, 'preview');
+		// One select with the three answers the store accepts, each under its own label.
+		assert.deepEqual(OPEN_FILE_MODE_OPTIONS.map((option) => option.value), ['preview', 'editor', 'split']);
+		assert.ok(OPEN_FILE_MODE_OPTIONS.every((option) => isOpenFileMode(option.value)));
+		const labels = OPEN_FILE_MODE_OPTIONS.map((option) => option.labelKey);
+		assert.equal(new Set(labels).size, labels.length);
+	});
+});
+
+describe('settings file export and import', async () => {
+	// Settings export and import (#134). Runs under vitest for the same reason as
+	// settings.spec.ts: the store is a runes module.
+	(window as any).__TAURI_INTERNALS__ = { invoke: async () => 'macos' };
+
+	const { SettingsStore, ZOOM_LEVEL_RANGE, applySettings, createSettingsPersistence, exportSettings, parseSettingsFile } = await import(
+		'../src/lib/stores/settings.svelte.js'
+	);
+
+	type Store = InstanceType<typeof SettingsStore>;
+
+	function freshStore(): Store {
+		localStorage.clear();
+		const store = new SettingsStore();
+		onTestFinished(() => store.dispose());
+		store.osType = 'macos';
+		flushSync();
+		return store;
+	}
+
+	function importSettings(store: Store, text: string) {
+		applySettings(store, parseSettingsFile(text).settings);
+	}
+
+	function storedValues(store: Store): Record<string, string | null> {
+		return Object.fromEntries(createSettingsPersistence().map((entry) => [entry.key, entry.read(store)]));
+	}
+
+	test('an exported file imported into a fresh store reproduces every setting', () => {
+		const source = freshStore();
+		source.minimap = true;
+		source.wordWrap = 'off';
+		source.zoomLevel = 130;
+		source.theme = 'dark';
+		source.editorFont = 'Fira Code';
+		source.editorToolbarHidden = ['fmt-italic'];
+		source.tocSide = 'right';
+		const expected = storedValues(source);
+		const file = exportSettings(source);
+
+		const target = freshStore();
+		importSettings(target, file);
+		flushSync();
+
+		assert.deepEqual(storedValues(target), expected);
+		assert.equal(localStorage.getItem('editor.minimap'), 'true');
+	});
+
+	test('the file holds booleans, numbers and lists as JSON, not strings', () => {
+		const store = freshStore();
+		store.minimap = true;
+		store.zoomLevel = 130;
+		store.editorToolbarHidden = ['fmt-italic'];
+		const { markpadSettings, settings } = JSON.parse(exportSettings(store));
+
+		assert.equal(markpadSettings, 1);
+		assert.equal(settings['editor.minimap'], true);
+		assert.equal(settings.zoomLevel, 130);
+		assert.deepEqual(settings['editor.toolbarHidden'], ['fmt-italic']);
+		assert.equal(settings['editor.wordWrap'], 'on');
+	});
+
+	test('a font family left at the OS default is not exported', () => {
+		const store = freshStore();
+		store.editorFont = 'Menlo';
+		store.previewFont = 'Georgia';
+		const { settings } = JSON.parse(exportSettings(store));
+
+		assert.equal('editor.font' in settings, false);
+		assert.equal(settings['preview.font'], 'Georgia');
+	});
+
+	test('imported values are validated, and keys the file omits are kept', () => {
+		const store = freshStore();
+		store.wordWrap = 'off';
+		importSettings(
+			store,
+			JSON.stringify({
+				markpadSettings: 1,
+				settings: { zoomLevel: 99999, theme: 5, 'editor.minimap': true, 'no.such.key': 1 },
+			}),
+		);
+
+		assert.equal(store.zoomLevel, ZOOM_LEVEL_RANGE.max);
+		assert.equal(store.theme, 'system');
+		assert.equal(store.minimap, true);
+		assert.equal(store.wordWrap, 'off');
+	});
+
+	test('a file that is not a settings file is rejected before anything is applied', () => {
+		const store = freshStore();
+		for (const text of ['not json', 'null', '{"settings":{"editor.minimap":true}}', '{"markpadSettings":1,"settings":[]}']) {
+			assert.throws(() => importSettings(store, text), text);
+		}
+		assert.equal(store.minimap, false);
+	});
+
+	test('installed themes travel with the file, and non-string entries are dropped', () => {
+		const store = freshStore();
+		store.theme = 'vscode:ayu-dark';
+		const theme = '{"type":"dark","colors":{}}';
+		const file = parseSettingsFile(exportSettings(store, { 'ayu-dark': theme }));
+
+		assert.deepEqual(file.themes, { 'ayu-dark': theme });
+		assert.equal(file.settings.theme, 'vscode:ayu-dark');
+		assert.deepEqual(
+			parseSettingsFile('{"markpadSettings":1,"settings":{},"themes":{"a":"{}","b":{"type":"dark"}}}').themes,
+			{ a: '{}' },
+		);
+	});
+});
+
+describe('settings panes', async () => {
+	// Settings.svelte renders each pane by walking SETTINGS_PANES[pane].rows, so
+	// what a pane shows — which rows, in which order, under which labels, with
+	// which bounds and gates — is this data.
+	const { SettingsStore, CODE_FONT_SIZE_RANGE, EDITOR_FONT_SIZE_RANGE, EDITOR_MAX_WIDTH_RANGE, PREVIEW_FONT_SIZE_RANGE } =
+		await import('../src/lib/stores/settings.svelte.js');
+	const { SETTINGS_PANES, numberInputHandlers, setNumberSetting } = await import('../src/lib/utils/settingsPanes.js');
+	const { t } = await import('../src/lib/utils/i18n.js');
+	const { DEFAULT_PREVIEW_MAX_WIDTH, MAX_PREVIEW_MAX_WIDTH, MIN_PREVIEW_MAX_WIDTH } = await import('../src/lib/utils/previewWidth.js');
+	type Row = (typeof SETTINGS_PANES)['editor']['rows'][number];
+
+	const languages = getSupportedLanguages().map((language) => language.code);
+	const allRows = Object.values(SETTINGS_PANES).flatMap((pane) => pane.rows);
+
+	function row(id: string): Row {
+		const found = allRows.find((candidate) => candidate.id === id);
+		assert.ok(found, `no settings row ${id}`);
+		return found;
+	}
+
+	function ids(pane: keyof typeof SETTINGS_PANES): string[] {
+		return SETTINGS_PANES[pane].rows.map((candidate) => candidate.id);
+	}
+
+	function store() {
+		const created = new SettingsStore();
+		onTestFinished(() => created.dispose());
+		return created;
+	}
+
+	test('the settings panes were actually read', () => {
+		// Every assertion below is vacuous if the panes were empty, and the label
+		// one matters most for the preview pane.
+		assert.deepEqual(Object.keys(SETTINGS_PANES).sort(), ['appearance', 'editor', 'files', 'preview']);
+		assert.ok(allRows.length > 25, `found ${allRows.length} rows`);
+		assert.deepEqual(ids('preview'), [
+			'preview-max-width',
+			'preview-font',
+			'preview-font-size',
+			'code-font',
+			'code-font-size',
+			'preview-cursor',
+			'preview-occurrences',
+			'preview-annotations',
+			'preview-table-breakout',
+			'preview-table-scroll',
+			'preview-newline-breaks',
+		]);
+	});
+
+	test('no two controls in one settings pane carry the same label, in any language', () => {
+		// The preview pane shipped `preview-font` and `code-font` both under
+		// `settings.font`, and both sizes under `settings.fontSize`: four controls,
+		// two labels, nothing on screen saying which pair was the prose font. The
+		// rule is stated over what `t()` renders, so two distinct keys a locale
+		// translates the same are the same defect.
+		const collisions: string[] = [];
+		for (const [pane, { rows }] of Object.entries(SETTINGS_PANES)) {
+			for (const lang of languages) {
+				const seen = new Map<string, string>();
+				for (const { id, labelKey } of rows) {
+					const label = t(labelKey, lang);
+					const owner = seen.get(label);
+					if (owner) collisions.push(`${lang} ${pane}: ${owner} and ${id} both read "${label}"`);
+					else seen.set(label, id);
+				}
+			}
+		}
+		assert.deepEqual(collisions, []);
+	});
+
+	test('every key a settings row renders exists in English', () => {
+		// The component reaches these through `t(row.labelKey)` and friends, which
+		// the translation-coverage scanner cannot resolve on its own.
+		const keys = allRows.flatMap((candidate) => [
+			candidate.labelKey,
+			candidate.hintKey,
+			candidate.titleKey,
+			candidate.inactiveTitleKey,
+			...(candidate.kind === 'select' ? candidate.options.map((option) => option.labelKey) : []),
+		]);
+		const missing = keys.filter((key): key is TranslationKey => key !== undefined && t(key, 'en') === key);
+		assert.deepEqual(missing, []);
+	});
+
+	test('the settings UI renders its bounds from the shared range constants', () => {
+		const ranges = Object.fromEntries(
+			allRows.flatMap((candidate) => (candidate.kind === 'number' ? [[candidate.id, candidate.range]] : [])),
+		);
+		assert.deepEqual(ranges, {
+			'editor-font-size': EDITOR_FONT_SIZE_RANGE,
+			'editor-max-width': EDITOR_MAX_WIDTH_RANGE,
+			'preview-font-size': PREVIEW_FONT_SIZE_RANGE,
+			'code-font-size': CODE_FONT_SIZE_RANGE,
+		});
+		// The same objects, not copies that agree today: persistence clamps against these.
+		assert.equal(ranges['editor-font-size'], EDITOR_FONT_SIZE_RANGE);
+		assert.equal(ranges['editor-max-width'], EDITOR_MAX_WIDTH_RANGE);
+		assert.equal(ranges['preview-font-size'], PREVIEW_FONT_SIZE_RANGE);
+		assert.equal(ranges['code-font-size'], CODE_FONT_SIZE_RANGE);
+	});
+
+	test('numeric setting inputs commit through the clamp, and not while typing', () => {
+		for (const id of ['editor-font-size', 'editor-max-width', 'preview-font-size', 'code-font-size']) {
+			const numberRow = row(id);
+			assert.equal(numberRow.kind, 'number');
+			if (numberRow.kind !== 'number') continue;
+			const { range } = numberRow;
+			const settingsStore = store();
+			const handlers = numberInputHandlers(range, (value) => setNumberSetting(settingsStore, numberRow, value));
+			const input = document.createElement('input');
+			input.type = 'number';
+			input.addEventListener('input', handlers.oninput);
+			input.addEventListener('change', handlers.onchange);
+			input.addEventListener('blur', handlers.onblur);
+			input.addEventListener('keydown', handlers.onkeydown);
+			const read = () => settingsStore[numberRow.key];
+			const type = (text: string, event: Event) => {
+				input.value = text;
+				input.dispatchEvent(event);
+			};
+
+			// Half-typed numbers are left alone: the "1" of "18" is not clamped up to the minimum.
+			const before = read();
+			type('1', new Event('input'));
+			assert.equal(read(), before, `${id}: a keystroke below the range was committed`);
+			assert.equal(input.value, '1', `${id}: the field was rewritten mid-keystroke`);
+			type('', new Event('input'));
+			assert.equal(read(), before, `${id}: an empty field reached the store`);
+			type(String(range.min + range.step), new Event('input'));
+			assert.equal(read(), range.min + range.step, `${id}: an in-range value is applied as it is typed`);
+
+			// Each commit path clamps and writes the clamped value back into the field.
+			type(String(range.max + 1000), new KeyboardEvent('keydown', { key: 'Enter' }));
+			assert.equal(read(), range.max, `${id}: Enter`);
+			assert.equal(input.value, String(range.max));
+			type(String(range.min - 1000), new Event('blur'));
+			assert.equal(read(), range.min, `${id}: blur`);
+			assert.equal(input.value, String(range.min));
+			type('', new Event('change'));
+			assert.equal(read(), range.default, `${id}: change on an empty field falls back to the default`);
+			assert.equal(input.value, String(range.default));
+			type(String(range.max + 1), new KeyboardEvent('keydown', { key: 'a' }));
+			assert.equal(read(), range.default, `${id}: a key other than Enter committed`);
+		}
+	});
+
+	test('the wrap column sits under the wrap mode, and is inert without it', () => {
+		// Monaco reads `wordWrapColumn` only in that wrap mode; the prerequisite is the row above.
+		const editor = ids('editor');
+		assert.equal(editor.indexOf('editor-max-width'), editor.indexOf('editor-word-wrap') + 1);
+		const wrapColumn = row('editor-max-width');
+		const settingsStore = store();
+		for (const mode of ['off', 'on']) {
+			settingsStore.wordWrap = mode;
+			assert.equal(wrapColumn.inactive?.(settingsStore), true, `the wrap column is live with word wrap ${mode}`);
+		}
+		settingsStore.wordWrap = 'wordWrapColumn';
+		assert.equal(wrapColumn.inactive?.(settingsStore), false);
+	});
+
+	test('the word count is greyed out when there is no status bar to show it in', () => {
+		const editor = ids('editor');
+		assert.equal(editor.indexOf('editor-word-count'), editor.indexOf('editor-status-bar') + 1);
+		const wordCount = row('editor-word-count');
+		const settingsStore = store();
+		settingsStore.statusBar = false;
+		assert.equal(wordCount.inactive?.(settingsStore), true);
+		settingsStore.statusBar = true;
+		assert.equal(wordCount.inactive?.(settingsStore), false);
+	});
+
+	test('Settings exposes a bounded preview-width input and reset action', () => {
+		const width = row('preview-max-width');
+		assert.equal(width.kind, 'previewWidth');
+		if (width.kind !== 'previewWidth') return;
+		assert.equal(width.range.min, MIN_PREVIEW_MAX_WIDTH);
+		assert.equal(width.range.max, MAX_PREVIEW_MAX_WIDTH);
+
+		const settingsStore = store();
+		settingsStore.previewMaxWidth = MAX_PREVIEW_MAX_WIDTH;
+		settingsStore.codeFontSize = CODE_FONT_SIZE_RANGE.max;
+		SETTINGS_PANES.preview.reset?.(settingsStore);
+		assert.equal(settingsStore.previewMaxWidth, DEFAULT_PREVIEW_MAX_WIDTH);
+		assert.equal(settingsStore.codeFontSize, CODE_FONT_SIZE_RANGE.default);
+	});
+});
+
+describe('settings row layout', async () => {
+	/*
+	 * `.setting-item` is a two-column flex row: a leading <label> that occupies
+	 * `--settings-label-column`, then the controls. Each control class carries its
+	 * own sizing rule — `.select-wrapper` is 220px wide, `.slider-container` is
+	 * `flex: 0 0 auto`, and so on — and every one of those rules assumes the
+	 * element it names is a DIRECT child of the row, i.e. a flex item of it.
+	 *
+	 * The Appearance pane's theme row broke that assumption and nothing noticed.
+	 * It wrapped its `.select-wrapper` in an unclassed `<div>` (to stack a
+	 * "delete selected theme" link under the dropdown) and made that div a COLUMN
+	 * flex container. The flex item of the row was then the unclassed div, which
+	 * no rule sizes, and `.select-wrapper`'s `flex: 0 1 220px` was read down the
+	 * column axis, so 220px became a HEIGHT: the dropdown rendered 79px too narrow
+	 * and sat 191px below its own label.
+	 *
+	 * jsdom does no layout, so the rows are checked by shape on the mounted panes.
+	 * "A rule sizes it" is read off the element itself: Svelte puts the
+	 * component's scoping class only on elements one of its own selectors matches.
+	 */
+	const { mount, unmount } = await import('svelte');
+	const { default: Settings } = await import('../src/lib/components/Settings.svelte');
+
+	/** The control classes `.setting-item`'s row layout sizes as flex items of the row. */
+	const ROW_SIZED_CONTROLS = ['select-wrapper', 'slider-container', 'toggle', 'custom-dropdown-wrapper'];
+
+	const describeEl = (el: Element) => `<${el.tagName.toLowerCase()}${el.className ? ` class="${el.className.replace(/ ?svelte-\w+/g, '')}"` : ''}>`;
+
+	async function renderedRows() {
+		const previous = (window as any).__TAURI_INTERNALS__;
+		(window as any).__TAURI_INTERNALS__ = {
+			invoke: async (cmd: string) => {
+				if (cmd === 'get_system_fonts') return ['Menlo', 'Arial'];
+				if (cmd === 'get_saved_vscode_themes') return ['Nord'];
+				if (cmd === 'plugin:app|version') return '9.9.9';
+				return 'macos';
+			},
+			transformCallback: () => 0,
+		};
+		onTestFinished(() => ((window as any).__TAURI_INTERNALS__ = previous));
+		const target = document.createElement('div');
+		document.body.append(target);
+		const app = mount(Settings, { target, props: { show: true, theme: 'vscode:Nord', onclose() {} }, intro: false });
+		onTestFinished(() => {
+			unmount(app);
+			target.remove();
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		flushSync();
+
+		const rows: { pane: string; row: HTMLElement; label: string }[] = [];
+		const panes = [...target.querySelectorAll<HTMLButtonElement>('.nav-item')];
+		for (const pane of panes) {
+			pane.click();
+			flushSync();
+			for (const row of target.querySelectorAll<HTMLElement>('.settings-panel .setting-item')) {
+				const label = row.firstElementChild?.textContent?.replace(/\s+/g, ' ').trim() ?? '(empty row)';
+				rows.push({ pane: pane.textContent!.trim(), row, label });
+			}
+		}
+		return rows;
+	}
+
+	test('every settings row was found', async () => {
+		// Vacuous-pass guard: the row assertions below say nothing if no row rendered.
+		const rows = await renderedRows();
+		const panes = new Set(rows.map((entry) => entry.pane));
+		assert.ok(rows.length > 25, `found ${rows.length} .setting-item rows`);
+		assert.ok(panes.size >= 4, `rows in ${[...panes].join(', ')}`);
+	});
+
+	test('a settings row leads with the label that names its control', async () => {
+		const wrong = (await renderedRows())
+			.filter(({ row }) => row.firstElementChild?.tagName !== 'LABEL')
+			.map(({ pane, label, row }) => `${pane} / ${label} leads with ${row.firstElementChild ? describeEl(row.firstElementChild) : 'nothing'}`);
+		assert.deepEqual(wrong, [], 'a row whose first child is not the <label> loses the label column');
+	});
+
+	test('every control in a settings row is a flex item the stylesheet sizes', async () => {
+		// The unclassed <div> that broke the theme row would appear here.
+		const unstyled = (await renderedRows()).flatMap(({ pane, label, row }) => {
+			const scope = [...row.classList].find((name) => name.startsWith('svelte-'));
+			assert.ok(scope, `${label}: the row itself is styled`);
+			return [...row.children]
+				.slice(1)
+				.filter((child) => !child.classList.contains(scope))
+				.map((child) => `${pane} / ${label}: ${describeEl(child)} has no rule`);
+		});
+		assert.deepEqual(unstyled, [], 'a direct child of .setting-item that no rule sizes gets no column');
+	});
+
+	test('no settings row buries a sized control below its own flex level', async () => {
+		// `.select-wrapper` one level deeper is the theme-row defect: its sizing
+		// stops meaning "width" as soon as some other element becomes the flex item.
+		// `.number-input-wrapper` legitimately lives inside `.slider-container`,
+		// which is itself a direct child, so a sized parent is allowed.
+		const sized = (el: Element | null) => !!el && ROW_SIZED_CONTROLS.some((name) => el.classList.contains(name));
+		const buried = (await renderedRows()).flatMap(({ pane, label, row }) =>
+			[...row.querySelectorAll(ROW_SIZED_CONTROLS.map((name) => `.${name}`).join(','))]
+				.filter((control) => control.parentElement !== row && !sized(control.parentElement))
+				.map((control) => `${pane} / ${label}: ${describeEl(control)}`),
+		);
+		assert.deepEqual(buried, [], 'a sized control must be a direct child of its .setting-item');
+	});
+});

@@ -18,14 +18,14 @@ import {
  * was empty and the marker should therefore go away. The uninteresting part is
  * asking Monaco for the line and handing it back an edit. Keeping the first
  * part here means it can be RUN by `node --test` — every case in
- * `scripts/listContinuation.test.ts` is the real function, not a description of
+ * `scripts/editing.test.ts` is the real function, not a description of
  * it — and leaves `Editor.svelte` with a keybinding, a `when` clause and four
  * lines of plumbing, which is all that genuinely needs a browser.
  *
  * The marker vocabulary comes from ./listSyntax.ts, which is the same grammar
  * the toolbar's toggles and the preview's checkbox rewrite read. A fourth
  * spelling of "what a list marker looks like" is exactly what #631 collapsed,
- * and `scripts/singleImplementationConvention.test.ts` holds it collapsed.
+ * and the `list-marker-grammar-from-bindings` lint rule holds it collapsed.
  */
 
 /**
@@ -57,15 +57,23 @@ export type ListItem = {
  * A list item, anchored at both ends.
  *
  * The separator after the marker is REQUIRED (`[ \t]+`) and that is what keeps
- * `---` and `***` out: a thematic break is a bullet character followed by more
- * bullet characters, not by a space, so it never matches and Enter on it stays
- * Enter. The separator after a task box is optional, so that the `- [ ]` a user
- * has just typed — no trailing space yet — is recognised as the empty task item
- * it is rather than as a bullet whose text happens to be `[ ]`.
+ * `---` and `***` out. It does not keep out `- - -` or `* * *`, which are
+ * thematic breaks too; `THEMATIC_BREAK` below does that. The separator after a
+ * task box is optional, so that the `- [ ]` a user has just typed — no trailing
+ * space yet — is recognised as the empty task item it is rather than as a
+ * bullet whose text happens to be `[ ]`.
  */
 const LIST_ITEM = new RegExp(
 	String.raw`^(${LIST_MARKER_PREFIX})(${LIST_MARKER})([ \t]+)(?:(${TASK_BOX})([ \t]*))?(.*)$`,
 );
+
+/**
+ * Three or more of one of `-`, `*`, `_`, spaces allowed between them. CommonMark
+ * gives such a line to the thematic break even where it also reads as a list
+ * item, so `- - -` is a rule, and Enter on it stays Enter. `- -` is too short to
+ * be one and stays an item.
+ */
+const THEMATIC_BREAK = /^([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 
 /**
  * The whitespace a marker ends with, which the caret test below does NOT count
@@ -129,7 +137,7 @@ const ORDERED_ONLY = new RegExp(String.raw`^${ORDERED_MARKER}$`);
 /** The item `line` is, or null when it is not a list item at all. */
 export function parseListItem(line: string): ListItem | null {
 	const match = LIST_ITEM.exec(line);
-	if (!match) return null;
+	if (!match || THEMATIC_BREAK.test(line.slice(match[1].length))) return null;
 
 	const [, prefix, marker, spacing, box, boxSpacing, content] = match;
 	const markerLength =
@@ -222,13 +230,8 @@ function quoteEnter(line: string, column: number): BlockEnter | null {
  *
  * WHAT THIS FUNCTION CANNOT SEE: a fence. `- item` inside a ``` block is the
  * same six characters as `- item` outside one, and the difference lives in the
- * lines above, which never reach here — nor does the caller check, so a list or
- * a quote inside a code block is continued as if it were prose. That is not new
- * with the quote branch; it is where lists have always stood. Nothing public in
- * Monaco answers "is this line code" without re-tokenizing every line above the
- * caret, which is 27 ms at 2 000 lines and 275 ms at 20 000 — a price Enter, of
- * all keys, cannot pay. Whoever fixes it has to reach Monaco's own incremental
- * tokens or this app's semantic layer first.
+ * lines above, which never reach here. The caller asks `isInFencedCode`
+ * (./codeFence.ts) first and sends a plain Enter inside one.
  */
 export function blockEnter(line: string, column: number): BlockEnter | null {
 	const item = parseListItem(line);
@@ -444,6 +447,11 @@ function withNumber(item: ListItem, number: number): string {
  * indentation, so an item's own wrapped paragraph is scanned past and the prose
  * before the list is not.
  *
+ * An item at the same level with a different `delimiter` — the last character
+ * of the marker: `.`, `)`, or the bullet itself — is not a sibling. CommonMark
+ * starts a new list there, so `1) x` after `2. b` is a list's first item, and
+ * counting it as `3)` renumbers a list the user never touched.
+ *
  * `lineAt` rather than the document, because the cascade below has already
  * rewritten some of these lines and every later scan has to see the rewrite.
  */
@@ -452,6 +460,7 @@ function siblingAbove(
 	from: number,
 	depth: number,
 	indent: number,
+	delimiter: string,
 ): Row | null {
 	for (let line = from - 1; line >= 1; line--) {
 		const row = rowOf(lineAt(line));
@@ -462,7 +471,7 @@ function siblingAbove(
 			// Reaching that item's content column means it is the PARENT, so
 			// there is no sibling above and this line is the first of its list.
 			if (indent >= row.content) return null;
-			if (indent >= row.indent) return row;
+			if (indent >= row.indent) return row.item.marker.endsWith(delimiter) ? row : null;
 			// Deeper than this line: something nested inside an earlier sibling.
 			continue;
 		}
@@ -483,16 +492,29 @@ function siblingAbove(
  * every outliner). Shift+Tab looks for the PARENT and takes its margin, which
  * lands the line on a level that exists rather than `tabSize` columns to the
  * left of one.
+ *
+ * The sibling is `siblingAbove`'s, delimiter boundary included: `1) x` under
+ * `2. b` is the first item of a new list, so Tab has nothing to nest it under.
  */
-function targetIndent(doc: ListDocument, line: number, here: Row, back: boolean): number | null {
+function targetIndent(
+	doc: ListDocument,
+	line: number,
+	here: Row,
+	delimiter: string,
+	back: boolean,
+): number | null {
+	if (!back) {
+		const lineAt = (at: number) => doc.getLineContent(at);
+		return siblingAbove(lineAt, line, here.depth, here.indent, delimiter)?.content ?? null;
+	}
+
 	for (let above = line - 1; above >= 1; above--) {
 		const row = rowOf(doc.getLineContent(above));
 		if (row.blank) continue;
 		if (row.depth !== here.depth) break;
 
 		if (row.item) {
-			if (here.indent >= row.content) return back ? row.indent : null;
-			if (!back && here.indent >= row.indent) return row.content;
+			if (here.indent >= row.content) return row.indent;
 			continue;
 		}
 
@@ -500,8 +522,8 @@ function targetIndent(doc: ListDocument, line: number, here: Row, back: boolean)
 	}
 
 	// Nothing above owns this line. Shift+Tab still has somewhere to go if the
-	// line is indented at all; Tab has nothing to nest under.
-	return back && here.indent > 0 ? 0 : null;
+	// line is indented at all.
+	return here.indent > 0 ? 0 : null;
 }
 
 /**
@@ -533,7 +555,8 @@ export function shiftListItem(
 	if (!item) return null;
 
 	const here = rowOf(source);
-	const target = targetIndent(doc, line, here, back);
+	const delimiter = item.marker.slice(-1);
+	const target = targetIndent(doc, line, here, delimiter, back);
 	if (target === null || target === here.indent) return null;
 
 	const edited = new Map<number, string>();
@@ -548,9 +571,9 @@ export function shiftListItem(
 	// a list at whatever it says. Landing without a sibling therefore writes 1 —
 	// unless the line had no sibling before the move either, in which case it was
 	// already a list's start and `5.` is a start, not a mistake.
-	const sibling = siblingAbove(lineAt, line, here.depth, target);
+	const sibling = siblingAbove(lineAt, line, here.depth, target, delimiter);
 	const first = sibling?.number == null;
-	const started = first && siblingAbove(lineAt, line, here.depth, here.indent) === null;
+	const started = first && siblingAbove(lineAt, line, here.depth, here.indent, delimiter) === null;
 	const number = first ? (started ? here.number : 1) : sibling!.number! + 1;
 	const marker = here.number === null ? item.marker : `${number}${item.marker.slice(-1)}`;
 	const shifted = rebuild(item, prefix, marker);
@@ -581,7 +604,7 @@ export function shiftListItem(
 		// No sibling means this item is the first of its own list, and a first
 		// item nobody moved keeps the number it says: `5. 6. 7.` is a list that
 		// starts at five, not a list that is wrong.
-		const previous = siblingAbove(lineAt, below, row.depth, row.indent);
+		const previous = siblingAbove(lineAt, below, row.depth, row.indent, row.item!.marker.slice(-1));
 		const fixed =
 			previous?.number == null || previous.number + 1 === row.number
 				? text

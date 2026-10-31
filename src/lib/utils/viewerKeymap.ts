@@ -54,11 +54,14 @@ export type ViewerCommand =
 	| 'move-tab-to-next-window'
 	| 'close-file'
 	| 'new-file'
+	| 'new-window'
 	| 'open-file'
-	| 'close-window'
+	| 'app-exit'
 	| 'toggle-split-view'
 	| 'toggle-edit-view'
 	| 'toggle-live-mode'
+	| 'toggle-zen-mode'
+	| 'toggle-tabs'
 	| 'save-as'
 	| 'save'
 	| 'undo-close-tab'
@@ -70,7 +73,9 @@ export type ViewerCommand =
 	| 'zoom-out'
 	| 'zoom-reset'
 	| 'open-settings'
+	| 'toggle-home'
 	| 'export-pdf'
+	| 'reveal-file'
 	| 'find';
 
 /**
@@ -78,8 +83,8 @@ export type ViewerCommand =
  *
  * A structural subset of `KeyboardEvent` rather than the event itself, so a
  * test can hand over an object literal without a DOM. `target` is here because
- * the preview-width branch walks up from it; every other branch reads only
- * `key`, `code` and the four modifiers.
+ * the preview-width and Alt+arrow branches walk up from it; every other
+ * branch reads only `key`, `code` and the four modifiers.
  */
 export type KeyStroke = {
 	readonly key: string;
@@ -89,12 +94,24 @@ export type KeyStroke = {
 	readonly shiftKey: boolean;
 	readonly altKey: boolean;
 	readonly target?: EventTarget | null;
+	readonly getModifierState?: (key: string) => boolean;
 };
+
+/**
+ * AltGr typing a character, not a Ctrl+Alt chord.
+ *
+ * Windows sends AltGr as Ctrl+Alt, so on a Polish layout AltGr+Z (ż) is also
+ * Ctrl+Alt+Z. The AltGraph modifier is what tells them apart. `ctrlKey` is
+ * required so this cannot touch macOS, where the chords are Cmd+Option.
+ */
+export function isAltGraphChord(e: Pick<KeyStroke, 'ctrlKey' | 'getModifierState'>): boolean {
+	return e.ctrlKey && e.getModifierState?.('AltGraph') === true;
+}
 
 /**
  * Everything about the app a branch below is allowed to know.
  *
- * Six plain values, all of them read-only. Anything a command needs in order to
+ * Seven plain values, all of them read-only. Anything a command needs in order to
  * RUN — the active tab, the settings store, the window — is deliberately absent:
  * this decides which command, and the caller runs it.
  */
@@ -106,20 +123,30 @@ export type KeyContext = {
 	readonly isSplit: boolean;
 	/** Settings, the modal, the prompt or the home screen is in front. */
 	readonly overlayOpen: boolean;
+	/**
+	 * The modal or the prompt is up. Nothing is dispatched: a dialog owns the
+	 * keyboard, and a chord behind it could open a second dialog over the first.
+	 */
+	readonly dialogOpen: boolean;
 	readonly isEditing: boolean;
 	/** The caret is inside the Monaco pane, so Monaco's own Find should answer. */
 	readonly editorHasFocus: boolean;
 };
 
+const TEXT_FIELD = 'input, textarea, select, [contenteditable="true"], [role="textbox"]';
+
 /**
  * Whether the preview-width chords apply, given what the keystroke landed on.
  *
- * Exported because it is the one branch condition that reads the DOM, and the
- * only one a test cannot state as a boolean: `Mod+Alt+[` inside a text field is
- * the field's business.
+ * Exported because it reads the DOM, so a test cannot state it as a boolean:
+ * `Mod+Alt+[` inside a text field is the field's business.
  */
 export function canUsePreviewWidthShortcut(target: EventTarget | null | undefined, context: KeyContext): boolean {
 	if (context.overlayOpen || (context.isEditing && !context.isSplit)) return false;
+	return !closestIn(target, TEXT_FIELD);
+}
+
+function closestIn(target: EventTarget | null | undefined, selector: string): boolean {
 	// `typeof target.closest === 'function'` rather than `target instanceof
 	// Element`, which is what this said while it lived in the component. The
 	// module is imported by `node --test` files that have no DOM at all, where
@@ -127,8 +154,23 @@ export function canUsePreviewWidthShortcut(target: EventTarget | null | undefine
 	// against a DOM constructor is the wrong test anyway for a node from another
 	// realm. The method being called is the thing worth asking about.
 	const element = target as Element | null | undefined;
-	if (typeof element?.closest !== 'function') return true;
-	return !element.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]');
+	return typeof element?.closest === 'function' && element.closest(selector) !== null;
+}
+
+/**
+ * Whether the Alt+arrow chords belong to the field the keystroke landed on.
+ *
+ * Option+Left/Right is word-jump in a macOS text field, so the find bar, the
+ * settings fields and the tag input keep it. Monaco's own input does not: on
+ * macOS Monaco binds Option+Left/Right itself and stops the event before it
+ * gets here, and the rest — Cmd+Option+arrows, Alt+arrows off macOS — Monaco
+ * leaves unbound, so they have always switched tabs and history from the
+ * editor. `.inputarea` and `.native-edit-context` are its input under each of
+ * its two edit-context implementations.
+ */
+function arrowChordsBelongToField(target: EventTarget | null | undefined): boolean {
+	return closestIn(target, TEXT_FIELD)
+		&& !closestIn(target, '.inputarea, .native-edit-context');
 }
 
 /**
@@ -140,7 +182,7 @@ export function canUsePreviewWidthShortcut(target: EventTarget | null | undefine
  * returns a command, which is what the handler did branch by branch before.
  */
 export function viewerCommandFor(e: KeyStroke, context: KeyContext): ViewerCommand | null {
-	if (context.mode !== 'app') return null;
+	if (context.mode !== 'app' || context.dialogOpen) return null;
 
 	const cmdOrCtrl = e.ctrlKey || e.metaKey;
 	const key = e.key.toLowerCase();
@@ -160,21 +202,24 @@ export function viewerCommandFor(e: KeyStroke, context: KeyContext): ViewerComma
 	 *
 	 * The guard is here rather than repeated in fourteen branches so that a
 	 * branch added later INHERITS it by reaching for `mod`, instead of having
-	 * to remember three negations. `shortcutRegistry.test.ts` closes the other
+	 * to remember three negations. `shortcuts.test.ts` closes the other
 	 * half: any chord this function answers that the registry does not advertise
 	 * fails there, so a new branch cannot quietly grow a cross product again.
 	 *
 	 * Three branches are deliberately not written in these terms, each with its
 	 * reason at the branch: tab cycling (Shift picks the direction), zoom in
 	 * (`+` is the shifted `=`), and the Alt-only navigation chords.
+	 *
+	 * `modAlt` also refuses AltGr, which Windows sends as Ctrl+Alt: that key is
+	 * typing a character, and every Mod+Alt branch inherits the refusal here.
 	 */
 	const mod = cmdOrCtrl && !e.shiftKey && !e.altKey;
 	const modShift = cmdOrCtrl && e.shiftKey && !e.altKey;
-	const modAlt = cmdOrCtrl && !e.shiftKey && e.altKey;
+	const modAlt = cmdOrCtrl && !e.shiftKey && e.altKey && !isAltGraphChord(e);
 
-	// The macOS application menu owns ⌘Q. Document shortcuts remain in the
-	// in-window controls, so they continue to act on the current webview.
-	if (context.osType === 'macos' && mod && key === 'q') return null; // → menu-app-quit
+	// The macOS application menu owns ⌘Q: left unprevented, it reaches the
+	// menu's Quit.
+	if (context.osType === 'macos' && mod && key === 'q') return null;
 
 	if (modAlt && (code === 'BracketLeft' || code === 'BracketRight')) {
 		if (!canUsePreviewWidthShortcut(e.target, context)) return null;
@@ -189,40 +234,10 @@ export function viewerCommandFor(e: KeyStroke, context: KeyContext): ViewerComma
 	// the OS answer them, which is strictly better than answering with the one
 	// irreversible thing the app can do.
 	if (mod && key === 'w') return 'close-file';
-	// Windows only, which is the scope this binding was written to and then
-	// exceeded. `docs/requirements/157-ctrl-f4-close-tab.md`, added by the
-	// same commit as the branch itself (4670743, "add Ctrl+F4 shortcut to
-	// close active tab on Windows"), puts "macOS / Linux (dort ist Ctrl+F4
-	// kein Standard)" under "Out of scope"; the handler bound all three
-	// anyway. So this is not a new product decision, it is the documented one
-	// finally being implemented. The doc went away with the rest of docs/ in
-	// d69c181, which is how the intent stopped being checkable —
-	// `shortcutRegistry.test.ts` now holds it instead.
-	//
-	// The convention argument is why the requirement says that: Ctrl+F4
-	// closes a document window on Windows, still live in Office and the IDEs.
-	// macOS has no equivalent — Cmd+F4 means nothing, and with "Use F1, F2,
-	// etc. as standard function keys" off, which is the default, F4 runs a
-	// system function and the app never receives the event at all
-	// (hand-tested on a Mac: it did nothing). A Mac was therefore offered a
-	// THIRD route to an irreversible action that was at once non-conventional
-	// and nearly unpressable.
-	//
-	// Not a rule about odd-looking chords: `Cmd+Shift+=` stays on every
-	// platform. That one is not a platform convention, it is how "Cmd plus"
-	// is typed — `+` is the shifted `=` on every layout — so Mac users press
-	// it as much as anyone. The question is "does anyone on this platform
-	// actually press this?", not "does it carry a Shift?".
-	//
-	// A bare `osType` comparison next to #646's `platformOf` is deliberate,
-	// not an oversight. `platformOf` answers `'macos' | 'windows'` and folds
-	// Linux INTO `'windows'` — correct for the two questions it was built for
-	// (which modifier to print, which window chrome to draw) and unable to
-	// express this one, which needs all three apart. And the reason to avoid a
-	// bare comparison does not apply to this spelling: `osType` is `'unknown'`
-	// until the Rust command answers, and `=== 'windows'` resolves that window
-	// to DO NOT FIRE. It fails closed, which is the only acceptable direction
-	// for a branch that throws a document away.
+	// Windows only: Ctrl+F4 closes a document there. On macOS it is no
+	// convention, and F4 usually runs a system function before the app sees it.
+	// A bare `osType` check rather than `platformOf`, which folds Linux into
+	// Windows. `'unknown'` at startup does not match, so it fails closed.
 	if (context.osType === 'windows' && mod && code === 'F4') return 'close-file';
 	// New file, both keys, whether or not the editor has focus (#392).
 	//
@@ -239,10 +254,11 @@ export function viewerCommandFor(e: KeyStroke, context: KeyContext): ViewerComma
 	// `file-new` binds Ctrl/Cmd+N as well, and this handler used to know
 	// about only one of the two, which left Ctrl+N doing nothing at all
 	// outside the editor. Both are listed here so the two paths cannot
-	// drift again; `formatShortcutKeymap.test.ts` holds them equal.
+	// drift again; `shortcuts.editor.test.ts` holds them equal.
 	if (mod && (key === 't' || key === 'n')) return 'new-file';
+	if (modShift && key === 'n') return 'new-window';
 	if (mod && key === 'o') return 'open-file';
-	if (mod && key === 'q') return 'close-window';
+	if (mod && key === 'q') return 'app-exit';
 	if (mod && (code === 'Backslash' || code === 'IntlBackslash')) return 'toggle-split-view';
 	if (mod && key === 'e') return 'toggle-edit-view';
 	// Mod+L had only the Monaco half (`editorAction` in shortcuts.ts), so it
@@ -250,6 +266,12 @@ export function viewerCommandFor(e: KeyStroke, context: KeyContext): ViewerComma
 	// the exact inverse of where the Auto-Reload button was drawn (#692). The
 	// panel advertised the chord in every mode regardless.
 	if (mod && key === 'l') return 'toggle-live-mode';
+	// Zen had only the Monaco half, so it did nothing in the preview (#800).
+	// `code`, not `key`: Option turns Z into Ω on a Mac.
+	if (modAlt && code === 'KeyZ') return 'toggle-zen-mode';
+	// Both halves, like Zen: off macOS no menu accelerator sits behind the
+	// preview to catch the chord.
+	if (modShift && key === 'b') return 'toggle-tabs';
 	// Save As. The app menu advertised this chord for as long as the menu has
 	// existed, but nothing ever bound it: the branch below matched on
 	// `cmdOrCtrl && key === 's'` with no Shift guard, so the advertised
@@ -266,6 +288,7 @@ export function viewerCommandFor(e: KeyStroke, context: KeyContext): ViewerComma
 	if (mod && code === 'PageDown') return 'next-tab';
 	// Alt-based chords, so they say what they need by hand: `mod` would demand
 	// Alt be up, which is the opposite of what these two bind.
+	if ((code === 'ArrowLeft' || code === 'ArrowRight') && e.altKey && arrowChordsBelongToField(e.target)) return null;
 	if (e.metaKey && !e.ctrlKey && e.altKey && !e.shiftKey && code === 'ArrowLeft') return 'previous-tab';
 	if (e.metaKey && !e.ctrlKey && e.altKey && !e.shiftKey && code === 'ArrowRight') return 'next-tab';
 	if (e.altKey && !e.shiftKey && !cmdOrCtrl && code === 'ArrowLeft') return 'history-back';
@@ -275,18 +298,21 @@ export function viewerCommandFor(e: KeyStroke, context: KeyContext): ViewerComma
 	// outright and leave Cmd+Shift+= — how a lot of people zoom in — dead. The
 	// guard is per-spelling instead: bare `=` wants no Shift, `+` brings its
 	// own. (The keymap harness only ever fires unshifted characters, so it sees
-	// the `=` half of this and never the `+` half; `viewerKeymap.test.ts` fires
+	// the `=` half of this and never the `+` half; `shortcuts.spec.ts` fires
 	// the `+` half directly.)
 	if (cmdOrCtrl && !e.altKey && (key === '+' || (key === '=' && !e.shiftKey))) return 'zoom-in';
 	if (mod && key === '-') return 'zoom-out';
 	if (mod && key === '0') return 'zoom-reset';
 	if (mod && key === ',') return 'open-settings';
+	if (modShift && key === 'h') return 'toggle-home';
 	// Export as PDF. Not the `Mod+Shift+E` the request asked for: Inline Code has
 	// held that since the formatting chords were added, and the editor toolbar
 	// prints it. `P` is the print mnemonic every app shares, and the unshifted
 	// `Mod+P` is already the command palette — the same place Obsidian puts it,
 	// which is where this app's users are coming from.
 	if (modShift && key === 'p') return 'export-pdf';
+	// Had only the Monaco half, so it did nothing in the preview.
+	if (modShift && key === 'r') return 'reveal-file';
 	// Ctrl/Cmd+F: route to either Monaco's built-in find or the preview
 	// FindBar depending on focus and which panes are visible. The caller only
 	// preventDefaults when it takes the action itself — otherwise Monaco's own
@@ -295,4 +321,21 @@ export function viewerCommandFor(e: KeyStroke, context: KeyContext): ViewerComma
 	if (mod && key === 'f' && !context.editorHasFocus) return 'find';
 
 	return null;
+}
+
+/**
+ * The viewer's keydown handler: a keystroke that means a command is prevented
+ * before the command runs, in every mode. Reading mode would otherwise surface
+ * the webview's own Save Page dialog on Ctrl+S. A chord that means nothing is
+ * left alone.
+ */
+export function dispatchViewerKey(
+	e: KeyStroke & { preventDefault: () => void },
+	context: KeyContext,
+	run: (command: ViewerCommand) => void,
+): void {
+	const command = viewerCommandFor(e, context);
+	if (!command) return;
+	e.preventDefault();
+	run(command);
 }

@@ -1,7 +1,7 @@
 /**
  * Markdown input → `convert_markdown` output, captured from a real comrak run.
  *
- * These are INPUTS, not expected values: `renderProtocol.test.ts` feeds the
+ * These are INPUTS, not expected values: `preview.render.test.ts` feeds the
  * `html` of each case to the frontend's `processMarkdownHtml` and asserts what
  * the frontend does with it. Nothing here re-asserts comrak's own behaviour —
  * that is `src-tauri/src/lib.rs`'s `mod tests` job, and it already covers it.
@@ -69,6 +69,10 @@ export const renderFixtures = {
 	taskStarPlus: {
 		markdown: "* [ ] star marker\n+ [x] plus marker\n",
 		html: "<ul data-sourcepos=\"1:1-1:17\">\n<li data-sourcepos=\"1:1-1:17\"><input type=\"checkbox\" data-task-checkbox=\"\" disabled=\"\" /> star marker</li>\n</ul>\n<ul data-sourcepos=\"2:1-2:17\">\n<li data-sourcepos=\"2:1-2:17\"><input type=\"checkbox\" data-task-checkbox=\"\" checked=\"\" disabled=\"\" /> plus marker</li>\n</ul>\n",
+	},
+	taskTextAfterBlock: {
+		markdown: "- [ ] task\n  ```sh\n  make\n  ```\n  then **check** it\n- [ ] next\n",
+		html: "<ul class=\"contains-task-list\" data-sourcepos=\"1:1-6:10\">\n<li data-sourcepos=\"1:1-5:19\"><input type=\"checkbox\" data-task-checkbox=\"\" class=\"task-list-item-checkbox\" disabled=\"\" /> task\n<pre data-sourcepos=\"2:3-4:5\"><code class=\"language-sh\">make\n</code></pre>\nthen <strong data-sourcepos=\"5:8-5:16\">check</strong> it</li>\n<li data-sourcepos=\"6:1-6:10\"><input type=\"checkbox\" data-task-checkbox=\"\" class=\"task-list-item-checkbox\" disabled=\"\" /> next</li>\n</ul>\n",
 	},
 	// --- protocol 2 — $$…$$ underscore protection (issue #174 shapes) ---
 	mathBracedSubscripts: {

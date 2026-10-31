@@ -1,0 +1,46 @@
+import { commands } from '../bindings.js';
+
+import type { ViewerWindowEntry } from './viewerWindows.js';
+
+/**
+ * A new window learns which pinned group to open from its own label.
+ * `create_transfer_window` builds `window-<token>`, and a label only takes
+ * `[A-Za-z0-9-/:_]`, so the tag name travels hex-encoded. The trailing nonce
+ * keeps labels unique when the same group is opened again later.
+ */
+export function pinnedWindowToken(name: string, nonce: number): string {
+	const hex = Array.from(new TextEncoder().encode(name), (byte) => byte.toString(16).padStart(2, '0')).join('');
+	return `pinned-${hex}-${nonce}`;
+}
+
+export function pinnedTagFromWindowLabel(label: string): string | null {
+	const hex = /^window-pinned-((?:[0-9a-f]{2})+)-\d+$/.exec(label)?.[1];
+	if (hex === undefined) return null;
+	return new TextDecoder().decode(Uint8Array.from(hex.match(/../g)!, (pair) => parseInt(pair, 16)));
+}
+
+/** The window already holding `name` as its tag, other than `self`. */
+export async function pinnedTagHolder(name: string, self?: string): Promise<string | undefined> {
+	const windows = await commands.listViewerWindows();
+	return windows.find((window) => window.tag_name === name && window.label !== self)?.label;
+}
+
+/**
+ * `tagName` makes the backend record the new window as the group's holder at
+ * once, so a second click before the window mounts focuses it instead of
+ * opening the group twice.
+ */
+export async function openPinnedTagWindow(name: string): Promise<void> {
+	const holder = await pinnedTagHolder(name);
+	if (holder) await commands.focusWindow(holder);
+	else await commands.createTransferWindow(pinnedWindowToken(name, Date.now()), name);
+}
+
+/** New Window stages no tab, so its window must not try to claim one. */
+export function isNewWindowLabel(label: string): boolean {
+	return /^window-new-\d+$/.test(label);
+}
+
+export async function openNewWindow(): Promise<void> {
+	await commands.createTransferWindow(`new-${Date.now()}`, null);
+}

@@ -44,7 +44,7 @@ If you ever lose the private key:
 
 ### 5. `alecdotdev/Markpad` is load-bearing
 
-The updater endpoint in `src-tauri/tauri.conf.json` points at **`sftwrdotdev/Markpad`**. (`scripts/releaseWorkflow.test.ts` holds that name and the endpoint together — if the repository ever moves again, this line moves with it.)
+The updater endpoint in `src-tauri/tauri.conf.json` points at **`sftwrdotdev/Markpad`**. (`scripts/release.workflows.test.ts` holds that name and the endpoint together — if the repository ever moves again, this line moves with it.)
 
 That only helps builds made from here on. The endpoint is compiled into the binary, so every copy up to and including v2.7.0 asks GitHub for `https://github.com/alecdotdev/Markpad/releases/latest/download/latest.json` and reaches the current feed only because GitHub answers with a 301. Those installs use that redirect for as long as they run.
 
@@ -58,20 +58,38 @@ The failure is quiet and unfixable from here: `latest.json` 404s, the updater re
 
 **`build.yml` checks this before creating a release.** It fetches that URL and asserts the feed's download URLs still name this repository. A network failure warns instead of blocking.
 
-### 6. Optional: a stable macOS signing identity
+### Official macOS signing and notarization
 
-This is unrelated to the minisign keypair above, and it is not the Apple Developer Program. Skip it and macOS releases behave exactly as they did before.
+Configure these repository Actions secrets before the next release:
 
-**What it buys.** macOS binds a persisted file-access grant — including the Full Disk Access checkbox — to the app's *designated requirement*, not to its bytes. Today's bundles carry no certificate, so the requirement is a content hash that changes with every build, and every update looks like a different app to TCC. Users re-grant folder access after each release ([#209](https://github.com/sftwrdotdev/Markpad/issues/209)). Signing with a certificate that outlives releases replaces that hash with `identifier "com.alecdotdev.markpad" and certificate leaf = H"..."`, which does not move when the code does.
+| Name | Value |
+|---|---|
+| `APPLE_DEVELOPER_ID_P12` | Base64 of the project's Developer ID Application certificate and private key exported as PKCS#12 |
+| `APPLE_DEVELOPER_ID_PASSWORD` | PKCS#12 export password |
+| `APPLE_DEVELOPER_ID_SHA1` | The certificate's 40-character SHA-1 fingerprint, not its shared common name |
+| `APPLE_ID` | Apple account email authorized for notarization |
+| `APPLE_APP_SPECIFIC_PASSWORD` | An app-specific password for that account |
+| `APPLE_TEAM_ID` | The certificate's 10-character Apple team ID |
 
-**What it does not buy.** Nothing about Gatekeeper. The app stays un-notarized, so a downloaded `.dmg` still warns on first launch — the same as today.
+The new certificate takes precedence over the legacy `MACOS_*` secrets below.
+Setting any `APPLE_DEVELOPER_ID_*` secret requires all six values. Missing or
+invalid credentials stop the release; they never fall back to legacy signing.
+With none of the three new certificate secrets, the existing flow is unchanged.
+Tauri receives the app-specific password as `APPLE_PASSWORD` and notarizes the
+app before creating the updater archive. The workflow checks the extracted
+archive and the app inside the DMG, then uploads only after verifying their
+Developer ID signatures and stapled tickets. The DMG is also signed, notarized
+and stapled. See [Tauri's macOS signing guide](https://v2.tauri.app/distribute/sign/macos/).
 
-**Create the certificate** (once, on a Mac, no Apple account involved):
+Keep `TAURI_SIGNING_PRIVATE_KEY`, its password, `plugins.updater.pubkey` and the
+updater endpoint unchanged. Apple signing and the existing updater signature are
+independent. The first Developer ID build may require users to grant folder
+access once more when migrating from the earlier identity. Do not claim a release
+is notarized until the macOS verification step passes.
 
-1. Keychain Access → menu bar → *Certificate Assistant* → *Create a Certificate…*
-2. Name it `markpad-codesign-certificate`, Identity Type *Self Signed Root*, Certificate Type **Code Signing**, and tick *Let me override defaults*.
-3. **Set the validity period to something long — 7300 days.** The default is 365, and an expired certificate is as disruptive as a lost one.
-4. Finish, then right-click the certificate → *Export…* → `.p12`, and set a password.
+### 6. Legacy: self-signed macOS signing identity
+
+Superseded by [Developer ID signing](#official-macos-signing-and-notarization). `build.yml` still uses these secrets when no `APPLE_DEVELOPER_ID_*` secret is set. Releases signed this way keep folder grants across updates but are not notarized.
 
 **Add three secrets** (Settings → Secrets and variables → Actions):
 
@@ -83,7 +101,7 @@ This is unrelated to the minisign keypair above, and it is not the Apple Develop
 
 With all three set, the macOS job imports the certificate into a throwaway keychain and `tauri build` signs with it. With `MACOS_CERTIFICATE` absent, the step prints one line and exits.
 
-### 7. CRITICAL: the signing certificate has no revocation path
+### 7. CRITICAL: the legacy self-signed certificate has no revocation path
 
 Apple can revoke a Developer ID certificate. Nobody can revoke this one. Two consequences worth accepting deliberately before step 6:
 
@@ -94,7 +112,7 @@ Back it up in the same place as the minisign private key, and treat it with the 
 
 ## Per-release workflow
 
-The workflow uses `npm ci`, so its installed dependency graph is exactly the committed lockfile. Do not replace it with `npm install` in release jobs. `scripts/releaseWorkflow.test.ts` guards that.
+The workflow uses `npm ci`, so its installed dependency graph is exactly the committed lockfile. Do not replace it with `npm install` in release jobs. `scripts/release.workflows.test.ts` guards that.
 
 [`snapcraft.yaml`](snapcraft.yaml) builds nothing. It packages the `.deb` the release already shipped (`plugin: dump`, `source-type: deb`), so the snap carries the same binary as the `.deb` and the AppImage. The same test asserts it is packaging rather than building.
 
@@ -125,7 +143,7 @@ The workflow uses `npm ci`, so its installed dependency graph is exactly the com
 4. **Wait** ~30 min for matrix builds to finish, plus ~2 min for `generate-update-feed`.
 5. **Open the draft release** on the [Releases page](https://github.com/sftwrdotdev/Markpad/releases). Verify the assets:
    - **macOS**: `*.dmg`, `*.app.tar.gz`, `*.app.tar.gz.sig`
-     - Once one-time setup step 6 is done, check the signature took as well: mount the `.dmg` and run `codesign -d -r-` against the `.app` inside it. It must print `certificate leaf = H"…"`. `code object is not signed at all` means the secrets are missing or the import step exited early — the build is green either way, and shipping it costs every macOS user their folder grants again.
+     - The workflow verifies the Developer ID signature and stapled tickets before upload. To spot-check the draft: mount the `.dmg` and run `spctl -a -vv` against the `.app` inside it. It must print `source=Notarized Developer ID`.
    - **Windows x64**: `Markpad_<version>_x64.exe` (portable), `*_x64-setup.exe` (NSIS installer), `*_x64-setup.exe.sig`
    - **Windows ARM64**: `Markpad_<version>_arm64.exe` (portable), `*_arm64-setup.exe` (NSIS installer), `*_arm64-setup.exe.sig`
    - **Linux**: `*.deb`, `*.rpm`, `*.AppImage`, `*.AppImage.sig`
@@ -141,19 +159,12 @@ Mention this clearly in the release notes for the first auto-update-capable vers
 
 > This release activates in-app auto-updates. **Install it manually one last time** — future releases will update Markpad on their own.
 
-## First signed macOS release
-
-Turning on one-time setup step 6 changes the app's identity once. Existing bundles are pinned to an ad-hoc content hash; the signed one is pinned to the certificate, so to macOS the first signed release is a different app. Its users grant folder access one last time, and from then on the grant survives updates. No other platform is affected.
-
-Say so in that release's notes, e.g.:
-
-> macOS will ask for folder access once more after this update. **This is the last time** — from this release on, the permission carries across updates.
-
 ## Coverage notes
 
 - **macOS** uses one universal binary (`darwin-aarch64` + `darwin-x86_64` share the same `.app.tar.gz` and signature).
 - **Windows** uses NSIS — the auto-updater downloads `*-setup.exe` (verified by `*-setup.exe.sig`) and runs it in `passive` install mode. The existing raw portable `.exe` distribution path is preserved alongside, so users who download the portable `.exe` directly continue to work; only the auto-updater path uses the NSIS installer.
 - **Linux**: only `AppImage` users get auto-updates — `tauri-plugin-updater` doesn't support `.deb` or `.rpm`, and there is no apt or dnf repository either. `.deb` and `.rpm` are therefore one-time installs: those users upgrade by downloading a newer package, and the app's *Check for Updates…* tells them so rather than offering one. This is stated in the README as well; if a repository is ever published, both change together.
+- **Homebrew**: the [`markpad` cask](https://github.com/Homebrew/homebrew-cask/blob/main/Casks/m/markpad.rb) lives in Homebrew's repository, not here. Homebrew's bot bumps it from the git tags and downloads `Markpad_<version>_universal.dmg` from the release, so a tag pushed before its release is published can produce a bump that fails until the release is out. Renaming the `.dmg` or shipping a build that Gatekeeper rejects breaks the cask. The cask declares `auto_updates`, so the app still updates itself.
 - **Snap / Chocolatey**: independent distribution channels, published by `publish-packages.yml` after the release is published. Their update mechanisms are unaffected. The Chocolatey package wraps the release's own `Markpad_<version>_x64.exe` rather than a second build, which is what `packaging/choco/tools/VERIFICATION.txt` promises.
 
 ## Troubleshooting
@@ -173,6 +184,5 @@ Say so in that release's notes, e.g.:
 
 ## Out of scope (not handled by this workflow)
 
-- **Apple Developer ID code-signing & notarization** — not done, and one-time setup step 6 is not a substitute: a self-signed certificate gives the bundle a stable identity for TCC, but macOS still shows a Gatekeeper warning on first launch because the app is not notarized. Minisign verification by the updater is independent of both.
 - **Windows Authenticode signing** — neither the portable `.exe` nor the `*-setup.exe` NSIS installer is signed with a code-signing certificate. Users may see a SmartScreen warning. Minisign verification by the updater is independent.
 - **Retroactive signing** of older releases.

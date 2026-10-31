@@ -1,29 +1,78 @@
 use crate::fs_safety::atomic_write;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
-use tauri::{AppHandle, Emitter, Manager, State};
+use std::time::Duration;
+use tauri::{AppHandle, Manager, Runtime, State};
+use tauri_specta::Event;
 
 pub struct WatcherState {
     pub(crate) watchers: Mutex<HashMap<String, RecommendedWatcher>>,
+    /// Window label -> the newest watch request it made. Arming runs on the
+    /// thread pool and can take seconds on a network share, so requests can
+    /// finish out of order; only the newest may install its watcher.
+    latest: Mutex<HashMap<String, u64>>,
+    next_request: AtomicU64,
 }
 
 impl WatcherState {
     pub fn new() -> Self {
         Self {
             watchers: Mutex::new(HashMap::new()),
+            latest: Mutex::new(HashMap::new()),
+            next_request: AtomicU64::new(0),
         }
+    }
+
+    /// Makes a new request for `label`, superseding any still arming.
+    fn request(&self, label: &str) -> u64 {
+        let id = self.next_request.fetch_add(1, Ordering::SeqCst) + 1;
+        lock_recover(&self.latest).insert(label.to_string(), id);
+        id
+    }
+
+    /// Installs `watcher` for request `id` unless a newer request (or the
+    /// window's destruction) came in behind it. A refused watcher is dropped,
+    /// which unregisters it.
+    fn install(&self, label: String, id: u64, watcher: RecommendedWatcher) -> bool {
+        let latest = lock_recover(&self.latest);
+        if latest.get(&label) != Some(&id) {
+            return false;
+        }
+        lock_recover(&self.watchers).insert(label, watcher);
+        true
+    }
+
+    /// Stops `label`'s watch, including one still arming.
+    fn unwatch(&self, label: &str) {
+        self.request(label);
+        lock_recover(&self.watchers).remove(label);
+    }
+
+    /// The window is gone: no request of its own can install after this.
+    pub(crate) fn forget_window(&self, label: &str) {
+        let mut latest = lock_recover(&self.latest);
+        latest.remove(label);
+        lock_recover(&self.watchers).remove(label);
     }
 }
 
+/// The window Tauri builds at launch. Only startup tells it apart: it adopts a
+/// remembered window when it has no snapshot of its own, takes the files the
+/// launch was started with, and shows itself without taking focus. Its files
+/// keep their pre-per-window names, so an older build still finds them.
+pub const LAUNCH_LABEL: &str = "main";
+
 pub struct AppState {
-    pub(crate) startup_files: Mutex<Vec<String>>,
+    /// Paths the launch was asked to open. `Some` until the launch window takes
+    /// them; after that a path opened goes straight to a window.
+    startup_files: Mutex<Option<Vec<String>>>,
     pub(crate) last_focused_viewer: Mutex<Option<String>>,
     window_registry: Mutex<HashMap<String, WindowMeta>>,
     window_counter: AtomicU64,
@@ -31,6 +80,36 @@ pub struct AppState {
     /// a critical section rather than a value, so the payload is `()` — see
     /// `update_pinned_tags` for why the whole cycle has to be inside it.
     pinned_tags: Mutex<()>,
+    /// `Some` while a quit is in progress, holding the windows it has closed so
+    /// far: a cancelled quit forgets them, since the user carries on without.
+    quit: Mutex<Option<Vec<String>>>,
+    /// Remembered windows are reopened once per launch, by the first caller.
+    reopened: AtomicBool,
+    /// Orphan backups already handed to a window this launch.
+    claimed_recovery: Mutex<HashSet<String>>,
+    /// The files each window has open, as it last reported them
+    /// (`set_window_files`): a tab's `pathKey`, or its path while it has none.
+    /// A window has no entry until its restore has finished; `file_holder`
+    /// answers from its snapshot until then.
+    open_files: Mutex<HashMap<String, Vec<String>>>,
+    /// Launch files routed to the window that already has them open.
+    launch_routing: Mutex<LaunchRouting>,
+}
+
+/// Launch files that belong to a window other than the launch window, because
+/// that window is restoring a tab on them. A window takes its share when it
+/// asks `send_markdown_path`; one that asked before the launch window handed
+/// the files out is sent them as `file-path` instead.
+#[derive(Default)]
+struct LaunchRouting {
+    asked: HashSet<String>,
+    routed: HashMap<String, Vec<String>>,
+    /// `windows-restored` has been sent. It is sent once per run.
+    restored: bool,
+    /// The last window that took launch files, brought back to the front once
+    /// every window has restored: a window that finishes restoring later comes
+    /// up over it.
+    took_files: Option<String>,
 }
 
 /// Locks `mutex`, recovering the guarded value if a previous holder panicked.
@@ -54,16 +133,90 @@ pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 impl AppState {
     pub fn new() -> Self {
         Self {
-            startup_files: Mutex::new(Vec::new()),
+            startup_files: Mutex::new(Some(Vec::new())),
             last_focused_viewer: Mutex::new(None),
             window_registry: Mutex::new(HashMap::new()),
             window_counter: AtomicU64::new(0),
             pinned_tags: Mutex::new(()),
+            quit: Mutex::new(None),
+            reopened: AtomicBool::new(false),
+            claimed_recovery: Mutex::new(HashSet::new()),
+            open_files: Mutex::new(HashMap::new()),
+            launch_routing: Mutex::new(LaunchRouting::default()),
         }
+    }
+
+    /// A viewer window's own report of itself. Its number is given on its first
+    /// report and kept, so the Move-to-window list stays in creation order.
+    fn record_window_meta(
+        &self,
+        label: String,
+        tag_name: Option<String>,
+        tag_color: Option<String>,
+        active_tab_title: String,
+        tab_count: usize,
+    ) {
+        let mut registry = lock_recover(&self.window_registry);
+        let entry = registry.entry(label).or_insert_with(|| WindowMeta {
+            number: self.window_counter.fetch_add(1, Ordering::SeqCst) + 1,
+            tag_name: None,
+            tag_color: None,
+            active_tab_title: String::new(),
+            tab_count: 0,
+        });
+        entry.tag_name = tag_name;
+        entry.tag_color = tag_color;
+        entry.active_tab_title = active_tab_title;
+        entry.tab_count = tab_count;
+    }
+
+    fn viewer_windows(&self) -> Vec<WindowListEntry> {
+        let registry = lock_recover(&self.window_registry);
+        let mut list: Vec<WindowListEntry> = registry
+            .iter()
+            .map(|(label, meta)| WindowListEntry {
+                label: label.clone(),
+                meta: meta.clone(),
+            })
+            .collect();
+        list.sort_by_key(|entry| entry.meta.number);
+        list
+    }
+
+    /// A closed window is no longer a move target, and a quit under way
+    /// remembers that it closed it.
+    fn window_destroyed(&self, label: &str) {
+        lock_recover(&self.window_registry).remove(label);
+        lock_recover(&self.open_files).remove(label);
+        let mut routing = lock_recover(&self.launch_routing);
+        routing.asked.remove(label);
+        routing.routed.remove(label);
+        drop(routing);
+        if let Some(closed) = lock_recover(&self.quit).as_mut() {
+            closed.push(label.to_string());
+        };
     }
 }
 
-#[derive(Clone, serde::Serialize)]
+/// `file-path`: a file the OS asked this window to open.
+#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type, tauri_specta::Event)]
+pub struct FilePath(pub String);
+
+/// `file-changed`: the file this window watches changed on disk.
+#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type, tauri_specta::Event)]
+pub struct FileChanged(pub String);
+
+/// `windows-restored`: every window of the launch has finished its restore, so
+/// the window list is complete. Sent once, to every window. See
+/// `announce_restored`.
+#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type, tauri_specta::Event)]
+pub struct WindowsRestored;
+
+/// `tab-transfer-offer`: another window offers this one a staged tab (its token).
+#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type, tauri_specta::Event)]
+pub struct TabTransferOffer(pub String);
+
+#[derive(Clone, serde::Serialize, specta::Type)]
 struct WindowMeta {
     number: u64,
     tag_name: Option<String>,
@@ -72,24 +225,34 @@ struct WindowMeta {
     tab_count: usize,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, specta::Type)]
 pub struct WindowListEntry {
     label: String,
     #[serde(flatten)]
     meta: WindowMeta,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type)]
 pub struct PinnedTag {
     pub name: String,
     pub color: String,
     pub files: Vec<String>,
 }
 
-fn pinned_tags_path(app: &AppHandle) -> Result<std::path::PathBuf, crate::error::Error> {
-    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join("pinned-tags.json"))
+/// `name` in the app config dir, which is created if missing.
+pub(crate) fn config_file(app: &AppHandle, name: &str) -> Result<PathBuf, crate::error::Error> {
+    Ok(config_dir(app)?.join(name))
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn pinned_tags_path(app: &AppHandle) -> Result<PathBuf, crate::error::Error> {
+    config_file(app, "pinned-tags.json")
 }
 
 /// Reads the pin list, treating an unreadable or unparseable file as empty.
@@ -133,55 +296,9 @@ fn read_pinned_tags(app: &AppHandle) -> Vec<PinnedTag> {
 /// on disk:  [x]                             [x, a]        [x, b]   ← "a" gone
 /// ```
 ///
-/// Tauri dispatches commands on a thread pool and every window can call these,
-/// so the interleaving is reachable whenever two windows persist their pins at
-/// once — which is exactly what quitting with ⌘Q does, since each window saves
-/// its pinned tag from its own close handler.
-///
-/// This is the same defect the frontend fixed in #405 for the recent-files
-/// list, where a re-read alone was enough. The previous revision of this
-/// comment — written here, by #424, the change that added this lock —
-/// explained why by saying that `localStorage` is per-document and
-/// single-threaded,
-/// "making an RMW cycle atomic by construction". That is false, and it is
-/// corrected here rather than softened, because someone reasoning from it
-/// about some other shared `localStorage` key would conclude they need no
-/// synchronisation at all. Each *document* is single-threaded; two Markpad
-/// windows are two documents sharing one origin's storage area. The storage
-/// mutex the HTML standard describes for exactly this case is not implemented
-/// by any shipping engine, WebKit and WebView2 included, so a `getItem` …
-/// `setItem` pair in one window can interleave with the other window's and
-/// lose precisely the update drawn above.
-///
-/// What the re-read buys is a narrower window, not atomicity:
-///
-/// - Before it, the exposure was the whole lifetime of a window's in-memory
-///   copy — from the last time that window looked at the list until it next
-///   wrote, which is minutes. After it, the cycle is one synchronous turn of
-///   the event loop containing no `await`: `getItem`, a `JSON.parse` of at
-///   most nine short strings, `setItem`.
-/// - The writes happen on discrete user actions (open a file, remove an
-///   entry, rename), so colliding means two windows landing inside those
-///   microseconds.
-/// - What a collision costs is one entry of a recent-file list, which the
-///   next open puts back.
-///
-/// It is a residual race, accepted on those three grounds — not a guarantee.
-/// None of the three holds here. This cycle is a file read, a parse, a
-/// serialize and an `atomic_write`: milliseconds of I/O on a preemptively
-/// scheduled thread pool, not microseconds of straight-line JS. The collision
-/// is not a coincidence but the ordinary shape of quitting, since ⌘Q makes
-/// every window write from its own close handler at once. And a dropped pin is
-/// a thing the user made, with nothing to recreate it from. Unlocked, this
-/// cycle was measured losing updates; hence the lock.
-///
-/// Serialising also keeps two `atomic_write` calls off the same target at
-/// once, which is not something `atomic_write` handles either: its temp file
-/// is named from the target name, the pid and a nanosecond clock reading, so
-/// two threads of one process that land on the same reading collide on
-/// `create_new` — and the loser's cleanup then deletes the temp file the
-/// winner was about to rename. Both spellings of that failure showed up in the
-/// unlocked measurements (`File exists`, `No such file or directory`).
+/// Tauri runs commands on a thread pool and ⌘Q makes every window save its
+/// pin from its own close handler at once, so this interleaving is the normal
+/// case. Unlocked, this cycle was measured losing pins.
 fn update_pinned_tags(
     lock: &Mutex<()>,
     path: &Path,
@@ -195,21 +312,68 @@ fn update_pinned_tags(
     Ok(())
 }
 
+/// Reports whether a pin named `name` existed. A window's closing save
+/// refreshes that pin's `color` and `files` and never makes one: another window
+/// may have unpinned the tag in the meantime. The explicit pin passes `create`
+/// and only ever makes one: a pin already holding the name is a group the user
+/// made earlier, likely in a window now closed, so it is left alone, as
+/// `rename_pinned_tag_at` leaves it, rather than replaced.
 fn save_pinned_tag_at(
     lock: &Mutex<()>,
     path: &Path,
     name: String,
     color: String,
     files: Vec<String>,
-) -> Result<(), crate::error::Error> {
-    update_pinned_tags(lock, path, move |tags| {
+    create: bool,
+) -> Result<bool, crate::error::Error> {
+    let mut found = false;
+    update_pinned_tags(lock, path, |tags| {
         if let Some(tag) = tags.iter_mut().find(|tag| tag.name == name) {
-            tag.color = color;
-            tag.files = files;
-        } else {
+            found = true;
+            if !create {
+                tag.color = color;
+                tag.files = files;
+            }
+        } else if create {
             tags.push(PinnedTag { name, color, files });
         }
-    })
+    })?;
+    Ok(found)
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum PinnedTagRename {
+    Renamed,
+    /// Another window unpinned the tag in the meantime.
+    Missing,
+    /// Another pin already holds the new name.
+    Taken,
+}
+
+/// Renames a pin in place, keeping its files and taking the new colour. The
+/// closing save finds the entry by the window's current name, so a rename the
+/// file never heard of unpinned the window at close. A name another pin holds
+/// is refused rather than merged: the two are separate groups the user made,
+/// and folding one into the other could not be undone.
+fn rename_pinned_tag_at(
+    lock: &Mutex<()>,
+    path: &Path,
+    old_name: String,
+    name: String,
+    color: String,
+) -> Result<PinnedTagRename, crate::error::Error> {
+    let mut outcome = PinnedTagRename::Missing;
+    update_pinned_tags(lock, path, |tags| {
+        if name != old_name && tags.iter().any(|tag| tag.name == name) {
+            outcome = PinnedTagRename::Taken;
+        } else if let Some(tag) = tags.iter_mut().find(|tag| tag.name == old_name) {
+            tag.name = name;
+            tag.color = color;
+            outcome = PinnedTagRename::Renamed;
+        }
+    })?;
+    Ok(outcome)
 }
 
 fn remove_pinned_tag_at(
@@ -223,23 +387,55 @@ fn remove_pinned_tag_at(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn list_pinned_tags(app: AppHandle) -> Vec<PinnedTag> {
     read_pinned_tags(&app)
 }
 
+/// `false` when another pin already holds the name.
 #[tauri::command]
+#[specta::specta]
 pub fn save_pinned_tag(
     app: AppHandle,
     name: String,
     color: String,
     files: Vec<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let path = pinned_tags_path(&app)?;
     let state = app.state::<AppState>();
-    save_pinned_tag_at(&state.pinned_tags, &path, name, color, files).map_err(String::from)
+    save_pinned_tag_at(&state.pinned_tags, &path, name, color, files, true)
+        .map(|found| !found)
+        .map_err(String::from)
 }
 
 #[tauri::command]
+#[specta::specta]
+pub fn update_pinned_tag(
+    app: AppHandle,
+    name: String,
+    color: String,
+    files: Vec<String>,
+) -> Result<bool, String> {
+    let path = pinned_tags_path(&app)?;
+    let state = app.state::<AppState>();
+    save_pinned_tag_at(&state.pinned_tags, &path, name, color, files, false).map_err(String::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn rename_pinned_tag(
+    app: AppHandle,
+    old_name: String,
+    name: String,
+    color: String,
+) -> Result<PinnedTagRename, String> {
+    let path = pinned_tags_path(&app)?;
+    let state = app.state::<AppState>();
+    rename_pinned_tag_at(&state.pinned_tags, &path, old_name, name, color).map_err(String::from)
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn remove_pinned_tag(app: AppHandle, name: String) -> Result<(), String> {
     let path = pinned_tags_path(&app)?;
     let state = app.state::<AppState>();
@@ -247,6 +443,7 @@ pub fn remove_pinned_tag(app: AppHandle, name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn set_window_meta(
     window: tauri::Window,
     state: State<'_, AppState>,
@@ -256,21 +453,112 @@ pub fn set_window_meta(
     tab_count: usize,
 ) {
     let label = window.label().to_string();
-    if label != "main" && !label.starts_with("window-") {
+    if !is_viewer_label(&label) {
         return;
     }
-    let mut registry = lock_recover(&state.window_registry);
-    let entry = registry.entry(label).or_insert_with(|| WindowMeta {
-        number: state.window_counter.fetch_add(1, Ordering::SeqCst) + 1,
-        tag_name: None,
-        tag_color: None,
-        active_tab_title: String::new(),
-        tab_count: 0,
-    });
-    entry.tag_name = tag_name;
-    entry.tag_color = tag_color;
-    entry.active_tab_title = active_tab_title;
-    entry.tab_count = tab_count;
+    state.record_window_meta(label, tag_name, tag_color, active_tab_title, tab_count);
+}
+
+/// A viewer window's report of the files it has open, sent once its restore
+/// has finished and again whenever its tabs change. See `file_holder`.
+#[tauri::command]
+#[specta::specta]
+pub fn set_window_files(window: tauri::Window, state: State<'_, AppState>, files: Vec<String>) {
+    let label = window.label().to_string();
+    if !is_viewer_label(&label) {
+        return;
+    }
+    lock_recover(&state.open_files).insert(label, files);
+}
+
+/// The identity a file is compared by: the filesystem's answer, as the
+/// frontend's `pathKey` is (`canonicalize_path`), or the path itself when it
+/// has none.
+fn file_key(path: &str) -> String {
+    crate::fs_safety::canonical_identity(Path::new(path))
+        .map(|resolved| resolved.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// The files a window's snapshot will restore: every `tabs[].path` of the JSON
+/// `TabManager.serializeState` writes. Anything unreadable names no files.
+fn snapshot_paths(json: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|data| data.get("tabs")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|tab| tab.get("path")?.as_str().map(str::to_string))
+        .collect()
+}
+
+/// The window that has `path` open.
+///
+/// `held` is each window's files, compared both ways a window can know a file:
+/// by identity (`key`, which folds case, separators and symlinks the way the
+/// volume does) and by the path as it was typed, for a tab whose identity was
+/// never resolved. The first match in `held` wins; the caller orders it.
+fn file_holder<'a>(held: &'a [(String, Vec<String>)], path: &str, key: &str) -> Option<&'a str> {
+    held.iter()
+        .find(|(_, files)| files.iter().any(|file| file == key || file == path))
+        .map(|(label, _)| label.as_str())
+}
+
+/// The identities of the files `label`'s snapshot will restore.
+fn snapshot_keys(config: &Path, label: &str) -> Vec<String> {
+    load_window_state_in(config, label)
+        .map(|json| {
+            snapshot_paths(&json)
+                .iter()
+                .map(|path| file_key(path))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every open viewer window's files, for `file_holder`: what it reported, or,
+/// before its first report, the identities of the files its snapshot is
+/// restoring. Sorted by label, so the launch window comes first.
+fn held_files<R: Runtime>(app: &AppHandle<R>) -> Vec<(String, Vec<String>)> {
+    let mut labels: Vec<String> = app
+        .webview_windows()
+        .into_keys()
+        .filter(|label| is_viewer_label(label))
+        .collect();
+    labels.sort();
+    let reported = lock_recover(&app.state::<AppState>().open_files).clone();
+    let config = app.path().app_config_dir().ok();
+    labels
+        .into_iter()
+        .map(|label| {
+            let files = match (reported.get(&label), config.as_deref()) {
+                (Some(files), _) => files.clone(),
+                (None, Some(config)) => snapshot_keys(config, &label),
+                (None, None) => Vec::new(),
+            };
+            (label, files)
+        })
+        .collect()
+}
+
+/// Whether a window this launch reopens (#990) is restoring a tab on `path`,
+/// read from the snapshots on disk. True before any of those windows exist —
+/// at setup, and while the launch's files are still being queued — which is
+/// when the launch window would otherwise be sent the file as `file-path` and
+/// open a second copy of it. `send_markdown_path` delivers it either way.
+fn snapshot_restores(config: &Path, path: &str, key: &str) -> bool {
+    remembered_window_labels_in(config).iter().any(|label| {
+        snapshot_keys(config, label)
+            .iter()
+            .any(|restored| restored == key || restored == path)
+    })
+}
+
+/// `snapshot_restores` for the running app.
+pub fn reopened_window_restores<R: Runtime>(app: &AppHandle<R>, path: &str) -> bool {
+    app.path()
+        .app_config_dir()
+        .is_ok_and(|config| snapshot_restores(&config, path, &file_key(path)))
 }
 
 /// Whether a window other than `label` currently carries `name` as its tag.
@@ -303,6 +591,7 @@ fn tag_held_by_another_window(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn is_window_tag_taken(
     window: tauri::Window,
     state: State<'_, AppState>,
@@ -313,20 +602,79 @@ pub fn is_window_tag_taken(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn list_viewer_windows(state: State<'_, AppState>) -> Vec<WindowListEntry> {
-    let registry = lock_recover(&state.window_registry);
-    let mut list: Vec<WindowListEntry> = registry
-        .iter()
-        .map(|(label, meta)| WindowListEntry {
-            label: label.clone(),
-            meta: meta.clone(),
-        })
-        .collect();
-    list.sort_by_key(|entry| entry.meta.number);
-    list
+    state.viewer_windows()
+}
+
+/// Starts a quit (`true`) or ends one a close cancelled (`false`), returning
+/// the windows a cancelled quit had already closed.
+fn update_quit(quit: &Mutex<Option<Vec<String>>>, quitting: bool) -> Vec<String> {
+    let mut quit = lock_recover(quit);
+    if quitting {
+        quit.get_or_insert_with(Vec::new);
+        return Vec::new();
+    }
+    quit.take().unwrap_or_default()
+}
+
+/// A window closed during a quit keeps its snapshot, since the session ends
+/// with it. If the quit is then cancelled the user carries on without those
+/// windows, so they are forgotten as if each had been closed on its own. Their
+/// unsaved backups stay: with no snapshot they are orphans the next launch adopts.
+/// ponytail: a window whose close was already under way when the quit was
+/// cancelled, and is destroyed after, is still remembered.
+#[tauri::command]
+#[specta::specta]
+pub fn set_quitting(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    quitting: bool,
+) -> Result<(), String> {
+    let closed = update_quit(&state.quit, quitting);
+    if closed.is_empty() {
+        return Ok(());
+    }
+    let config = config_dir(&app)?;
+    for label in closed {
+        forget_window_state_in(&config, &label)?;
+    }
+    Ok(())
+}
+
+/// Hot exit applies when the app is quitting or no other viewer window is open,
+/// so the app exits with this window. Two windows closing at once each still see
+/// the other and ask: a race costs a prompt, never hides content.
+fn keeps_unsaved_on_close_for<'a>(
+    quitting: bool,
+    own: &str,
+    open: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    quitting
+        || !open
+            .into_iter()
+            .any(|label| label != own && is_viewer_label(label))
 }
 
 #[tauri::command]
+#[specta::specta]
+pub fn keeps_unsaved_on_close(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> bool {
+    // Tauri's own window list, not the registry: a window counts as open before
+    // its frontend has registered.
+    let open = app.webview_windows();
+    keeps_unsaved_on_close_for(
+        lock_recover(&state.quit).is_some(),
+        window.label(),
+        open.keys().map(String::as_str),
+    )
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn offer_tab_to_window(
     app: AppHandle,
     broker: State<'_, crate::tab_transfer::TabTransferBroker>,
@@ -337,11 +685,13 @@ pub fn offer_tab_to_window(
         return Err(format!("no such window: {target_label}"));
     }
     broker.set_target_label(&token, target_label.clone())?;
-    app.emit_to(target_label.as_str(), "tab-transfer-offer", token)
+    TabTransferOffer(token)
+        .emit_to(&app, target_label.as_str())
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn focus_window(app: AppHandle, label: String) -> Result<(), String> {
     let window = app
         .get_webview_window(&label)
@@ -350,12 +700,18 @@ pub fn focus_window(app: AppHandle, label: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Consumed by the main window's first show. See `show_window`.
+/// Consumed by the launch window's first show. See `show_window`.
 static MAIN_WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Whether this show is the launch window's first, the one that must not
+/// activate. Asking consumes it. See `show_window`.
+fn is_cold_start_show(label: &str, shown: &AtomicBool) -> bool {
+    label == LAUNCH_LABEL && !shown.swap(true, Ordering::Relaxed)
+}
 
 /// Reveals a window that was built hidden.
 ///
-/// The main window is built hidden so no empty frame is on screen while the
+/// The launch window is built hidden so no empty frame is on screen while the
 /// webview boots, and the frontend calls this once it has mounted — seconds
 /// after launch, by which time the user has usually gone back to whatever they
 /// were doing. Activating then is wrong, and `set_focus` is not a polite
@@ -371,9 +727,9 @@ static MAIN_WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
 /// bringing its window up so the dialog is not hidden behind another — and each
 /// of those must still come to the front.
 #[tauri::command]
+#[specta::specta]
 pub async fn show_window(window: tauri::Window) {
-    let is_cold_start =
-        window.label() == "main" && !MAIN_WINDOW_SHOWN.swap(true, Ordering::Relaxed);
+    let is_cold_start = is_cold_start_show(window.label(), &MAIN_WINDOW_SHOWN);
 
     let _ = window.show();
 
@@ -385,44 +741,382 @@ pub async fn show_window(window: tauri::Window) {
     let _ = window.set_focus();
 }
 
-fn window_state_path(app: &AppHandle) -> Result<std::path::PathBuf, crate::error::Error> {
+/// The launch window's snapshot keeps its pre-per-window name, so an existing
+/// session needs no migration and an older build still finds it.
+const MAIN_WINDOW_STATE: &str = "window-state-v2.json";
+/// Every other remembered window has a snapshot here, named by its label.
+/// One file per window: N windows closing at once never write the same file.
+const WINDOW_STATE_DIR: &str = "window-state";
+const MAIN_RESTORE_PROGRESS: &str = "restore-progress-v1.json";
+const RESTORE_PROGRESS_DIR: &str = "restore-progress";
+
+fn config_dir(app: &AppHandle) -> Result<PathBuf, crate::error::Error> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir)?;
-    Ok(dir.join("window-state-v2.json"))
+    Ok(dir)
 }
 
-/// Persists the session snapshot atomically.
+/// `label`'s file in a per-window directory. Only `window-*` windows have one:
+/// the launch window has its own file, and anything else is not a window
+/// startup reopens.
+fn secondary_window_file(dir: &Path, label: &str) -> Result<PathBuf, String> {
+    if !label.starts_with("window-") {
+        return Err(format!("not a secondary window label: {label}"));
+    }
+    label_file(dir, label)
+}
+
+fn window_state_path_in(config: &Path, label: &str) -> Result<PathBuf, String> {
+    if label == LAUNCH_LABEL {
+        return Ok(config.join(MAIN_WINDOW_STATE));
+    }
+    secondary_window_file(&config.join(WINDOW_STATE_DIR), label)
+}
+
+fn restore_progress_path_in(config: &Path, label: &str) -> Result<PathBuf, String> {
+    if label == LAUNCH_LABEL {
+        return Ok(config.join(MAIN_RESTORE_PROGRESS));
+    }
+    secondary_window_file(&config.join(RESTORE_PROGRESS_DIR), label)
+}
+
+/// Writes a file Markpad owns in one of its per-window directories. Like
+/// `atomic_write`, but refuses to follow a symlink into a document.
+fn write_owned_file(path: &Path, json: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err("target is not a regular file".to_string());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    atomic_write(path, json.as_bytes()).map_err(|error| error.to_string())
+}
+
+fn save_window_state_in(config: &Path, label: &str, json: &str) -> Result<(), String> {
+    let path = window_state_path_in(config, label)?;
+    write_owned_file(&path, json)
+}
+
+fn load_window_state_in(config: &Path, label: &str) -> Option<String> {
+    fs::read_to_string(window_state_path_in(config, label).ok()?).ok()
+}
+
+/// A window closed on its own is not reopened. Its crash-guard breadcrumb goes with it.
+fn forget_window_state_in(config: &Path, label: &str) -> Result<(), String> {
+    remove_if_exists(&window_state_path_in(config, label)?)?;
+    remove_if_exists(&restore_progress_path_in(config, label)?)
+}
+
+fn remove_dir_if_exists(dir: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Every window's snapshot, for the setting that turns restore off.
+fn clear_window_state_in(config: &Path) -> Result<(), String> {
+    remove_if_exists(&config.join(MAIN_WINDOW_STATE))?;
+    remove_dir_if_exists(&config.join(WINDOW_STATE_DIR))?;
+    remove_dir_if_exists(&config.join(RESTORE_PROGRESS_DIR))
+}
+
+/// The secondary windows that were open when the last session ended.
+fn remembered_window_labels_in(config: &Path) -> Vec<String> {
+    let dir = config.join(WINDOW_STATE_DIR);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut labels: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let label = name.to_str()?.strip_suffix(".json")?.to_string();
+            secondary_window_file(&dir, &label).ok()?;
+            Some(label)
+        })
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// Persists the calling window's restore snapshot atomically.
 ///
-/// This runs while the last window is closing — the moment the WebKit storage
-/// process is already tearing down — so a partial write is a realistic
-/// outcome, not a theoretical one. `fs::write` truncates first and then
-/// streams, so a crash mid-write leaves behind half a JSON document, and the
-/// next launch restores no tabs at all. `atomic_write` publishes the new
+/// This runs as the window changes and while it closes, when the WebKit
+/// storage process may already be tearing down, so a partial write is a
+/// realistic outcome, not a theoretical one. `fs::write` truncates first and
+/// then streams, so a crash mid-write leaves behind half a JSON document, and
+/// the next launch restores no tabs at all. `atomic_write` publishes the new
 /// snapshot with a rename: the file on disk is either entirely the old
 /// session or entirely the new one.
+///
+/// Off the main thread: the two fsyncs cost ~8 ms, and on it every window
+/// freezes for that long. The caller still awaits the write.
 #[tauri::command]
-pub fn save_window_state(app: AppHandle, json: String) -> Result<(), String> {
-    atomic_write(&window_state_path(&app)?, json.as_bytes()).map_err(|e| e.to_string())
+#[specta::specta]
+pub async fn save_window_state(
+    window: tauri::Window,
+    app: AppHandle,
+    json: String,
+) -> Result<(), String> {
+    let config = config_dir(&app)?;
+    let label = window.label().to_string();
+    crate::commands::blocking(move || save_window_state_in(&config, &label, &json)).await
 }
 
 #[tauri::command]
-pub fn load_window_state(app: AppHandle) -> Option<String> {
-    fs::read_to_string(window_state_path(&app).ok()?).ok()
+#[specta::specta]
+pub fn load_window_state(window: tauri::Window, app: AppHandle) -> Option<String> {
+    load_window_state_in(&config_dir(&app).ok()?, window.label())
 }
 
 #[tauri::command]
+#[specta::specta]
+pub fn forget_window_state(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    forget_window_state_in(&config_dir(&app)?, window.label())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn clear_window_state(app: AppHandle) -> Result<(), String> {
-    let path = window_state_path(&app)?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
+    clear_window_state_in(&config_dir(&app)?)
+}
+
+/// Rebuilds each remembered secondary window under its saved label. Each one
+/// restores its own snapshot and unsaved backup. Every window asks after its
+/// own restore; only the first call of a launch does anything, so a window
+/// opened later cannot resurrect one that is closing.
+///
+/// Async for the reason `create_transfer_window` is.
+#[tauri::command]
+#[specta::specta]
+pub async fn reopen_remembered_windows(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if state.reopened.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let config = config_dir(&app)?;
+    for label in remembered_window_labels_in(&config) {
+        if app.get_webview_window(&label).is_none() {
+            if let Err(error) = build_viewer_window(&app, &label) {
+                eprintln!("Failed to reopen window {label}: {error}");
+            }
+        }
     }
     Ok(())
 }
 
-fn restore_progress_path(app: &AppHandle) -> Result<std::path::PathBuf, crate::error::Error> {
-    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join("restore-progress-v1.json"))
+/// The remembered window the launch window takes over when it has no
+/// snapshot of its own, so a launch never shows an extra empty window.
+fn adoption_source(launch_has_snapshot: bool, remembered: &[String]) -> Option<&str> {
+    if launch_has_snapshot {
+        return None;
+    }
+    remembered.first().map(String::as_str)
+}
+
+fn rename_if_exists(from: &Path, to: &Path) -> Result<(), String> {
+    match fs::rename(from, to) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Moves `from`'s entry in the window-state plugin's file to the launch
+/// window. Geometry is cosmetic, so a file that cannot be read is left alone.
+fn adopt_geometry(path: &Path, from: &str) {
+    let Some(mut entries) = fs::read_to_string(path).ok().and_then(|json| {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
+    }) else {
+        return;
+    };
+    let Some(entry) = entries.remove(from) else {
+        return;
+    };
+    entries.insert(LAUNCH_LABEL.to_string(), entry);
+    if let Ok(json) = serde_json::to_string(&entries) {
+        let _ = atomic_write(path, json.as_bytes());
+    }
+}
+
+/// Hands `from`'s snapshot, breadcrumb, unsaved backup and geometry to the
+/// launch window. The snapshot moves last: it is what makes `from` a
+/// remembered window, so a launch killed partway adopts it again next time.
+/// A backup the launch window already has is never overwritten; `from`'s then
+/// stays an orphan and is claimed at startup like any other.
+fn adopt_window_in(config: &Path, from: &str) -> Result<(), String> {
+    let recovery = config.join(UNSAVED_RECOVERY_DIR);
+    let own_backup = label_file(&recovery, LAUNCH_LABEL)?;
+    if !own_backup.exists() {
+        rename_if_exists(&label_file(&recovery, from)?, &own_backup)?;
+    }
+    adopt_geometry(
+        &config.join(tauri_plugin_window_state::DEFAULT_FILENAME),
+        from,
+    );
+    rename_if_exists(
+        &restore_progress_path_in(config, from)?,
+        &restore_progress_path_in(config, LAUNCH_LABEL)?,
+    )?;
+    fs::rename(
+        window_state_path_in(config, from)?,
+        window_state_path_in(config, LAUNCH_LABEL)?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Runs before the window-state plugin reads its file and before the launch
+/// window is built, so the window comes up with the adopted geometry.
+pub fn adopt_remembered_window(app: &AppHandle) {
+    let Ok(config) = config_dir(app) else {
+        return;
+    };
+    let has_snapshot = config.join(MAIN_WINDOW_STATE).exists();
+    let remembered = remembered_window_labels_in(&config);
+    if let Some(from) = adoption_source(has_snapshot, &remembered) {
+        if let Err(error) = adopt_window_in(&config, from) {
+            eprintln!("Failed to adopt window {from}: {error}");
+        }
+    }
+}
+
+const UNSAVED_RECOVERY_DIR: &str = "unsaved-recovery";
+
+fn unsaved_recovery_dir(app: &AppHandle) -> Result<PathBuf, crate::error::Error> {
+    config_file(app, UNSAVED_RECOVERY_DIR)
+}
+
+fn label_file(dir: &Path, label: &str) -> Result<PathBuf, String> {
+    if label.is_empty()
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(format!("invalid window label: {label}"));
+    }
+    Ok(dir.join(format!("{label}.json")))
+}
+
+fn remove_recovery_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Each window replaces only its own snapshot, never a document on disk.
+fn save_unsaved_recovery_at(dir: &Path, label: &str, json: &str) -> Result<(), String> {
+    let path = label_file(dir, label)?;
+    if json.trim() == "[]" {
+        return remove_recovery_file(&path);
+    }
+    write_owned_file(&path, json)
+}
+
+fn load_unsaved_recovery_at(dir: &Path) -> Result<Vec<(String, String)>, String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut snapshots = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(label) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        if label_file(dir, label).is_err() || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        // One unreadable file must not hide the others. It arrives empty, which
+        // the frontend rejects as a corrupt record and leaves on disk.
+        let json = fs::read_to_string(entry.path()).unwrap_or_default();
+        snapshots.push((label.to_string(), json));
+    }
+    snapshots.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(snapshots)
+}
+
+fn clear_unsaved_recovery_at(dir: &Path, labels: &[String]) -> Result<(), String> {
+    // Validate the whole request before deleting any snapshot.
+    let paths = labels
+        .iter()
+        .map(|label| label_file(dir, label))
+        .collect::<Result<Vec<_>, _>>()?;
+    for path in paths {
+        remove_recovery_file(&path)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_unsaved_recovery(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+    json: String,
+) -> Result<(), String> {
+    let dir = unsaved_recovery_dir(&app)?;
+    let label = window.label().to_string();
+    crate::commands::blocking(move || save_unsaved_recovery_at(&dir, &label, &json)).await
+}
+
+/// The backups a window takes in at startup: its own, and each orphan no other
+/// window has taken yet. An orphan is a backup whose window is not open and
+/// has no snapshot, so nothing will reopen it — after a crash before the
+/// window's first snapshot, say, or with restore off.
+fn claim_recovery_records(
+    records: Vec<(String, String)>,
+    own: &str,
+    is_orphan: impl Fn(&str) -> bool,
+    claimed: &mut HashSet<String>,
+) -> Vec<(String, String)> {
+    records
+        .into_iter()
+        .filter(|(label, _)| label == own || (is_orphan(label) && claimed.insert(label.clone())))
+        .collect()
+}
+
+/// Whichever window asks first gets the orphans, once: two windows starting
+/// together must not both restore the same unsaved buffer.
+#[tauri::command]
+#[specta::specta]
+pub async fn claim_unsaved_recovery(
+    window: tauri::WebviewWindow,
+    app: AppHandle,
+) -> Result<Vec<(String, String)>, String> {
+    let dir = unsaved_recovery_dir(&app)?;
+    let config = config_dir(&app)?;
+    let records = crate::commands::blocking(move || load_unsaved_recovery_at(&dir)).await?;
+    let open = app.webview_windows();
+    let state = app.state::<AppState>();
+    let mut claimed = lock_recover(&state.claimed_recovery);
+    Ok(claim_recovery_records(
+        records,
+        window.label(),
+        |label| {
+            !open.contains_key(label)
+                && !window_state_path_in(&config, label).is_ok_and(|path| path.exists())
+        },
+        &mut claimed,
+    ))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn clear_unsaved_recovery(app: AppHandle, labels: Vec<String>) -> Result<(), String> {
+    let dir = unsaved_recovery_dir(&app)?;
+    crate::commands::blocking(move || clear_unsaved_recovery_at(&dir, &labels)).await
 }
 
 /// Publishes the restore breadcrumb by rename, but without `atomic_write`'s
@@ -450,9 +1144,17 @@ fn restore_progress_path(app: &AppHandle) -> Result<std::path::PathBuf, crate::e
 /// measured on macOS/APFS with a 122-byte payload, `atomic_write`'s two fsyncs
 /// cost ~8 ms per call against ~0.2 ms for temp-file-plus-rename.
 fn write_restore_progress(path: &Path, json: &str) -> std::io::Result<()> {
-    // Two Markpad processes (Windows, Linux) would otherwise share a temp name
-    // and the loser would delete the winner's file out from under its rename.
-    let temp = path.with_file_name(format!(".restore-progress-{}.tmp", std::process::id()));
+    // Two Markpad processes (Windows, Linux), or two windows of one, would
+    // otherwise share a temp name and the loser would delete the winner's file
+    // out from under its rename.
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("restore-progress");
+    let temp = path.with_file_name(format!(".{name}-{}.tmp", std::process::id()));
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let write = (|| -> std::io::Result<()> {
         let mut file = fs::File::create(&temp)?;
         std::io::Write::write_all(&mut file, json.as_bytes())?;
@@ -469,55 +1171,130 @@ fn write_restore_progress(path: &Path, json: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Each window guards its own restore: the breadcrumb is keyed by the caller's label.
 #[tauri::command]
-pub fn save_restore_progress(app: AppHandle, json: String) -> Result<(), String> {
-    write_restore_progress(&restore_progress_path(&app)?, &json).map_err(|e| e.to_string())
+#[specta::specta]
+pub fn save_restore_progress(
+    window: tauri::Window,
+    app: AppHandle,
+    json: String,
+) -> Result<(), String> {
+    let path = restore_progress_path_in(&config_dir(&app)?, window.label())?;
+    write_restore_progress(&path, &json).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn load_restore_progress(app: AppHandle) -> Option<String> {
-    fs::read_to_string(restore_progress_path(&app).ok()?).ok()
+#[specta::specta]
+pub fn load_restore_progress(window: tauri::Window, app: AppHandle) -> Option<String> {
+    fs::read_to_string(restore_progress_path_in(&config_dir(&app).ok()?, window.label()).ok()?).ok()
 }
 
 #[tauri::command]
-pub fn clear_restore_progress(app: AppHandle) -> Result<(), String> {
-    let path = restore_progress_path(&app)?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+#[specta::specta]
+pub fn clear_restore_progress(window: tauri::Window, app: AppHandle) -> Result<(), String> {
+    remove_if_exists(&restore_progress_path_in(
+        &config_dir(&app)?,
+        window.label(),
+    )?)
 }
 
-pub fn bring_to_front(window: &tauri::WebviewWindow) {
+/// A document window: the launch one or any other.
+fn is_viewer_label(label: &str) -> bool {
+    label == LAUNCH_LABEL || label.starts_with("window-")
+}
+
+pub fn bring_to_front<R: Runtime>(window: &tauri::WebviewWindow<R>) {
     let _ = window.show();
     let _ = window.unminimize();
     let _ = window.set_focus();
 }
 
-pub fn pick_delivery_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
-    let viewers: Vec<tauri::WebviewWindow> = app
-        .webview_windows()
-        .into_iter()
-        .filter(|(label, _)| label == "main" || label.starts_with("window-"))
-        .map(|(_, window)| window)
+/// Where a file opened while the app runs goes: the focused window, else the
+/// one focused last, else the launch window, else any open one.
+fn delivery_label<'a>(
+    focused: Option<&'a str>,
+    last_focused: Option<&'a str>,
+    open: &[&'a str],
+) -> Option<&'a str> {
+    focused
+        .or(last_focused.filter(|label| open.contains(label)))
+        .or_else(|| open.iter().copied().find(|label| *label == LAUNCH_LABEL))
+        .or_else(|| open.first().copied())
+}
+
+pub fn pick_delivery_window<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::WebviewWindow<R>> {
+    let windows = app.webview_windows();
+    let mut open: Vec<&str> = windows
+        .keys()
+        .map(String::as_str)
+        .filter(|label| is_viewer_label(label))
         .collect();
-
-    if let Some(focused) = viewers
+    open.sort();
+    let focused = open
         .iter()
-        .find(|window| window.is_focused().unwrap_or(false))
-    {
-        return Some(focused.clone());
-    }
-
+        .copied()
+        .find(|label| windows[*label].is_focused().unwrap_or(false));
     let state = app.state::<AppState>();
     let last = lock_recover(&state.last_focused_viewer).clone();
-    if let Some(label) = last {
-        if let Some(window) = viewers.iter().find(|window| window.label() == label) {
-            return Some(window.clone());
+    let label = delivery_label(focused, last.as_deref(), &open)?;
+    windows.get(label).cloned()
+}
+
+/// Joins `path` to the launch's files while the launch window has not taken them
+/// yet, keeping every one delivered. False once they have been taken.
+fn queue_startup_file(pending: &mut Option<Vec<String>>, path: &str) -> bool {
+    match pending.as_mut() {
+        Some(paths) => {
+            paths.push(path.to_string());
+            true
+        }
+        None => false,
+    }
+}
+
+/// The launch's files: every path the OS delivered before the launch window
+/// asked, in delivery order, ahead of the argv paths it did not already name.
+fn merge_startup_files(opened: Vec<String>, mut files: Vec<String>) -> Vec<String> {
+    for path in opened.into_iter().rev() {
+        if !files.contains(&path) {
+            files.insert(0, path);
         }
     }
+    files
+}
 
-    viewers.into_iter().next()
+/// A file opened by the OS. Until the launch window has taken the launch's files it
+/// joins them, so it lands there and in no other window; `send_markdown_path`
+/// routes them from there. After that it goes to the window that already has
+/// it open, and only otherwise where `pick_delivery_window` says.
+///
+/// One tab per file is the rule inside a window (`TabManager.claimPath`), and
+/// it only ever saw that window's tabs: a file open in one window, opened
+/// again from Explorer while another was focused, became a second tab there —
+/// two buffers and two auto-save timers on one file (#1029).
+pub fn deliver_opened_path<R: Runtime>(app: &AppHandle<R>, path: String) {
+    let state = app.state::<AppState>();
+    let queued = queue_startup_file(&mut lock_recover(&state.startup_files), &path);
+    let target = if queued {
+        // Queued for `send_markdown_path`, which routes it. The direct send to
+        // the launch window is a second channel (#547), and for a file a
+        // reopened window is restoring it would be a second copy.
+        if reopened_window_restores(app, &path) {
+            return;
+        }
+        app.get_webview_window(LAUNCH_LABEL)
+    } else {
+        {
+            let held = held_files(app);
+            file_holder(&held, &path, &file_key(&path))
+                .and_then(|label| app.get_webview_window(label))
+                .or_else(|| pick_delivery_window(app))
+        }
+    };
+    if let Some(window) = target {
+        let _ = FilePath(path).emit_to(app, window.label());
+        bring_to_front(&window);
+    }
 }
 
 /// The openable paths named on a command line, in order, resolved against the
@@ -573,21 +1350,81 @@ pub fn startup_paths(args: &[String], cwd: &Path) -> Vec<String> {
         .collect()
 }
 
-pub fn handle_single_instance(app: &AppHandle, args: Vec<String>, cwd: String) {
-    let Some(window) = pick_delivery_window(app) else {
-        return;
-    };
-    if let Some(path) = startup_paths(&args, Path::new(&cwd)).into_iter().next() {
-        let _ = app.emit_to(window.label(), "file-path", path);
+pub fn handle_single_instance<R: Runtime>(app: &AppHandle<R>, args: Vec<String>, cwd: String) {
+    // Explorer launches one process per selected file, so these can arrive
+    // before the launch window listens; `deliver_opened_path` queues them and
+    // fronts the window each one lands in.
+    let paths = startup_paths(&args, Path::new(&cwd));
+    if paths.is_empty() {
+        if let Some(window) = pick_delivery_window(app) {
+            bring_to_front(&window);
+        }
     }
-    bring_to_front(&window);
+    for path in paths {
+        deliver_opened_path(app, path);
+    }
 }
 
-pub fn create_transfer_window(app: AppHandle, token: String) -> Result<(), String> {
-    let label = format!("window-{token}");
+/// Creates the destination window for a tab transfer. Its label carries the
+/// token, so the new frontend knows which transfer to claim.
+///
+/// `tag_name` is the pinned group a window opened from Home or the title bar
+/// will adopt. It is recorded as that window's tag before the window exists,
+/// because the window reports its own tag only once it has mounted and read
+/// the group, and a second click on the group before then found no holder and
+/// opened the group again.
+///
+/// Async on purpose: a sync command runs on the main thread, and WebView2
+/// deadlocks building a window there (tauri-apps/tauri#12521).
+#[tauri::command]
+#[specta::specta]
+pub async fn create_transfer_window(
+    app: AppHandle,
+    token: String,
+    tag_name: Option<String>,
+) -> Result<(), String> {
+    let label = crate::tab_transfer::destination_label(&token);
+    let state = app.state::<AppState>();
+    if let Some(name) = tag_name {
+        reserve_window_tag(
+            &mut lock_recover(&state.window_registry),
+            &state.window_counter,
+            &label,
+            name,
+        );
+    }
+    let built = build_viewer_window(&app, &label);
+    if built.is_err() {
+        lock_recover(&state.window_registry).remove(&label);
+    }
+    built
+}
+
+/// Enters `label` in the registry holding `name`, as `set_window_meta` would.
+/// The window's own first report replaces it.
+fn reserve_window_tag(
+    registry: &mut HashMap<String, WindowMeta>,
+    counter: &AtomicU64,
+    label: &str,
+    name: String,
+) {
+    registry.insert(
+        label.to_string(),
+        WindowMeta {
+            number: counter.fetch_add(1, Ordering::SeqCst) + 1,
+            tag_name: Some(name),
+            tag_color: None,
+            active_tab_title: String::new(),
+            tab_count: 0,
+        },
+    );
+}
+
+/// The one factory for secondary windows: built hidden, the frontend shows it.
+fn build_viewer_window(app: &AppHandle, label: &str) -> Result<(), String> {
     #[allow(unused_mut)]
     let mut builder =
-        tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
+        tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App("index.html".into()))
             .title("Markpad")
             .inner_size(1000.0, 800.0)
             .min_inner_size(400.0, 300.0)
@@ -618,14 +1455,14 @@ pub fn create_transfer_window(app: AppHandle, token: String) -> Result<(), Strin
 /// VS Code, Vim, JetBrains and Emacs — saves by writing a temp file alongside
 /// and renaming it over the top. That leaves a new inode at the same path, so
 /// the watch was left holding the unlinked old one: after the first save, its
-/// own or anyone else's, Live Mode on Linux reported nothing for the rest of
+/// own or anyone else's, the watcher on Linux reported nothing for the rest of
 /// the session, and the callback swallowed the error that said so.
 /// `watch_survives_rename` below is that failure, pinned per platform.
 ///
 /// A directory watch has no such problem, because the directory is the thing
 /// whose entries changed. The cost is hearing about every sibling file, which
 /// `event_concerns` drops on a name comparison — cheaper than the emit it
-/// replaces, and paid only while Live Mode is on.
+/// replaces.
 ///
 /// Falls back to the target itself when there is no usable parent (a bare
 /// relative filename, or a filesystem root), which keeps the previous
@@ -660,6 +1497,34 @@ fn event_concerns(event: &notify::Event, file_name: Option<&OsStr>) -> bool {
     }
 }
 
+/// Turns a burst of calls into one call of `f`, `delay` after the first.
+///
+/// A save is several events — an editor's temp write and rename, or a
+/// truncate and a write — and each `file-changed` is a full reload. Calls
+/// that land while one is pending ride on it; it runs after them, so it sees
+/// their result. The flag is cleared before `f` runs, so a call made while
+/// `f` is running schedules another rather than being lost. A file written
+/// continuously still emits every `delay`, where a debounce would wait for it
+/// to go quiet.
+pub(crate) fn coalesced(
+    delay: Duration,
+    f: impl Fn() + Send + Sync + 'static,
+) -> impl Fn() + Send + 'static {
+    let f = Arc::new(f);
+    let pending = Arc::new(AtomicBool::new(false));
+    move || {
+        if pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (f, pending) = (f.clone(), pending.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            pending.store(false, Ordering::SeqCst);
+            f();
+        });
+    }
+}
+
 pub fn watch_file(
     window: tauri::Window,
     handle: AppHandle,
@@ -667,6 +1532,7 @@ pub fn watch_file(
     path: String,
 ) -> Result<(), String> {
     let label = window.label().to_string();
+    let request = state.request(&label);
     let event_label = label.clone();
     let watched_path = path.clone();
 
@@ -677,18 +1543,21 @@ pub fn watch_file(
     let root = watch_root(target);
 
     // Build and arm the replacement *before* touching the watcher already
-    // registered for this window. Dropping the old one first meant a failure
-    // in either step below left the window with no watcher at all: the
-    // frontend only logs the error, so external edits would silently stop
-    // being reported for the rest of the session. Inserting last swaps them
-    // in one step — the map drops the previous watcher, which unregisters it.
+    // registered for this window. Dropping the old one first would leave the
+    // window with no watcher at all if either step below failed: the frontend
+    // only logs the error, so external edits would silently stop being
+    // reported for the rest of the session. `install` swaps them in one step —
+    // the map drops the previous watcher, which unregisters it.
+    let emit = coalesced(Duration::from_millis(150), move || {
+        let _ = FileChanged(watched_path.clone()).emit_to(&handle, event_label.as_str());
+    });
     let mut watcher = RecommendedWatcher::new(
         move |result: Result<notify::Event, notify::Error>| {
             let Ok(event) = result else { return };
             if !event_concerns(&event, file_name.as_deref()) {
                 return;
             }
-            let _ = handle.emit_to(event_label.as_str(), "file-changed", watched_path.clone());
+            emit();
         },
         Config::default(),
     )
@@ -697,43 +1566,168 @@ pub fn watch_file(
         .watch(&root, RecursiveMode::NonRecursive)
         .map_err(|e| e.to_string())?;
 
-    lock_recover(&state.watchers).insert(label, watcher);
+    state.install(label, request, watcher);
     Ok(())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn unwatch_file(window: tauri::Window, state: State<'_, WatcherState>) -> Result<(), String> {
-    lock_recover(&state.watchers).remove(window.label());
+    state.unwatch(window.label());
     Ok(())
 }
 
+/// The launch's files, handed once to the launch window. Every window asks;
+/// the others, and any later ask, get nothing, so a new window never reopens
+/// the files the app was started with.
+///
+/// Except the ones a reopened window (#990) is restoring a tab on: those go to
+/// that window instead of becoming a second copy in the launch window (#1001
+/// sends every launch file here). The other windows may not have restored, or
+/// even started, yet, so `held_files` reads their snapshots. A window that
+/// asks later takes its share here; one that already asked is sent it.
 #[tauri::command]
-pub fn send_markdown_path(state: State<'_, AppState>) -> Vec<String> {
+#[specta::specta]
+pub fn send_markdown_path(
+    window: tauri::Window,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Vec<String> {
+    let label = window.label().to_string();
+    lock_recover(&state.launch_routing)
+        .asked
+        .insert(label.clone());
+    if label != LAUNCH_LABEL {
+        let mut routing = lock_recover(&state.launch_routing);
+        let files = routing.routed.remove(&label).unwrap_or_default();
+        if !files.is_empty() {
+            routing.took_files = Some(label.clone());
+        }
+        drop(routing);
+        if !files.is_empty() {
+            if let Some(window) = app.get_webview_window(&label) {
+                bring_to_front(&window);
+            }
+        }
+        announce_restored(&app, None);
+        return files;
+    }
+    let Some(opened) = lock_recover(&state.startup_files).take() else {
+        return Vec::new();
+    };
     let args: Vec<String> = std::env::args().collect();
-    let mut files = startup_paths(&args, &std::env::current_dir().unwrap_or_default());
-    let startup_files: Vec<String> = lock_recover(&state.startup_files).drain(..).collect();
-    for path in startup_files.into_iter().rev() {
-        if !files.contains(&path) {
-            files.insert(0, path);
+    let files = startup_paths(&args, &std::env::current_dir().unwrap_or_default());
+    let files = merge_startup_files(opened, files);
+
+    let held = held_files(&app);
+    let (here, elsewhere) = route_launch_files(&held, files, file_key);
+    for (holder, paths) in elsewhere {
+        let mut routing = lock_recover(&state.launch_routing);
+        if !routing.asked.contains(&holder) {
+            routing.routed.entry(holder).or_default().extend(paths);
+            continue;
+        }
+        routing.took_files = Some(holder.clone());
+        drop(routing);
+        if let Some(window) = app.get_webview_window(&holder) {
+            for path in paths {
+                let _ = FilePath(path).emit_to(&app, &holder);
+            }
+            bring_to_front(&window);
         }
     }
-    files
+    if !here.is_empty() {
+        lock_recover(&state.launch_routing).took_files = Some(label);
+    }
+    announce_restored(&app, None);
+    here
 }
 
-pub fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+/// Sends `windows-restored` to every window, and brings the last window that
+/// took launch files back to the front, once every open viewer window has
+/// asked `send_markdown_path`, which each does only after its restore and
+/// its first report (`set_window_meta`). Asked on every ask, and when a window
+/// closes, since a window that closes mid-startup never asks. `closing` is
+/// that window, still listed while it is being destroyed.
+fn announce_restored<R: Runtime>(app: &AppHandle<R>, closing: Option<&str>) {
+    let windows = app.webview_windows();
+    let open: Vec<&str> = windows
+        .keys()
+        .map(String::as_str)
+        .filter(|label| is_viewer_label(label) && Some(*label) != closing)
+        .collect();
+    let state = app.state::<AppState>();
+    let mut routing = lock_recover(&state.launch_routing);
+    if routing.restored || !launch_restored(&open, &routing.asked) {
+        return;
+    }
+    routing.restored = true;
+    let took_files = routing.took_files.take();
+    drop(routing);
+    let _ = WindowsRestored.emit(app);
+    if let Some(window) = took_files.and_then(|label| app.get_webview_window(&label)) {
+        bring_to_front(&window);
+    }
+}
+
+/// Whether `windows-restored` has been sent, for a window that started after it.
+#[tauri::command]
+#[specta::specta]
+pub fn windows_restored(state: State<'_, AppState>) -> bool {
+    lock_recover(&state.launch_routing).restored
+}
+
+/// Whether the launch window and every other open window have asked for their
+/// launch files.
+fn launch_restored(open: &[&str], asked: &HashSet<String>) -> bool {
+    asked.contains(LAUNCH_LABEL) && open.iter().all(|label| asked.contains(*label))
+}
+
+/// Splits the launch's files into the launch window's own and, per window, the
+/// ones another window already has open. A file the launch window has open
+/// itself stays with it (`held` lists it first). Order is kept within each part.
+fn route_launch_files(
+    held: &[(String, Vec<String>)],
+    files: Vec<String>,
+    key: impl Fn(&str) -> String,
+) -> (Vec<String>, BTreeMap<String, Vec<String>>) {
+    let mut here = Vec::new();
+    let mut elsewhere: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for path in files {
+        match file_holder(held, &path, &key(&path)) {
+            None | Some(LAUNCH_LABEL) => here.push(path),
+            Some(holder) => elsewhere.entry(holder.to_string()).or_default().push(path),
+        }
+    }
+    (here, elsewhere)
+}
+
+/// What the window-state plugin keeps for every window.
+pub fn geometry_flags() -> tauri_plugin_window_state::StateFlags {
+    use tauri_plugin_window_state::StateFlags;
+    StateFlags::SIZE
+        | StateFlags::POSITION
+        | StateFlags::MAXIMIZED
+        | StateFlags::VISIBLE
+        | StateFlags::FULLSCREEN
+}
+
+pub fn handle_window_event<R: Runtime>(window: &tauri::Window<R>, event: &tauri::WindowEvent) {
     match event {
         tauri::WindowEvent::Focused(true) => {
             let label = window.label();
-            if label == "main" || label.starts_with("window-") {
+            if is_viewer_label(label) {
                 let state = window.state::<AppState>();
                 *lock_recover(&state.last_focused_viewer) = Some(label.to_string());
             }
         }
         tauri::WindowEvent::Destroyed => {
-            let state = window.state::<WatcherState>();
-            lock_recover(&state.watchers).remove(window.label());
-            let app_state = window.state::<AppState>();
-            lock_recover(&app_state.window_registry).remove(window.label());
+            window.state::<WatcherState>().forget_window(window.label());
+            window
+                .state::<crate::folder::FolderWatcherState>()
+                .forget_window(window.label());
+            window.state::<AppState>().window_destroyed(window.label());
+            announce_restored(window.app_handle(), Some(window.label()));
         }
         _ => {}
     }
@@ -743,6 +1737,96 @@ pub fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn heavy_window_commands_run_off_the_main_thread() {
+        use crate::commands::tests::runs_off_the_main_thread;
+        // save_window_state: two fsyncs, ~8 ms of every window frozen on the main
+        // thread. create_transfer_window: WebView2 deadlocks building a window
+        // from a sync command (tauri-apps/tauri#12521, #356). Built, never run.
+        let _ = |window: tauri::Window, app: AppHandle| {
+            runs_off_the_main_thread(save_window_state(window, app, String::new()))
+        };
+        let _ = |app: AppHandle| {
+            runs_off_the_main_thread(create_transfer_window(app, String::new(), None))
+        };
+    }
+
+    // macOS open-document events: opening several files from Finder delivers
+    // several paths, and every one has to reach the launch window. The defect
+    // this guards against was consuming only the first.
+    #[test]
+    fn macos_open_document_events_preserve_every_delivered_file_path() {
+        let mut pending = Some(Vec::new());
+        assert!(queue_startup_file(&mut pending, "/n/a.md"));
+        assert!(queue_startup_file(&mut pending, "/n/b.md"));
+        let opened = pending.take().unwrap();
+        assert_eq!(
+            merge_startup_files(opened, vec!["/n/c.md".into()]),
+            vec!["/n/a.md", "/n/b.md", "/n/c.md"]
+        );
+        // argv naming one of them again does not open it twice.
+        assert_eq!(
+            merge_startup_files(vec!["/n/a.md".into()], vec!["/n/a.md".into()]),
+            vec!["/n/a.md"]
+        );
+        // Once taken, a later file is not queued for the launch window again.
+        assert!(!queue_startup_file(&mut pending, "/n/d.md"));
+        assert_eq!(pending, None);
+    }
+
+    // `markpad a.md b.md` with Markpad already running arrives here instead of
+    // at `send_markdown_path`. Taking only the first path opened a.md alone,
+    // and emitting straight to a window lost the files that arrived before
+    // the launch window listened (Explorer launches one process per file).
+    #[test]
+    // Not on Windows: the mock runtime pulls in Common Controls v6 entry
+    // points, and a test binary has no manifest declaring them, so it fails to
+    // load (STATUS_ENTRYPOINT_NOT_FOUND) before any test runs.
+    #[cfg(not(windows))]
+    fn a_second_launch_hands_every_argv_path_to_the_running_window() {
+        let app = tauri::test::mock_app();
+        app.manage(AppState::new());
+        let args = ["markpad", "a.md", "b.md"].map(String::from).to_vec();
+        handle_single_instance(app.handle(), args, "/n".into());
+        let pending = lock_recover(&app.state::<AppState>().startup_files).clone();
+        let expected =
+            ["a.md", "b.md"].map(|name| Path::new("/n").join(name).display().to_string());
+        assert_eq!(pending, Some(expected.to_vec()));
+    }
+
+    fn idle_watcher() -> RecommendedWatcher {
+        RecommendedWatcher::new(|_: notify::Result<notify::Event>| {}, Config::default()).unwrap()
+    }
+
+    #[test]
+    fn a_watch_that_finishes_arming_late_never_replaces_a_newer_request() {
+        let state = WatcherState::new();
+        let slow = state.request("main");
+        let fast = state.request("main");
+        assert!(state.install("main".into(), fast, idle_watcher()));
+        assert!(
+            !state.install("main".into(), slow, idle_watcher()),
+            "the older request replaced the newer watch"
+        );
+    }
+
+    #[test]
+    fn unwatch_and_window_close_cancel_a_watch_still_arming() {
+        let state = WatcherState::new();
+        let pending = state.request("main");
+        state.unwatch("main");
+        assert!(!state.install("main".into(), pending, idle_watcher()));
+        assert!(lock_recover(&state.watchers).is_empty());
+
+        let pending = state.request("other");
+        state.forget_window("other");
+        assert!(
+            !state.install("other".into(), pending, idle_watcher()),
+            "a watch for a destroyed window was installed and leaked"
+        );
+        assert!(lock_recover(&state.watchers).is_empty());
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A private directory to keep the pin file in, so a test never touches the
@@ -755,6 +1839,526 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("markpad-{tag}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn unsaved_changes_are_kept_only_by_the_last_window_or_on_quit() {
+        assert!(keeps_unsaved_on_close_for(false, "main", ["main"]));
+        assert!(keeps_unsaved_on_close_for(
+            false,
+            "window-2",
+            ["window-2", "settings"]
+        ));
+        assert!(!keeps_unsaved_on_close_for(
+            false,
+            "main",
+            ["main", "window-2"]
+        ));
+        assert!(!keeps_unsaved_on_close_for(
+            false,
+            "window-2",
+            ["main", "window-2"]
+        ));
+        assert!(keeps_unsaved_on_close_for(
+            true,
+            "main",
+            ["main", "window-2"]
+        ));
+    }
+
+    #[test]
+    fn recovery_paths_accept_only_safe_window_labels() {
+        let dir = Path::new("unsaved-recovery");
+        for label in ["main", "window-123", "A_b-09"] {
+            assert_eq!(
+                label_file(dir, label).unwrap(),
+                dir.join(format!("{label}.json"))
+            );
+        }
+        for label in [
+            "", ".", "..", "../main", "a/b", "a\\b", "/main", "a.json", "a b", "é",
+        ] {
+            assert!(label_file(dir, label).is_err(), "accepted {label:?}");
+        }
+    }
+
+    #[test]
+    fn recovery_snapshots_are_separate_and_empty_save_removes_only_its_window() {
+        let root = temp_dir("recovery");
+        let dir = root.join("unsaved-recovery");
+        assert!(load_unsaved_recovery_at(&dir).unwrap().is_empty());
+        save_unsaved_recovery_at(&dir, "main", "[]").unwrap();
+        assert!(!dir.exists());
+        save_unsaved_recovery_at(&dir, "main", r#"[{"content":"draft"}]"#).unwrap();
+        save_unsaved_recovery_at(&dir, "window-2", r#"[{"content":"other"}]"#).unwrap();
+        save_unsaved_recovery_at(&dir, "main", r#"[{"content":"updated"}]"#).unwrap();
+        assert_eq!(
+            load_unsaved_recovery_at(&dir).unwrap(),
+            vec![
+                ("main".to_string(), r#"[{"content":"updated"}]"#.to_string()),
+                (
+                    "window-2".to_string(),
+                    r#"[{"content":"other"}]"#.to_string()
+                ),
+            ]
+        );
+        save_unsaved_recovery_at(&dir, "main", " [] \n").unwrap();
+        assert_eq!(load_unsaved_recovery_at(&dir).unwrap().len(), 1);
+        clear_unsaved_recovery_at(&dir, &["window-2".into(), "missing".into()]).unwrap();
+        assert!(load_unsaved_recovery_at(&dir).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_clear_validates_all_labels_before_removing_anything() {
+        let dir = temp_dir("recovery-validation");
+        save_unsaved_recovery_at(&dir, "main", "[1]").unwrap();
+        assert!(clear_unsaved_recovery_at(&dir, &["main".into(), "../outside".into()]).is_err());
+        assert_eq!(fs::read_to_string(dir.join("main.json")).unwrap(), "[1]");
+        assert!(save_unsaved_recovery_at(&dir, "../outside", "[2]").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_load_ignores_invalid_names_and_returns_unreadable_files_empty() {
+        let dir = temp_dir("recovery-read");
+        fs::write(dir.join("bad.name.json"), "ignored").unwrap();
+        fs::write(dir.join(".json"), "ignored").unwrap();
+        fs::write(dir.join("main.tmp"), "ignored").unwrap();
+        fs::create_dir(dir.join("directory.json")).unwrap();
+        assert!(load_unsaved_recovery_at(&dir).unwrap().is_empty());
+        fs::write(dir.join("main.json"), [0xff]).unwrap();
+        fs::write(dir.join("window-2.json"), "[1]").unwrap();
+        assert_eq!(
+            load_unsaved_recovery_at(&dir).unwrap(),
+            vec![
+                ("main".to_string(), String::new()),
+                ("window-2".to_string(), "[1]".to_string()),
+            ]
+        );
+        assert_eq!(fs::read(dir.join("main.json")).unwrap(), [0xff]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_does_not_follow_a_snapshot_symlink_into_a_document() {
+        let dir = temp_dir("recovery-symlink");
+        let document = dir.join("original.md");
+        fs::write(&document, "original").unwrap();
+        std::os::unix::fs::symlink(&document, dir.join("main.json")).unwrap();
+        assert!(save_unsaved_recovery_at(&dir, "main", "[1]").is_err());
+        assert!(load_unsaved_recovery_at(&dir).unwrap().is_empty());
+        clear_unsaved_recovery_at(&dir, &["main".into()]).unwrap();
+        assert_eq!(fs::read_to_string(document).unwrap(), "original");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn main_keeps_its_old_files_and_other_windows_get_one_each() {
+        let config = Path::new("config");
+        assert_eq!(
+            window_state_path_in(config, "main").unwrap(),
+            config.join("window-state-v2.json")
+        );
+        assert_eq!(
+            restore_progress_path_in(config, "main").unwrap(),
+            config.join("restore-progress-v1.json")
+        );
+        assert_eq!(
+            window_state_path_in(config, "window-ab12").unwrap(),
+            config.join("window-state").join("window-ab12.json")
+        );
+        assert_eq!(
+            restore_progress_path_in(config, "window-ab12").unwrap(),
+            config.join("restore-progress").join("window-ab12.json")
+        );
+        for label in ["settings", "", "window-../main", "window-a/b", "window-a.b"] {
+            assert!(
+                window_state_path_in(config, label).is_err(),
+                "accepted {label:?}"
+            );
+            assert!(
+                restore_progress_path_in(config, label).is_err(),
+                "accepted {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_window_reads_and_forgets_only_its_own_snapshot() {
+        let config = temp_dir("window-state");
+        // A session written before snapshots were per window is main's entry.
+        fs::write(config.join("window-state-v2.json"), "legacy").unwrap();
+        assert_eq!(
+            load_window_state_in(&config, "main").as_deref(),
+            Some("legacy")
+        );
+        assert!(remembered_window_labels_in(&config).is_empty());
+
+        save_window_state_in(&config, "main", "m").unwrap();
+        save_window_state_in(&config, "window-b", "b").unwrap();
+        save_window_state_in(&config, "window-a", "a").unwrap();
+        write_restore_progress(
+            &restore_progress_path_in(&config, "window-a").unwrap(),
+            "{}",
+        )
+        .unwrap();
+        assert!(save_window_state_in(&config, "settings", "x").is_err());
+        fs::write(config.join("window-state").join("notes.json"), "x").unwrap();
+        assert_eq!(load_window_state_in(&config, "main").as_deref(), Some("m"));
+        assert_eq!(
+            load_window_state_in(&config, "window-a").as_deref(),
+            Some("a")
+        );
+        assert_eq!(load_window_state_in(&config, "window-c"), None);
+        assert_eq!(
+            remembered_window_labels_in(&config),
+            ["window-a", "window-b"]
+        );
+
+        forget_window_state_in(&config, "window-a").unwrap();
+        assert_eq!(remembered_window_labels_in(&config), ["window-b"]);
+        assert!(!config
+            .join("restore-progress")
+            .join("window-a.json")
+            .exists());
+        assert_eq!(load_window_state_in(&config, "main").as_deref(), Some("m"));
+        forget_window_state_in(&config, "main").unwrap();
+        assert_eq!(load_window_state_in(&config, "main"), None);
+        assert_eq!(
+            load_window_state_in(&config, "window-b").as_deref(),
+            Some("b")
+        );
+
+        save_window_state_in(&config, "main", "m").unwrap();
+        clear_window_state_in(&config).unwrap();
+        assert_eq!(load_window_state_in(&config, "main"), None);
+        assert!(remembered_window_labels_in(&config).is_empty());
+        clear_window_state_in(&config).unwrap();
+        fs::remove_dir_all(config).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_window_snapshot_does_not_follow_a_symlink_into_a_document() {
+        let config = temp_dir("window-state-symlink");
+        let document = config.join("original.md");
+        fs::write(&document, "original").unwrap();
+        fs::create_dir(config.join("window-state")).unwrap();
+        std::os::unix::fs::symlink(&document, config.join("window-state").join("window-a.json"))
+            .unwrap();
+        assert!(save_window_state_in(&config, "window-a", "x").is_err());
+        assert!(remembered_window_labels_in(&config).is_empty());
+        assert_eq!(fs::read_to_string(document).unwrap(), "original");
+        fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_quit_forgets_the_windows_it_closed() {
+        let config = temp_dir("quit");
+        let quit = Mutex::new(None);
+        save_window_state_in(&config, "window-a", "a").unwrap();
+        save_window_state_in(&config, "window-b", "b").unwrap();
+        // A close cancelled with no quit under way forgets nothing.
+        assert!(update_quit(&quit, false).is_empty());
+
+        update_quit(&quit, true);
+        lock_recover(&quit)
+            .as_mut()
+            .unwrap()
+            .push("window-a".to_string());
+        // A second Quit while the first is still closing keeps the record.
+        update_quit(&quit, true);
+        let closed = update_quit(&quit, false);
+        assert_eq!(closed, ["window-a"]);
+        for label in &closed {
+            forget_window_state_in(&config, label).unwrap();
+        }
+        assert_eq!(remembered_window_labels_in(&config), ["window-b"]);
+        assert!(lock_recover(&quit).is_none());
+        fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
+    fn an_orphan_backup_is_handed_out_once() {
+        let records = || {
+            vec![
+                ("main".to_string(), "m".to_string()),
+                ("window-crashed".to_string(), "c".to_string()),
+                ("window-open".to_string(), "o".to_string()),
+            ]
+        };
+        let orphan = |label: &str| label == "window-crashed";
+        let labels = |taken: Vec<(String, String)>| -> Vec<String> {
+            taken.into_iter().map(|(label, _)| label).collect()
+        };
+        let mut claimed = HashSet::new();
+        assert_eq!(
+            labels(claim_recovery_records(
+                records(),
+                "window-open",
+                orphan,
+                &mut claimed
+            )),
+            ["window-crashed", "window-open"]
+        );
+        assert_eq!(
+            labels(claim_recovery_records(
+                records(),
+                "main",
+                orphan,
+                &mut claimed
+            )),
+            ["main"]
+        );
+    }
+
+    #[test]
+    fn the_launch_window_adopts_a_remembered_window_only_without_a_snapshot() {
+        let remembered = ["window-a".to_string(), "window-b".to_string()];
+        assert_eq!(adoption_source(true, &remembered), None);
+        assert_eq!(adoption_source(false, &remembered), Some("window-a"));
+        assert_eq!(adoption_source(false, &[]), None);
+    }
+
+    #[test]
+    fn adoption_moves_every_file_of_the_window_to_the_launch_window() {
+        let config = temp_dir("adopt");
+        let recovery = config.join(UNSAVED_RECOVERY_DIR);
+        save_window_state_in(&config, "window-a", "a").unwrap();
+        write_restore_progress(&restore_progress_path_in(&config, "window-a").unwrap(), "p")
+            .unwrap();
+        save_unsaved_recovery_at(&recovery, "window-a", "[1]").unwrap();
+        let geometry = config.join(tauri_plugin_window_state::DEFAULT_FILENAME);
+        fs::write(&geometry, r#"{"main":{"x":1},"window-a":{"x":2}}"#).unwrap();
+
+        adopt_window_in(&config, "window-a").unwrap();
+
+        assert_eq!(
+            load_window_state_in(&config, LAUNCH_LABEL).as_deref(),
+            Some("a")
+        );
+        assert!(remembered_window_labels_in(&config).is_empty());
+        assert_eq!(
+            fs::read_to_string(restore_progress_path_in(&config, LAUNCH_LABEL).unwrap()).unwrap(),
+            "p"
+        );
+        assert_eq!(
+            load_unsaved_recovery_at(&recovery).unwrap(),
+            [("main".to_string(), "[1]".to_string())]
+        );
+        let entries: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&geometry).unwrap()).unwrap();
+        assert_eq!(entries, serde_json::json!({"main": {"x": 2}}));
+        fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
+    fn adoption_never_overwrites_the_launch_windows_own_backup() {
+        let config = temp_dir("adopt-backup");
+        let recovery = config.join(UNSAVED_RECOVERY_DIR);
+        save_window_state_in(&config, "window-a", "a").unwrap();
+        save_unsaved_recovery_at(&recovery, "main", "[0]").unwrap();
+        save_unsaved_recovery_at(&recovery, "window-a", "[1]").unwrap();
+
+        adopt_window_in(&config, "window-a").unwrap();
+
+        // window-a's backup now has no snapshot: an orphan, claimed at startup.
+        assert_eq!(
+            load_unsaved_recovery_at(&recovery).unwrap(),
+            [
+                ("main".to_string(), "[0]".to_string()),
+                ("window-a".to_string(), "[1]".to_string()),
+            ]
+        );
+        assert_eq!(
+            load_window_state_in(&config, LAUNCH_LABEL).as_deref(),
+            Some("a")
+        );
+        fs::remove_dir_all(config).unwrap();
+    }
+
+    fn held(entries: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        entries
+            .iter()
+            .map(|(label, files)| {
+                (
+                    label.to_string(),
+                    files.iter().map(|f| f.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_file_already_open_belongs_to_the_window_that_has_it() {
+        let held = held(&[
+            ("main", &["/n/a.md"]),
+            ("window-1", &["/n/b.md", "/n/c.md"]),
+        ]);
+        assert_eq!(file_holder(&held, "/n/c.md", "/n/c.md"), Some("window-1"));
+        assert_eq!(file_holder(&held, "/n/a.md", "/n/a.md"), Some("main"));
+        assert_eq!(file_holder(&held, "/n/new.md", "/n/new.md"), None);
+        // The receiving window itself is not "another window that has it".
+    }
+
+    #[test]
+    fn a_holder_is_found_by_identity_or_by_the_path_it_typed() {
+        // A tab with a resolved `pathKey` reports the canonical form; one
+        // without reports the path as typed. Either matches.
+        let held = held(&[
+            ("window-1", &["C:\\Notes\\A.md"]),
+            ("window-2", &["/typed/b.md"]),
+        ]);
+        assert_eq!(
+            file_holder(&held, "c:/notes/a.md", "C:\\Notes\\A.md"),
+            Some("window-1")
+        );
+        assert_eq!(
+            file_holder(&held, "/typed/b.md", "/real/b.md"),
+            Some("window-2")
+        );
+    }
+
+    #[test]
+    fn a_snapshot_names_the_files_its_window_will_restore() {
+        let json = r#"{"version":2,"activeTabId":"x","tabs":[{"id":"x","path":"/n/a.md"},{"id":"y","path":"/n/b.md"}]}"#;
+        assert_eq!(snapshot_paths(json), vec!["/n/a.md", "/n/b.md"]);
+        for unreadable in [
+            "",
+            "not json",
+            "{}",
+            r#"{"tabs":"no"}"#,
+            r#"{"tabs":[{"title":"no path"}]}"#,
+        ] {
+            assert!(snapshot_paths(unreadable).is_empty(), "{unreadable:?}");
+        }
+    }
+
+    #[test]
+    fn launch_files_another_window_restores_are_routed_to_it() {
+        let held = held(&[
+            ("main", &["/n/main.md"]),
+            ("window-1", &["/n/a.md", "/n/b.md"]),
+            ("window-2", &["/n/c.md"]),
+        ]);
+        let files = ["/n/a.md", "/n/new.md", "/n/c.md", "/n/main.md", "/n/b.md"]
+            .map(String::from)
+            .to_vec();
+        let (here, elsewhere) = route_launch_files(&held, files, |path| path.to_string());
+        // Files open nowhere, and ones the launch window has itself, stay.
+        assert_eq!(here, vec!["/n/new.md", "/n/main.md"]);
+        assert_eq!(
+            elsewhere,
+            BTreeMap::from([
+                (
+                    "window-1".to_string(),
+                    vec!["/n/a.md".to_string(), "/n/b.md".to_string()]
+                ),
+                ("window-2".to_string(), vec!["/n/c.md".to_string()]),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_launch_window_keeps_a_file_it_shares_with_another_window() {
+        // Two windows on one file is the duplicate this fixes, but a session
+        // saved by an older build can still hold one. The launch window lists
+        // first, so the file stays where the files are being opened anyway.
+        let held = held(&[("main", &["/n/a.md"]), ("window-1", &["/n/a.md"])]);
+        let (here, elsewhere) =
+            route_launch_files(&held, vec!["/n/a.md".to_string()], |p| p.to_string());
+        assert_eq!(here, vec!["/n/a.md"]);
+        assert!(elsewhere.is_empty());
+    }
+
+    #[test]
+    fn a_launch_file_a_reopened_window_restores_is_not_sent_to_the_launch_window() {
+        let config = temp_dir("restores");
+        // The pinned window from the report: its label, its three files.
+        save_window_state_in(
+            &config,
+            "window-pinned-54657374205461672031-1",
+            r#"{"tabs":[{"path":"/t/Test_file_1.md"},{"path":"/t/Test_file_2.md"}]}"#,
+        )
+        .unwrap();
+        // The launch window's own snapshot names a file too, but its own tabs
+        // are not "another window's"; it is not one the launch reopens.
+        save_window_state_in(&config, "main", r#"{"tabs":[{"path":"/t/main.md"}]}"#).unwrap();
+
+        assert!(snapshot_restores(
+            &config,
+            "/t/Test_file_2.md",
+            "/t/Test_file_2.md"
+        ));
+        assert!(!snapshot_restores(&config, "/t/main.md", "/t/main.md"));
+        assert!(!snapshot_restores(&config, "/t/new.md", "/t/new.md"));
+        // No session at all: nothing is held, so nothing changes.
+        assert!(!snapshot_restores(
+            &temp_dir("restores-empty"),
+            "/t/a.md",
+            "/t/a.md"
+        ));
+    }
+
+    #[test]
+    fn a_closed_window_stops_holding_its_files() {
+        let state = AppState::new();
+        lock_recover(&state.open_files).insert("window-1".to_string(), vec!["/n/a.md".to_string()]);
+        lock_recover(&state.launch_routing)
+            .routed
+            .insert("window-1".to_string(), vec!["/n/b.md".to_string()]);
+        state.window_destroyed("window-1");
+        assert!(!lock_recover(&state.open_files).contains_key("window-1"));
+        assert!(!lock_recover(&state.launch_routing)
+            .routed
+            .contains_key("window-1"));
+    }
+
+    // #1029: "Ask me" lists the windows only once every reopened window has
+    // restored, or a launch file could be asked about with windows missing.
+    #[test]
+    fn the_launch_is_restored_once_every_open_window_has_asked() {
+        let asked = |labels: &[&str]| {
+            labels
+                .iter()
+                .map(|label| label.to_string())
+                .collect::<HashSet<_>>()
+        };
+        let open = ["main", "window-a", "window-b"];
+        assert!(!launch_restored(&open, &asked(&["main", "window-a"])));
+        assert!(!launch_restored(&open, &asked(&["window-a", "window-b"])));
+        assert!(launch_restored(
+            &open,
+            &asked(&["main", "window-a", "window-b"])
+        ));
+        assert!(launch_restored(&["main"], &asked(&["main"])));
+        // A window that closed without asking is no longer waited for.
+        assert!(launch_restored(
+            &["main", "window-a"],
+            &asked(&["main", "window-a"])
+        ));
+    }
+
+    #[test]
+    fn a_file_opened_while_running_goes_to_the_last_focused_window() {
+        let open = ["main", "window-a", "window-b"];
+        assert_eq!(
+            delivery_label(Some("window-b"), Some("window-a"), &open),
+            Some("window-b")
+        );
+        assert_eq!(
+            delivery_label(None, Some("window-a"), &open),
+            Some("window-a")
+        );
+        // The last focused window has closed since.
+        assert_eq!(delivery_label(None, Some("window-c"), &open), Some("main"));
+        assert_eq!(
+            delivery_label(None, None, &["window-b", "window-a"]),
+            Some("window-b")
+        );
+        assert_eq!(delivery_label(None, None, &[]), None);
     }
 
     /// argv, as the shell would hand it over: `argv[0]` and then the arguments.
@@ -898,6 +2502,7 @@ mod tests {
                             format!("keep-{writer}"),
                             "#222222".to_string(),
                             vec![format!("/tmp/{writer}-{round}.md")],
+                            true,
                         )
                         .unwrap();
                     }
@@ -927,34 +2532,39 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Re-pinning a tag replaces its color and file list in place.
+    /// Pinning a window under a name a closed group still holds refuses, and
+    /// the group keeps its colour and files.
     #[test]
-    fn saving_an_existing_tag_updates_it_rather_than_duplicating_it() {
+    fn pinning_a_taken_name_leaves_the_existing_group_alone() {
         let dir = temp_dir("pinned-tags-update");
         let path = dir.join("pinned-tags.json");
         let lock = Mutex::new(());
 
-        save_pinned_tag_at(
+        let found = save_pinned_tag_at(
             &lock,
             &path,
             "work".to_string(),
             "#1a73e8".to_string(),
             vec!["/tmp/a.md".to_string()],
+            true,
         )
         .unwrap();
-        save_pinned_tag_at(
+        assert!(!found);
+        let found = save_pinned_tag_at(
             &lock,
             &path,
             "work".to_string(),
             "#d93025".to_string(),
             vec!["/tmp/b.md".to_string()],
+            true,
         )
         .unwrap();
+        assert!(found, "the second pin was not told the name is taken");
 
         let tags = read_pinned_tags_at(&path);
         assert_eq!(tags.len(), 1);
-        assert_eq!(tags[0].color, "#d93025");
-        assert_eq!(tags[0].files, vec!["/tmp/b.md".to_string()]);
+        assert_eq!(tags[0].color, "#1a73e8");
+        assert_eq!(tags[0].files, vec!["/tmp/a.md".to_string()]);
 
         remove_pinned_tag_at(&lock, &path, "work".to_string()).unwrap();
         assert!(read_pinned_tags_at(&path).is_empty());
@@ -962,18 +2572,159 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A window's closing save only refreshes a pin that still exists. Another
+    /// window may have unpinned the tag while this one still held it, and
+    /// writing it back then would undo that unpin.
+    #[test]
+    fn updating_a_pin_never_recreates_one_that_was_removed() {
+        let dir = temp_dir("pinned-tags-update-only");
+        let path = dir.join("pinned-tags.json");
+        let lock = Mutex::new(());
+
+        save_pinned_tag_at(
+            &lock,
+            &path,
+            "Research".to_string(),
+            "#1a73e8".to_string(),
+            vec!["/papers/a.md".to_string()],
+            true,
+        )
+        .unwrap();
+        let updated = save_pinned_tag_at(
+            &lock,
+            &path,
+            "Research".to_string(),
+            "#d93025".to_string(),
+            vec!["/papers/b.md".to_string()],
+            false,
+        )
+        .unwrap();
+        assert!(updated);
+        let tags = read_pinned_tags_at(&path);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].color, "#d93025");
+        assert_eq!(tags[0].files, vec!["/papers/b.md".to_string()]);
+
+        remove_pinned_tag_at(&lock, &path, "Research".to_string()).unwrap();
+        let updated = save_pinned_tag_at(
+            &lock,
+            &path,
+            "Research".to_string(),
+            "#d93025".to_string(),
+            vec!["/papers/b.md".to_string()],
+            false,
+        )
+        .unwrap();
+        assert!(!updated, "the update reported a pin that is gone");
+        assert!(read_pinned_tags_at(&path).is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Renaming a pinned tag renames its entry, so the closing save — which
+    /// finds the entry by the window's current name — still finds it.
+    #[test]
+    fn renaming_a_pin_keeps_its_files_under_the_new_name() {
+        let dir = temp_dir("pinned-tags-rename");
+        let path = dir.join("pinned-tags.json");
+        let lock = Mutex::new(());
+
+        save_pinned_tag_at(
+            &lock,
+            &path,
+            "Research".to_string(),
+            "#1a73e8".to_string(),
+            vec!["/papers/a.md".to_string()],
+            true,
+        )
+        .unwrap();
+        let outcome = rename_pinned_tag_at(
+            &lock,
+            &path,
+            "Research".to_string(),
+            "Papers".to_string(),
+            "#d93025".to_string(),
+        )
+        .unwrap();
+        assert_eq!(outcome, PinnedTagRename::Renamed);
+        let tags = read_pinned_tags_at(&path);
+        assert_eq!(tags.len(), 1, "the rename left the old entry behind");
+        assert_eq!(tags[0].name, "Papers");
+        assert_eq!(tags[0].color, "#d93025");
+        assert_eq!(tags[0].files, vec!["/papers/a.md".to_string()]);
+
+        let updated = save_pinned_tag_at(
+            &lock,
+            &path,
+            "Papers".to_string(),
+            "#d93025".to_string(),
+            vec!["/papers/b.md".to_string()],
+            false,
+        )
+        .unwrap();
+        assert!(updated, "the closing save did not find the renamed pin");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A name another pin holds is refused, and a pin another window removed
+    /// is not recreated by renaming it.
+    #[test]
+    fn renaming_a_pin_refuses_a_taken_name_and_never_recreates_one() {
+        let dir = temp_dir("pinned-tags-rename-refused");
+        let path = dir.join("pinned-tags.json");
+        let lock = Mutex::new(());
+
+        for (name, file) in [("Research", "/papers/a.md"), ("Notes", "/notes/c.md")] {
+            save_pinned_tag_at(
+                &lock,
+                &path,
+                name.to_string(),
+                "#1a73e8".to_string(),
+                vec![file.to_string()],
+                true,
+            )
+            .unwrap();
+        }
+        let outcome = rename_pinned_tag_at(
+            &lock,
+            &path,
+            "Research".to_string(),
+            "Notes".to_string(),
+            "#d93025".to_string(),
+        )
+        .unwrap();
+        assert_eq!(outcome, PinnedTagRename::Taken);
+        let tags = read_pinned_tags_at(&path);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].name, "Research");
+        assert_eq!(tags[1].files, vec!["/notes/c.md".to_string()]);
+
+        let outcome = rename_pinned_tag_at(
+            &lock,
+            &path,
+            "Gone".to_string(),
+            "Back".to_string(),
+            "#d93025".to_string(),
+        )
+        .unwrap();
+        assert_eq!(outcome, PinnedTagRename::Missing);
+        assert_eq!(read_pinned_tags_at(&path).len(), 2);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The loss that makes tag names exclusive worth enforcing.
     ///
-    /// Two windows, one tag name, one pinned document set. Both windows pin —
-    /// serially, each holding the lock in turn, so #424's `pinned_tags` mutex
-    /// is doing its job and this is not a race. `save_pinned_tag_at` still
-    /// finds the entry BY NAME and replaces its whole `files` list, so the
-    /// second window's pin does not merge with the first's, it erases it. The
-    /// user set two windows up and gets one back.
+    /// Two windows, one tag name, one pinned document set. Both windows save
+    /// their pin as they close — serially, each holding the lock in turn, so
+    /// #424's `pinned_tags` mutex is doing its job and this is not a race.
+    /// `save_pinned_tag_at` still finds the entry BY NAME and replaces its
+    /// whole `files` list, so the second window's save does not merge with the
+    /// first's, it erases it. The user set two windows up and gets one back.
     ///
     /// Asserted on the surviving file rather than on the call, because the call
-    /// succeeds in both worlds: `save_pinned_tag_at` returns `Ok(())` either
-    /// way and nothing anywhere reports the overwrite.
+    /// succeeds in both worlds and nothing anywhere reports the overwrite.
     #[test]
     fn two_windows_sharing_a_tag_name_overwrite_one_anothers_pinned_files() {
         let dir = temp_dir("pinned-tags-shared-name");
@@ -986,6 +2737,7 @@ mod tests {
             "Research".to_string(),
             "#1a73e8".to_string(),
             vec!["/papers/a.md".to_string(), "/papers/b.md".to_string()],
+            true,
         )
         .unwrap();
         save_pinned_tag_at(
@@ -994,6 +2746,7 @@ mod tests {
             "Research".to_string(),
             "#d93025".to_string(),
             vec!["/notes/c.md".to_string()],
+            false,
         )
         .unwrap();
 
@@ -1020,6 +2773,32 @@ mod tests {
             active_tab_title: String::new(),
             tab_count: 0,
         }
+    }
+
+    /// A pinned group's window holds the group's name from the moment it is
+    /// created, so a second click finds it and focuses it instead of opening
+    /// another window for the same group. Its own first report keeps the
+    /// number it was given.
+    #[test]
+    fn a_pinned_window_holds_its_tag_before_it_mounts() {
+        let mut registry = HashMap::new();
+        registry.insert("main".to_string(), meta_with_tag(None));
+        let counter = AtomicU64::new(1);
+
+        reserve_window_tag(
+            &mut registry,
+            &counter,
+            "window-pinned-576f726b-1",
+            "Work".to_string(),
+        );
+
+        assert!(tag_held_by_another_window(&registry, "main", "Work"));
+        assert!(!tag_held_by_another_window(
+            &registry,
+            "window-pinned-576f726b-1",
+            "Work"
+        ));
+        assert_eq!(registry["window-pinned-576f726b-1"].number, 2);
     }
 
     /// A name is taken by OTHER windows only — never by the asker itself.
@@ -1089,6 +2868,7 @@ mod tests {
             "after".to_string(),
             "#188038".to_string(),
             vec![],
+            true,
         )
         .unwrap();
         let tags = read_pinned_tags_at(&path);
@@ -1172,6 +2952,49 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    fn listed(state: &AppState) -> Vec<String> {
+        state
+            .viewer_windows()
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect()
+    }
+
+    /// Move-to-window lists open windows in the order they were opened, and
+    /// never one that has closed: a closed window offered as a target takes the
+    /// tab nowhere.
+    #[test]
+    fn the_runtime_registers_live_viewer_windows_in_stable_creation_order() {
+        let state = AppState::new();
+        for label in ["main", "window-b", "window-a"] {
+            state.record_window_meta(label.into(), None, None, "t".into(), 1);
+        }
+        // A later report from the first window keeps its place.
+        state.record_window_meta("main".into(), Some("Work".into()), None, "u".into(), 2);
+        assert_eq!(listed(&state), ["main", "window-b", "window-a"]);
+
+        update_quit(&state.quit, true);
+        state.window_destroyed("window-b");
+        assert_eq!(listed(&state), ["main", "window-a"]);
+        assert_eq!(update_quit(&state.quit, false), ["window-b"]);
+    }
+
+    /// Only the launch window's first show stays in the background (#702); a
+    /// detached tab window or the close walk revealing a window still activates.
+    #[test]
+    fn the_launch_window_is_shown_without_being_activated_on_a_cold_start() {
+        let shown = AtomicBool::new(false);
+        assert!(
+            !is_cold_start_show("window-a", &shown),
+            "another window's show is not the cold start"
+        );
+        assert!(is_cold_start_show(LAUNCH_LABEL, &shown));
+        assert!(
+            !is_cold_start_show(LAUNCH_LABEL, &shown),
+            "only the first show is quiet"
+        );
+    }
 }
 
 /// Does a watch armed on a FILE survive that file being replaced by a rename?
@@ -1183,8 +3006,8 @@ mod tests {
 /// it is what one Markpad save does to its own watch, and what most editors do
 /// to it (VS Code, Vim, JetBrains, Emacs all rename on save).
 ///
-/// If this fails on a platform, Live Mode there stops reporting anything after
-/// the first save, silently and for the rest of the session.
+/// If this fails on a platform, the watcher there stops reporting anything
+/// after the first save, silently and for the rest of the session.
 #[cfg(test)]
 mod watch_targeting {
     use super::{event_concerns, watch_root};
@@ -1224,6 +3047,39 @@ mod watch_targeting {
         assert!(!event_concerns(&event(&[]), name));
         // The fallback watch is on the file, so there is nothing to filter.
         assert!(event_concerns(&event(&["/notes/b.md"]), None));
+    }
+}
+
+#[cfg(test)]
+mod coalesced_calls {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_burst_runs_once_after_it_and_a_later_call_runs_again() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = runs.clone();
+        let call = super::coalesced(Duration::from_millis(100), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Temp write, rename, metadata: one save.
+        for _ in 0..5 {
+            call();
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "ran before the burst settled"
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "one save, one reload");
+
+        // The next save is its own change, not swallowed by the last one.
+        call();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 }
 

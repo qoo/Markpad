@@ -1,14 +1,11 @@
-//! Markpad's Rust backend.
-//!
-//! Four modules that used to share one file, plus the three that already had
-//! their own: `fs_safety` (durable writes, file identity, text decoding),
-//! `markdown` (the render pipeline), `commands` (what the frontend can
-//! `invoke`) and `app` (the Tauri builder).
+//! Markpad's Rust backend. `app::run` builds the Tauri app; `commands`,
+//! `window_runtime` and `tab_transfer` hold what the frontend can `invoke`.
 
 mod app;
 mod asset_protocol;
 mod commands;
 mod error;
+mod folder;
 mod fs_safety;
 mod markdown;
 mod semantic;

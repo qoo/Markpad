@@ -29,16 +29,70 @@
 
 use comrak::nodes::{AstNode, ListType, NodeValue};
 
-use crate::markdown::markdown_options;
+use crate::markdown::{blank_front_matter, markdown_options};
+
+/// What a span is, as the legend in `utils/semanticTokens.ts` spells it: a token
+/// type, plus `.marker` for the `marker` modifier, which is how Monaco's theme
+/// lookup spells it (`tokenTheme._match("heading.marker")`). The frontend gets
+/// this as a string union, so a kind added here without a legend entry fails
+/// svelte-check there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum SemanticKind {
+    Heading,
+    #[serde(rename = "heading.marker")]
+    HeadingMarker,
+    #[serde(rename = "list.marker")]
+    ListMarker,
+    #[serde(rename = "task.marker")]
+    TaskMarker,
+    #[serde(rename = "quote.marker")]
+    QuoteMarker,
+    Rule,
+    Fence,
+    Frontmatter,
+    #[serde(rename = "table.marker")]
+    TableMarker,
+    Code,
+    #[serde(rename = "code.marker")]
+    CodeMarker,
+    Strong,
+    #[serde(rename = "strong.marker")]
+    StrongMarker,
+    Emph,
+    #[serde(rename = "emph.marker")]
+    EmphMarker,
+    Strongemph,
+    Strike,
+    #[serde(rename = "strike.marker")]
+    StrikeMarker,
+    Highlight,
+    #[serde(rename = "highlight.marker")]
+    HighlightMarker,
+    Insert,
+    #[serde(rename = "insert.marker")]
+    InsertMarker,
+    Link,
+    #[serde(rename = "link.marker")]
+    LinkMarker,
+    Image,
+    #[serde(rename = "image.marker")]
+    ImageMarker,
+    Math,
+    #[serde(rename = "math.marker")]
+    MathMarker,
+    Wikilink,
+    #[serde(rename = "wikilink.marker")]
+    WikilinkMarker,
+    Footnote,
+    Html,
+}
 
 /// One coloured range, in the coordinates Monaco's semantic tokens speak:
 /// zero-based line, zero-based UTF-16 column, length in UTF-16 code units.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
 pub struct SemanticSpan {
-    /// A legend entry in `utils/semanticTokens.ts`. `kind.marker` there is a
-    /// token type plus its `marker` modifier, which is how Monaco's theme
-    /// lookup spells it (`tokenTheme._match("heading.marker")`).
-    pub kind: &'static str,
+    pub kind: SemanticKind,
     pub line: u32,
     pub start: u32,
     pub len: u32,
@@ -57,16 +111,22 @@ struct ByteSpan {
 /// Non-overlapping is a requirement, not a nicety: Monaco's semantic tokens are
 /// delta-encoded from one token to the next, and two tokens covering the same
 /// character produce a negative delta that the decoder reads as a new line.
-pub fn semantic_spans(content: &str) -> Vec<SemanticSpan> {
+pub fn semantic_spans(content: &str, front_matter_lines: usize) -> Vec<SemanticSpan> {
     let lines: Vec<&str> = content.split('\n').collect();
-    let mut raw: Vec<(ByteSpan, &'static str)> = Vec::new();
+    let mut raw: Vec<(ByteSpan, SemanticKind)> = Vec::new();
 
+    // Front matter is YAML, and parsed as markdown its closing `---` makes it
+    // a setext heading. The parse gets it blanked instead, which empties those
+    // lines and leaves the rest byte for byte, so every position below is
+    // still the buffer's.
+    let parsed = blank_front_matter(content, front_matter_lines);
     let arena = comrak::Arena::new();
     let options = markdown_options();
-    let root = comrak::parse_document(&arena, content, &options);
+    let root = comrak::parse_document(&arena, &parsed, &options);
     for node in root.descendants() {
         collect_node(node, &lines, &mut raw);
     }
+    front_matter_spans(&lines, front_matter_lines, &mut raw);
     app_syntax_spans(&lines, &mut raw);
 
     // Sort, then keep the first claim on any character. The order matters: an
@@ -102,6 +162,29 @@ pub fn semantic_spans(content: &str) -> Vec<SemanticSpan> {
         });
     }
     spans
+}
+
+/// The front matter lines `blank_front_matter` emptied, each whole. Being
+/// whole lines, these claim their lines before anything `app_syntax_spans`
+/// finds in the YAML.
+fn front_matter_spans(
+    lines: &[&str],
+    front_matter_lines: usize,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
+) {
+    for (line, text) in lines.iter().enumerate().take(front_matter_lines) {
+        let end = text.trim_end_matches('\r').len();
+        if end > 0 {
+            out.push((
+                ByteSpan {
+                    line,
+                    start: 0,
+                    end,
+                },
+                SemanticKind::Frontmatter,
+            ));
+        }
+    }
 }
 
 /// The UTF-16 offset of a byte offset, or `None` if it is not a char boundary.
@@ -147,7 +230,7 @@ fn node_lines(node: &AstNode, lines: &[&str]) -> Vec<ByteSpan> {
 fn collect_node<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     let value = node.data.borrow().value.clone();
     match value {
@@ -155,8 +238,8 @@ fn collect_node<'a>(
             // The `#` run and the space after it, then the words. Splitting them
             // is the thing Monarch cannot do — it emits one `keyword` for the
             // whole line, markup and prose alike.
-            emit_gaps(node, lines, "heading.marker", out);
-            emit_text_children(node, lines, "heading", out);
+            emit_gaps(node, lines, SemanticKind::HeadingMarker, out);
+            emit_text_children(node, lines, SemanticKind::Heading, out);
         }
         NodeValue::Item(item) => {
             emit_item_marker(node, lines, item.list_type, out);
@@ -170,14 +253,13 @@ fn collect_node<'a>(
             // currently purple.
             emit_task_marker(node, lines, out);
         }
-        NodeValue::BlockQuote => emit_line_prefix(node, lines, '>', "quote.marker", out),
-        NodeValue::ThematicBreak => emit_whole_lines(node, lines, "rule", out),
+        NodeValue::BlockQuote => emit_line_prefix(node, lines, '>', SemanticKind::QuoteMarker, out),
+        NodeValue::ThematicBreak => emit_whole_lines(node, lines, SemanticKind::Rule, out),
         NodeValue::CodeBlock(ref block) => {
             if block.fenced {
                 emit_fence_lines(node, lines, out);
             }
         }
-        NodeValue::FrontMatter(_) => emit_whole_lines(node, lines, "frontmatter", out),
         NodeValue::Table(_) => {
             // The `|---|---|` row is not a `TableRow` — it belongs to the table
             // itself — so its pipes have to be picked up here or the frame
@@ -190,7 +272,7 @@ fn collect_node<'a>(
             // Not `emit_gaps`: inline code keeps its text in the node's own
             // value rather than in a child, so the gap arithmetic would call the
             // whole span markup. The backtick runs are a known length instead.
-            emit_delimited(node, lines, code.num_backticks, "code", out);
+            emit_delimited(node, lines, code.num_backticks, SemanticKind::Code, out);
         }
         // The words as well as the `**`, which matters only when something else
         // has already claimed the line. Monaco's grammar paints `**bold**` on
@@ -199,51 +281,65 @@ fn collect_node<'a>(
         // token, and its heading rule takes the whole line as one `keyword`.
         // Inside either, an emphasis the parse can see would otherwise arrive
         // with no colour of its own.
+        //
+        // `***x***` is an Emph wrapping a Strong, and each claims only its own
+        // direct text, so `x` was bold and not italic (#830). A run inside
+        // both says so, since one character can carry only one kind.
         NodeValue::Strong => {
-            emit_gaps(node, lines, "strong.marker", out);
-            emit_text_children(node, lines, "strong", out);
+            emit_gaps(node, lines, SemanticKind::StrongMarker, out);
+            if inside(node, |value| matches!(value, NodeValue::Emph)) {
+                emit_text_children(node, lines, SemanticKind::Strongemph, out);
+            } else {
+                emit_text_children(node, lines, SemanticKind::Strong, out);
+            }
         }
         NodeValue::Emph => {
-            emit_gaps(node, lines, "emph.marker", out);
-            emit_text_children(node, lines, "emph", out);
+            emit_gaps(node, lines, SemanticKind::EmphMarker, out);
+            if inside(node, |value| matches!(value, NodeValue::Strong)) {
+                emit_text_children(node, lines, SemanticKind::Strongemph, out);
+            } else {
+                emit_text_children(node, lines, SemanticKind::Emph, out);
+            }
         }
         NodeValue::Strikethrough => {
-            emit_gaps(node, lines, "strike.marker", out);
-            emit_text_children(node, lines, "strike", out);
+            emit_gaps(node, lines, SemanticKind::StrikeMarker, out);
+            emit_text_children(node, lines, SemanticKind::Strike, out);
         }
         NodeValue::Insert | NodeValue::Underline => {
-            emit_gaps(node, lines, "insert.marker", out);
-            emit_text_children(node, lines, "insert", out);
+            emit_gaps(node, lines, SemanticKind::InsertMarker, out);
+            emit_text_children(node, lines, SemanticKind::Insert, out);
         }
         NodeValue::Highlight => {
-            emit_gaps(node, lines, "highlight.marker", out);
-            emit_text_children(node, lines, "highlight", out);
+            emit_gaps(node, lines, SemanticKind::HighlightMarker, out);
+            emit_text_children(node, lines, SemanticKind::Highlight, out);
         }
         NodeValue::Link(_) => {
-            emit_gaps(node, lines, "link.marker", out);
-            emit_text_children(node, lines, "link", out);
+            emit_gaps(node, lines, SemanticKind::LinkMarker, out);
+            emit_text_children(node, lines, SemanticKind::Link, out);
         }
         NodeValue::Image(_) => {
-            emit_gaps(node, lines, "image.marker", out);
-            emit_text_children(node, lines, "image", out);
+            emit_gaps(node, lines, SemanticKind::ImageMarker, out);
+            emit_text_children(node, lines, SemanticKind::Image, out);
         }
         NodeValue::FootnoteReference(_) | NodeValue::FootnoteDefinition(_) => {
-            emit_self(node, lines, "footnote", out);
+            emit_self(node, lines, SemanticKind::Footnote, out);
         }
         NodeValue::Math(ref math) => {
             emit_delimited(
                 node,
                 lines,
                 if math.display_math { 2 } else { 1 },
-                "math",
+                SemanticKind::Math,
                 out,
             );
         }
         NodeValue::WikiLink(_) => {
-            emit_gaps(node, lines, "wikilink.marker", out);
-            emit_text_children(node, lines, "wikilink", out);
+            emit_gaps(node, lines, SemanticKind::WikilinkMarker, out);
+            emit_text_children(node, lines, SemanticKind::Wikilink, out);
         }
-        NodeValue::HtmlInline(_) | NodeValue::HtmlBlock(_) => emit_self(node, lines, "html", out),
+        NodeValue::HtmlInline(_) | NodeValue::HtmlBlock(_) => {
+            emit_self(node, lines, SemanticKind::Html, out)
+        }
         _ => {}
     }
 }
@@ -252,8 +348,8 @@ fn collect_node<'a>(
 fn emit_gaps<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
-    kind: &'static str,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    kind: SemanticKind,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     let mut child_ranges: Vec<ByteSpan> = Vec::new();
     for child in node.children() {
@@ -296,13 +392,13 @@ fn emit_delimited<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
     delimiter: usize,
-    kind: &'static str,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    kind: SemanticKind,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
-    let marker: &'static str = match kind {
-        "code" => "code.marker",
-        "math" => "math.marker",
-        _ => "code.marker",
+    let marker: SemanticKind = match kind {
+        SemanticKind::Code => SemanticKind::CodeMarker,
+        SemanticKind::Math => SemanticKind::MathMarker,
+        _ => SemanticKind::CodeMarker,
     };
     let ranges = node_lines(node, lines);
     let (Some(first), Some(last)) = (ranges.first(), ranges.last()) else {
@@ -352,12 +448,19 @@ fn emit_delimited<'a>(
     }
 }
 
+/// Whether any ancestor of `node` matches.
+fn inside<'a>(node: &'a AstNode<'a>, matches: impl Fn(&NodeValue) -> bool) -> bool {
+    node.ancestors()
+        .skip(1)
+        .any(|a| matches(&a.data.borrow().value))
+}
+
 /// The direct `Text` children — the words, as opposed to the markup.
 fn emit_text_children<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
-    kind: &'static str,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    kind: SemanticKind,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     for child in node.children() {
         if matches!(child.data.borrow().value, NodeValue::Text(_)) {
@@ -373,8 +476,8 @@ fn emit_text_children<'a>(
 fn emit_self<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
-    kind: &'static str,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    kind: SemanticKind,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     out.extend(node_lines(node, lines).into_iter().map(|span| (span, kind)));
 }
@@ -382,8 +485,8 @@ fn emit_self<'a>(
 fn emit_whole_lines<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
-    kind: &'static str,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    kind: SemanticKind,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     emit_self(node, lines, kind, out);
 }
@@ -393,7 +496,7 @@ fn emit_item_marker<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
     list_type: ListType,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     let sp = node.data.borrow().sourcepos;
     let Some(text) = lines.get(sp.start.line.saturating_sub(1)) else {
@@ -425,7 +528,7 @@ fn emit_item_marker<'a>(
                 start,
                 end: start + len,
             },
-            "list.marker",
+            SemanticKind::ListMarker,
         ));
     }
 }
@@ -434,7 +537,7 @@ fn emit_item_marker<'a>(
 fn emit_task_marker<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     let sp = node.data.borrow().sourcepos;
     let Some(text) = lines.get(sp.start.line.saturating_sub(1)) else {
@@ -454,7 +557,7 @@ fn emit_task_marker<'a>(
             start,
             end: start + close + 1,
         },
-        "task.marker",
+        SemanticKind::TaskMarker,
     ));
 }
 
@@ -463,8 +566,8 @@ fn emit_line_prefix<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
     marker: char,
-    kind: &'static str,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    kind: SemanticKind,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     let sp = node.data.borrow().sourcepos;
     for line_no in sp.start.line..=sp.end.line {
@@ -496,7 +599,7 @@ fn emit_line_prefix<'a>(
 fn emit_fence_lines<'a>(
     node: &'a AstNode<'a>,
     lines: &[&str],
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     let sp = node.data.borrow().sourcepos;
     for line_no in [sp.start.line, sp.end.line] {
@@ -511,21 +614,21 @@ fn emit_fence_lines<'a>(
                     start: 0,
                     end: text.len(),
                 },
-                "fence",
+                SemanticKind::Fence,
             ));
         }
     }
 }
 
 /// Every `|` on a table row's lines.
-fn emit_pipes<'a>(node: &'a AstNode<'a>, lines: &[&str], out: &mut Vec<(ByteSpan, &'static str)>) {
+fn emit_pipes<'a>(node: &'a AstNode<'a>, lines: &[&str], out: &mut Vec<(ByteSpan, SemanticKind)>) {
     let sp = node.data.borrow().sourcepos;
     for line_no in sp.start.line..=sp.end.line {
         emit_pipes_on_line(lines, line_no, out);
     }
 }
 
-fn emit_pipes_on_line(lines: &[&str], line_no: usize, out: &mut Vec<(ByteSpan, &'static str)>) {
+fn emit_pipes_on_line(lines: &[&str], line_no: usize, out: &mut Vec<(ByteSpan, SemanticKind)>) {
     let Some(text) = lines.get(line_no.saturating_sub(1)) else {
         return;
     };
@@ -537,7 +640,7 @@ fn emit_pipes_on_line(lines: &[&str], line_no: usize, out: &mut Vec<(ByteSpan, &
                     start: index,
                     end: index + 1,
                 },
-                "table.marker",
+                SemanticKind::TableMarker,
             ));
         }
     }
@@ -549,46 +652,57 @@ fn emit_pipes_on_line(lines: &[&str], line_no: usize, out: &mut Vec<(ByteSpan, &
 /// the parse above cannot report them — see the note at the top of this module
 /// for why it is handed the raw buffer anyway. Both are scanned the same way the
 /// rewriter scans them, and both are line-local.
-fn app_syntax_spans(lines: &[&str], out: &mut Vec<(ByteSpan, &'static str)>) {
+fn app_syntax_spans(lines: &[&str], out: &mut Vec<(ByteSpan, SemanticKind)>) {
     math_spans(lines, out);
-    for (index, text) in lines.iter().enumerate() {
-        let bytes = text.as_bytes();
-        let mut at = 0;
-        while at + 1 < bytes.len() {
-            if bytes[at] == b'[' && bytes[at + 1] == b'[' {
-                if let Some(close) = text[at..].find("]]") {
-                    let end = at + close + 2;
-                    out.push((
-                        ByteSpan {
-                            line: index,
-                            start: at,
-                            end: at + 2,
-                        },
-                        "wikilink.marker",
-                    ));
-                    out.push((
-                        ByteSpan {
-                            line: index,
-                            start: at + 2,
-                            end: end - 2,
-                        },
-                        "wikilink",
-                    ));
-                    out.push((
-                        ByteSpan {
-                            line: index,
-                            start: end - 2,
-                            end,
-                        },
-                        "wikilink.marker",
-                    ));
-                    at = end;
-                    continue;
-                }
-            }
-            at += 1;
+    wikilink_spans(lines, out);
+}
+
+/// `[[…]]` and `![[…]]`, found by the renderer's own patterns and rules
+/// (`wikilink_ranges`): a `[[note]]` without a heading, one inside code, and
+/// one followed by `(` all stay literal in the preview, so they stay
+/// uncoloured here.
+fn wikilink_spans(lines: &[&str], out: &mut Vec<(ByteSpan, SemanticKind)>) {
+    let content = lines.join("\n");
+    let line_starts = line_starts(lines);
+    for (start, end, opener) in crate::markdown::wikilink_ranges(&content) {
+        if end < start + opener + 2 {
+            continue;
         }
+        emit_byte_range(
+            lines,
+            &line_starts,
+            start,
+            start + opener,
+            SemanticKind::WikilinkMarker,
+            out,
+        );
+        emit_byte_range(
+            lines,
+            &line_starts,
+            start + opener,
+            end - 2,
+            SemanticKind::Wikilink,
+            out,
+        );
+        emit_byte_range(
+            lines,
+            &line_starts,
+            end - 2,
+            end,
+            SemanticKind::WikilinkMarker,
+            out,
+        );
     }
+}
+
+fn line_starts(lines: &[&str]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut at = 0usize;
+    for line in lines {
+        starts.push(at);
+        at += line.len() + 1;
+    }
+    starts
 }
 
 /// `$…$` and `$$…$$`, found the way the renderer finds them.
@@ -599,15 +713,10 @@ fn app_syntax_spans(lines: &[&str], out: &mut Vec<(ByteSpan, &'static str)>) {
 ///
 /// comrak's own math extension is off (`markdown_options`), so nothing else
 /// claims these ranges and the spans below are the only ones a formula gets.
-fn math_spans(lines: &[&str], out: &mut Vec<(ByteSpan, &'static str)>) {
+fn math_spans(lines: &[&str], out: &mut Vec<(ByteSpan, SemanticKind)>) {
     let content = lines.join("\n");
     let regions = crate::markdown::code_region_ranges(&content);
-    let mut line_starts = Vec::with_capacity(lines.len());
-    let mut at = 0usize;
-    for line in lines {
-        line_starts.push(at);
-        at += line.len() + 1;
-    }
+    let line_starts = line_starts(lines);
 
     for (start, end) in crate::markdown::find_math_spans(&content, &regions) {
         // Display math spans lines: `$$` opens on one and closes on another,
@@ -626,7 +735,7 @@ fn math_spans(lines: &[&str], out: &mut Vec<(ByteSpan, &'static str)>) {
             &line_starts,
             start,
             start + delimiter,
-            "math.marker",
+            SemanticKind::MathMarker,
             out,
         );
         emit_math_body(
@@ -642,7 +751,7 @@ fn math_spans(lines: &[&str], out: &mut Vec<(ByteSpan, &'static str)>) {
             &line_starts,
             end - delimiter,
             end,
-            "math.marker",
+            SemanticKind::MathMarker,
             out,
         );
     }
@@ -669,7 +778,7 @@ fn emit_math_body(
     content: &str,
     start: usize,
     end: usize,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     let bytes = content.as_bytes();
     let mut at = start;
@@ -689,12 +798,12 @@ fn emit_math_body(
         if close == at + 1 && close < end {
             close += char_len(content, close);
         }
-        emit_byte_range(lines, line_starts, operand, at, "math", out);
-        emit_byte_range(lines, line_starts, at, close, "math.marker", out);
+        emit_byte_range(lines, line_starts, operand, at, SemanticKind::Math, out);
+        emit_byte_range(lines, line_starts, at, close, SemanticKind::MathMarker, out);
         at = close;
         operand = close;
     }
-    emit_byte_range(lines, line_starts, operand, end, "math", out);
+    emit_byte_range(lines, line_starts, operand, end, SemanticKind::Math, out);
 }
 
 /// The length of the character at `byte`, which is always a boundary here.
@@ -708,8 +817,8 @@ fn emit_byte_range(
     line_starts: &[usize],
     start: usize,
     end: usize,
-    kind: &'static str,
-    out: &mut Vec<(ByteSpan, &'static str)>,
+    kind: SemanticKind,
+    out: &mut Vec<(ByteSpan, SemanticKind)>,
 ) {
     if end <= start {
         return;
@@ -743,10 +852,24 @@ fn emit_byte_range(
 mod tests {
     use super::*;
 
+    /// The kind as it crosses to the frontend.
+    fn kind_name(kind: SemanticKind) -> String {
+        serde_json::to_value(kind)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     fn spans(text: &str) -> Vec<(String, u32, u32, u32)> {
-        semantic_spans(text)
+        spans_after(text, 0)
+    }
+
+    /// `spans` for a buffer whose first `front_matter_lines` are front matter.
+    fn spans_after(text: &str, front_matter_lines: usize) -> Vec<(String, u32, u32, u32)> {
+        semantic_spans(text, front_matter_lines)
             .into_iter()
-            .map(|s| (s.kind.to_string(), s.line, s.start, s.len))
+            .map(|s| (kind_name(s.kind), s.line, s.start, s.len))
             .collect()
     }
 
@@ -812,12 +935,33 @@ mod tests {
             ("~~gone~~\n", "strike"),
             ("==lit==\n", "highlight"),
             ("++new++\n", "insert"),
-            ("[[a page]]\n", "wikilink"),
+            ("[[a page#Setup]]\n", "wikilink"),
         ] {
             let kinds = kinds_on(text, 0);
             assert!(
                 kinds.contains(&kind.to_string()),
                 "{kind} missing in {kinds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_brackets_the_preview_links_are_coloured_as_wikilinks() {
+        // The renderer leaves all of these literal: no heading, inside code,
+        // and a CommonMark link whose text happens to be bracketed.
+        for text in ["[[a page]]\n", "`[[#Setup]]`\n", "[[1#x]](https://x.dev)\n"] {
+            let kinds = kinds_on(text, 0);
+            assert!(
+                !kinds.iter().any(|k| k.starts_with("wikilink")),
+                "{text:?} is not a link in the preview: {kinds:?}"
+            );
+        }
+        // And these it does rewrite, embed included.
+        for text in ["[[#Setup]]\n", "![[a.png]]\n"] {
+            let kinds = kinds_on(text, 0);
+            assert!(
+                kinds.contains(&"wikilink".to_string()),
+                "{text:?}: {kinds:?}"
             );
         }
     }
@@ -901,9 +1045,6 @@ mod tests {
             "==**b**==",
             "++**b**++",
             "> **b**",
-            // `***bi***` is an Emph wrapping a Strong: the words belong to the
-            // inner one, and the outer contributes its `*` and nothing else.
-            "***bi***",
         ] {
             let found = spans(&format!("{text}\n"));
             assert!(found.iter().any(|s| s.0 == "strong"), "{text}: {found:?}");
@@ -912,6 +1053,31 @@ mod tests {
             let found = spans(&format!("{text}\n"));
             assert!(found.iter().any(|s| s.0 == "emph"), "{text}: {found:?}");
         }
+    }
+
+    #[test]
+    fn bold_inside_italic_is_both() {
+        // #830: the words of `***x***` were `strong` only, so Monaco drew them
+        // upright, and `**_x_**` came out `emph` only, not bold.
+        for text in [
+            "***x***",
+            "_**x**_",
+            "**_x_**",
+            "*a **x** b*",
+            "**a *x* b**",
+        ] {
+            let words: Vec<_> = spans(&format!("{text}\n"))
+                .into_iter()
+                .filter(|s| !s.0.ends_with(".marker"))
+                .collect();
+            let x = text.find('x').unwrap() as u32;
+            let on_x: Vec<_> = words.iter().filter(|s| s.2 <= x && x < s.2 + s.3).collect();
+            assert_eq!(on_x.len(), 1, "{text}: {words:?}");
+            assert_eq!(on_x[0].0, "strongemph", "{text}: {words:?}");
+        }
+        // The rest of an outer run keeps its own single style.
+        assert!(kinds_on("*a **x** b*\n", 0).contains(&"emph".to_string()));
+        assert!(kinds_on("**a *x* b**\n", 0).contains(&"strong".to_string()));
     }
 
     #[test]
@@ -927,7 +1093,7 @@ mod tests {
     #[test]
     fn spans_never_overlap() {
         let text = "# Head `code` **bold _mixed_**\n\n> quote with `tick`\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let mut seen: Vec<(u32, u32, u32)> = semantic_spans(text)
+        let mut seen: Vec<(u32, u32, u32)> = semantic_spans(text, 0)
             .into_iter()
             .map(|s| (s.line, s.start, s.len))
             .collect();
@@ -955,5 +1121,36 @@ mod tests {
             !found.iter().any(|s| s.1 == 1),
             "the code itself keeps its own colouring: {found:?}"
         );
+    }
+
+    /// Front matter is YAML, not markdown. Parsed as the buffer, its closing
+    /// `---` underlines the YAML into a setext heading, so the keys came out
+    /// bold in the heading colour. The body after it keeps its buffer lines.
+    #[test]
+    fn front_matter_is_not_a_heading() {
+        let kinds = |text: &str, front_matter_lines: usize, line: u32| -> Vec<String> {
+            spans_after(text, front_matter_lines)
+                .into_iter()
+                .filter(|s| s.1 == line)
+                .map(|s| s.0)
+                .collect()
+        };
+        // Math in the YAML is not typeset either: the whole line is claimed.
+        let text = "---\ntitle: Hello\nprice: $5 or $6\n---\n\n# Body\n";
+        for line in 0..4 {
+            assert_eq!(kinds(text, 4, line), ["frontmatter"], "line {line}");
+        }
+        assert_eq!(kinds(text, 4, 5), ["heading.marker", "heading"]);
+
+        // A BOM, CRLF, an indented closing fence.
+        let crlf = "\u{feff}---\r\ntitle: Hello\r\n  ---\r\n# Top\r\n";
+        assert_eq!(kinds(crlf, 3, 1), ["frontmatter"]);
+        assert_eq!(kinds(crlf, 3, 3), ["heading.marker", "heading"]);
+
+        // A thematic break then prose, which the frontend says is not front
+        // matter: its heading is a heading.
+        let rule = "---\n\n# Title\n\nSome intro text.\n\n---\n\n## Part 2\n";
+        assert_eq!(kinds(rule, 0, 2), ["heading.marker", "heading"]);
+        assert!(spans(rule).iter().all(|s| s.0 != "frontmatter"));
     }
 }

@@ -1,19 +1,19 @@
 import { hasMarkdownLinkExtension } from './markdownLinks.js';
+import { applyMove, getAdjacentMove, getReorderMove, type ToolbarMove } from './toolbarMove.js';
+import type { TranslationKey } from './i18n.js';
 
 export type TitlebarToolbarPlacement = 'bar' | 'menu';
 
 type TitlebarToolbarAction = {
 	id: string;
-	labelKey: string;
+	labelKey: TranslationKey;
 	fallbackName: string;
 	sample: string;
 	defaultPlacement: TitlebarToolbarPlacement;
 	required?: boolean;
-};
-
-type TitlebarToolbarMove = {
-	fromIndex: number;
-	toIndex: number;
+	// Second line in Settings: when the button shows (see
+	// visibleTitlebarActionIds), or for viewMode, the modes it switches between.
+	hintKey?: TranslationKey;
 };
 
 type ConfiguredTitlebarToolbarIds = {
@@ -23,20 +23,22 @@ type ConfiguredTitlebarToolbarIds = {
 };
 
 const TITLEBAR_TOOLBAR_ACTIONS: TitlebarToolbarAction[] = [
+	{ id: 'home', labelKey: 'menu.home', fallbackName: 'Home', sample: 'H', defaultPlacement: 'bar' },
 	{ id: 'back', labelKey: 'menu.back', fallbackName: 'Back', sample: '<', defaultPlacement: 'bar' },
 	{ id: 'forward', labelKey: 'menu.forward', fallbackName: 'Forward', sample: '>', defaultPlacement: 'bar' },
-	{ id: 'reload', labelKey: 'tooltip.reloadFromDisk', fallbackName: 'Reload from Disk', sample: 'R', defaultPlacement: 'bar' },
-	{ id: 'toc', labelKey: 'tooltip.showTableOfContents', fallbackName: 'Table of Contents', sample: 'T', defaultPlacement: 'menu' },
+	{ id: 'reload', labelKey: 'tooltip.reloadFromDisk', fallbackName: 'Reload from Disk', sample: 'R', defaultPlacement: 'bar', hintKey: 'settings.toolbarDiskFileOnly' },
+	{ id: 'toc', labelKey: 'settings.toolbarToc', fallbackName: 'Show/Hide Table of Contents', sample: 'T', defaultPlacement: 'menu' },
 	{ id: 'fullWidth', labelKey: 'menu.fullWidth', fallbackName: 'Full Width', sample: 'W', defaultPlacement: 'bar' },
-	{ id: 'live', labelKey: 'menu.autoReload', fallbackName: 'Auto-Reload', sample: 'L', defaultPlacement: 'bar' },
-	{ id: 'sync', labelKey: 'menu.syncScroll', fallbackName: 'Sync Scroll', sample: 'S', defaultPlacement: 'bar' },
-	{ id: 'swap', labelKey: 'menu.swapPanes', fallbackName: 'Swap Panes', sample: '<>', defaultPlacement: 'bar' },
-	{ id: 'split', labelKey: 'menu.splitView', fallbackName: 'Split View', sample: '\\', defaultPlacement: 'bar' },
-	{ id: 'edit', labelKey: 'tooltip.editFile', fallbackName: 'Edit file', sample: 'E', defaultPlacement: 'bar' },
-	{ id: 'editorToolbar', labelKey: 'tooltip.editorToolbar', fallbackName: 'Editor Toolbar', sample: 'TB', defaultPlacement: 'bar' },
+	{ id: 'live', labelKey: 'menu.autoReload', fallbackName: 'Auto-Reload', sample: 'L', defaultPlacement: 'bar', hintKey: 'settings.toolbarDiskFileOnly' },
+	{ id: 'sync', labelKey: 'menu.syncScroll', fallbackName: 'Sync Scroll', sample: 'S', defaultPlacement: 'bar', hintKey: 'settings.toolbarSplitOnly' },
+	{ id: 'swap', labelKey: 'tooltip.swapPanes', fallbackName: 'Swap editor and preview', sample: '<>', defaultPlacement: 'bar', hintKey: 'settings.toolbarSplitOnly' },
+	{ id: 'editorToolbar', labelKey: 'tooltip.editorToolbar', fallbackName: 'Editor Toolbar', sample: 'TB', defaultPlacement: 'bar', hintKey: 'settings.toolbarEditOrSplit' },
+	// Last on the bar: the bar is right-aligned, so only buttons to the right of
+	// the group can move it, and none come and go with the mode (#806).
+	{ id: 'viewMode', labelKey: 'settings.toolbarViewSwitcher', fallbackName: 'View Switcher', sample: 'P|S|E', defaultPlacement: 'bar', hintKey: 'settings.toolbarViewModes' },
 	{ id: 'find', labelKey: 'menu.find', fallbackName: 'Find', sample: 'F', defaultPlacement: 'menu' },
 	{ id: 'zen', labelKey: 'menu.zenMode', fallbackName: 'Zen Mode', sample: 'Z', defaultPlacement: 'menu' },
-	{ id: 'tabs', labelKey: 'menu.openTabs', fallbackName: 'Open Tabs', sample: 'Tab', defaultPlacement: 'menu' },
+	{ id: 'tabs', labelKey: 'settings.toolbarTabs', fallbackName: 'Show/Hide Tab Bar', sample: 'Tab', defaultPlacement: 'menu' },
 	{ id: 'zoom', labelKey: 'tooltip.resetZoom', fallbackName: 'Reset Zoom', sample: '%', defaultPlacement: 'menu' },
 	{ id: 'theme', labelKey: 'menu.changeTheme', fallbackName: 'Change Theme', sample: 'A', defaultPlacement: 'menu' },
 	{ id: 'settings', labelKey: 'tooltip.settings', fallbackName: 'Settings', sample: '...', defaultPlacement: 'menu', required: true },
@@ -53,12 +55,39 @@ export const DEFAULT_TITLEBAR_TOOLBAR_PLACEMENT = TITLEBAR_TOOLBAR_ACTIONS.reduc
 );
 
 const knownToolbarIds = new Set(DEFAULT_TITLEBAR_TOOLBAR_ORDER);
+
+/*
+ * #806 merged the Split and Edit toggles into `viewMode`. Stored settings from
+ * before it name the old two, so each normalizer maps them on the way in.
+ */
+const LEGACY_VIEW_IDS = ['split', 'edit'];
+const LEGACY_DEFAULT_ORDER = [
+	'back', 'forward', 'reload', 'toc', 'fullWidth', 'live', 'sync', 'swap', 'split', 'edit',
+	'editorToolbar', 'find', 'zen', 'tabs', 'zoom', 'theme', 'settings',
+];
+
+function migrateLegacyViewOrder(order: readonly string[]): readonly string[] {
+	if (!order.some((id) => LEGACY_VIEW_IDS.includes(id))) return order;
+	// Never reordered: take the new default, which moves the group to the end.
+	const legacyOnly = order.filter((id) => LEGACY_DEFAULT_ORDER.includes(id));
+	if (legacyOnly.join() === LEGACY_DEFAULT_ORDER.join()) return DEFAULT_TITLEBAR_TOOLBAR_ORDER;
+	// Reordered: the group takes Edit's slot, the later of the two by default.
+	const slot = order.includes('edit') ? 'edit' : 'split';
+	return order.flatMap((id) => (id === slot ? ['viewMode'] : LEGACY_VIEW_IDS.includes(id) ? [] : [id]));
+}
+
+export type ViewMode = 'preview' | 'split' | 'edit';
+
+export function viewModeOf(tab: { isEditing: boolean; isSplit: boolean }): ViewMode {
+	if (tab.isSplit) return 'split';
+	return tab.isEditing ? 'edit' : 'preview';
+}
 const requiredToolbarIds = new Set(TITLEBAR_TOOLBAR_ACTIONS.filter((action) => action.required).map((action) => action.id));
 
 export function normalizeTitlebarToolbarOrder(order: readonly string[] | null | undefined): string[] {
 	const normalized: string[] = [];
 
-	for (const id of order ?? []) {
+	for (const id of migrateLegacyViewOrder(order ?? [])) {
 		if (!knownToolbarIds.has(id) || normalized.includes(id)) continue;
 		normalized.push(id);
 	}
@@ -72,8 +101,10 @@ export function normalizeTitlebarToolbarOrder(order: readonly string[] | null | 
 
 export function normalizeTitlebarToolbarHidden(hidden: readonly string[] | null | undefined): string[] {
 	const normalized: string[] = [];
+	// Hidden only if both halves were: one visible half still had a button.
+	const legacyHidden = LEGACY_VIEW_IDS.every((id) => hidden?.includes(id));
 
-	for (const id of hidden ?? []) {
+	for (const id of [...(hidden ?? []), ...(legacyHidden ? ['viewMode'] : [])]) {
 		if (!knownToolbarIds.has(id) || requiredToolbarIds.has(id) || normalized.includes(id)) continue;
 		normalized.push(id);
 	}
@@ -85,6 +116,8 @@ export function normalizeTitlebarToolbarPlacement(
 	placement: Record<string, unknown> | null | undefined,
 ): Record<string, TitlebarToolbarPlacement> {
 	const normalized = { ...DEFAULT_TITLEBAR_TOOLBAR_PLACEMENT };
+	const legacy = placement?.split ?? placement?.edit;
+	if (placement && !('viewMode' in placement) && (legacy === 'bar' || legacy === 'menu')) normalized.viewMode = legacy;
 
 	for (const [id, value] of Object.entries(placement ?? {})) {
 		if (!knownToolbarIds.has(id)) continue;
@@ -104,46 +137,20 @@ export function getTitlebarToolbarReorderMove(
 	order: readonly string[],
 	draggedId: string,
 	targetId: string,
-): TitlebarToolbarMove | null {
-	const normalized = normalizeTitlebarToolbarOrder(order);
-	const fromIndex = normalized.indexOf(draggedId);
-	const toIndex = normalized.indexOf(targetId);
-
-	if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return null;
-	return { fromIndex, toIndex };
+): ToolbarMove | null {
+	return getReorderMove(normalizeTitlebarToolbarOrder(order), draggedId, targetId);
 }
 
 export function getTitlebarToolbarAdjacentMove(
 	order: readonly string[],
 	id: string,
 	direction: 'up' | 'down',
-): TitlebarToolbarMove | null {
-	const normalized = normalizeTitlebarToolbarOrder(order);
-	const fromIndex = normalized.indexOf(id);
-	if (fromIndex === -1) return null;
-
-	const toIndex = direction === 'up' ? fromIndex - 1 : fromIndex + 1;
-	if (toIndex < 0 || toIndex >= normalized.length) return null;
-
-	return { fromIndex, toIndex };
+): ToolbarMove | null {
+	return getAdjacentMove(normalizeTitlebarToolbarOrder(order), id, direction);
 }
 
-export function applyTitlebarToolbarMove(order: readonly string[], move: TitlebarToolbarMove): string[] {
-	const normalized = normalizeTitlebarToolbarOrder(order);
-	if (
-		move.fromIndex < 0 ||
-		move.fromIndex >= normalized.length ||
-		move.toIndex < 0 ||
-		move.toIndex >= normalized.length ||
-		move.fromIndex === move.toIndex
-	) {
-		return normalized;
-	}
-
-	const next = [...normalized];
-	const [moved] = next.splice(move.fromIndex, 1);
-	next.splice(move.toIndex, 0, moved);
-	return next;
+export function applyTitlebarToolbarMove(order: readonly string[], move: ToolbarMove): string[] {
+	return applyMove(normalizeTitlebarToolbarOrder(order), move);
 }
 
 export type TitlebarActionContext = {
@@ -175,6 +182,9 @@ export type TitlebarActionContext = {
 export function visibleTitlebarActionIds(context: TitlebarActionContext): string[] {
 	const list: string[] = [];
 
+	// With no tab there is nothing but Home to show, so there is nothing to toggle.
+	if (context.hasActiveTab) list.push('home');
+
 	if (context.hasActiveTab && !context.showHome) {
 		list.push('back');
 		list.push('forward');
@@ -202,17 +212,11 @@ export function visibleTitlebarActionIds(context: TitlebarActionContext): string
 				// control that orders them exists only there.
 				list.push('swap');
 			}
-			list.push('split');
+			list.push('viewMode');
 		}
-		if (isMarkdown && !context.isSplit) {
-			list.push('edit');
-		}
-		// Find in preview: only meaningful when a preview is actually
-		// visible (view mode or split). In pure edit mode Monaco's own
-		// Ctrl+F handles search, so we hide the entry there.
-		if (isMarkdown && (!context.isEditing || context.isSplit)) {
-			list.push('find');
-		}
+		// Every mode: the button routes like Mod+F, to Monaco's find when no
+		// preview is on screen.
+		if (isMarkdown) list.push('find');
 		if (context.isEditing || context.isSplit) {
 			list.push('editorToolbar');
 		}

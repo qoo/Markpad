@@ -2,18 +2,16 @@
  * A memo for rendered Mermaid diagrams, keyed by the only two inputs that
  * decide what Mermaid draws: the diagram source and the theme.
  *
- * Why this exists: the preview re-renders the whole article on a 16ms debounce
- * — in split mode, and in edit mode with the TOC open, that is roughly once per
- * keystroke — and `{@html sanitizedHtml}` swaps the entire block, which puts
- * every `<pre><code class="language-mermaid">` back. So every diagram was drawn
- * from scratch on every keystroke. Measured on a 44-diagram document, one pass
- * spent ~2.3s in `mermaid.render` and ~30ms in everything else.
+ * Why this exists: `mermaid.render` is by far the slowest part of a preview
+ * render (on a 44-diagram document, ~2.3s against ~30ms for everything else),
+ * and the same source and theme come back often: a theme toggled back, a block
+ * the patch re-inserts, a tab reopened.
  *
  * ## The one hard part: the svg id is baked into the output
  *
  * Mermaid's renderer, given an id and a source, does not return an
  * id-independent string. (This module never calls it — `richContent.ts` is the
- * one render site, and `singleImplementationConvention.test.ts` keeps it that
+ * one render site, and the `mermaid-render-sites` lint rule keeps it that
  * way.) The id it is given prefixes the diagram's `<style>` selectors (`#id
  * .node rect{…}`),
  * every arrow marker's `id`, and every `url(#id_flowchart-v2-pointEnd)` that

@@ -1,3 +1,5 @@
+import { previewZoomFactor } from './previewAnchor.js';
+
 const FOLD_WRAPPER_SELECTOR = '.foldable-content-wrapper';
 const FOLD_CONTENT_SELECTOR = ':scope > .content-inner';
 
@@ -41,33 +43,16 @@ function updateFoldHeights(root: HTMLElement) {
 	// reflow, and the remaining reads hit that same clean layout. No paint
 	// happens mid-task, so the cleared state is never visible.
 	//
-	// The measurement is the *layout* height, not `scrollHeight`. They are not
-	// the same number for maths. KaTeX stacks a display formula with negative
-	// margins and vertical-align, so its glyphs reach past the box that lays
-	// them out: `scrollHeight` reports the scrollable extent it needs, which is
-	// several pixels taller than the height `auto` resolves to. Writing that
-	// number back made the wrapper taller than the content it wraps.
+	// Measure the layout height, not `scrollHeight`: KaTeX glyphs overhang
+	// their box, so `scrollHeight` is up to ~7px taller and the wrapper would
+	// grow past its content (see the `fold-height-from-layout` lint rule in
+	// eslint.config.js). Nothing is clipped by the smaller
+	// number: expanded wrappers are `overflow: visible`.
 	//
-	// That is a visible defect, not a rounding artefact, and it fired on every
-	// keystroke: `{@html}` rebuilds the wrapper with no inline property, so it
-	// paints at `auto`, and the next frame writes the larger number and pushes
-	// everything below it down. Measured against `katex-stress.md`'s own
-	// formulas, at devicePixelRatio 2:
-	//
-	//     prose (control)               51.188 auto → 51  scrollHeight  -0.188px
-	//     `\mathrm`/`\mathit` row       25.227 auto → 25                -0.227px
-	//     grown delimiters              46.461 auto → 52                +5.539px
-	//     nested \frac + \sqrt + x^y^z  74.867 auto → 82                +7.133px
-	//
-	// which is exactly the shape of the report: the prose and short-formula
-	// sections sat still and the one with stacked fractions moved. Reading
-	// `getBoundingClientRect().height` instead takes every row to +0.000px,
-	// and keeps the sub-pixel precision `scrollHeight` rounds away.
-	//
-	// Nothing is clipped by the smaller number: both the wrapper and
-	// `.content-inner` are `overflow: visible` while expanded, and a collapsed
-	// wrapper takes `height: 0` from the more specific rule either way.
-	const heights = pending.map(({ content }) => content.getBoundingClientRect().height);
+	// Divide by the preview's CSS `zoom`: a rect is in viewport pixels, and
+	// `height` has the zoom applied again (#807).
+	const zoom = previewZoomFactor(root);
+	const heights = pending.map(({ content }) => content.getBoundingClientRect().height / zoom);
 
 	// Write pass 2: publish the measured heights without reading anything back.
 	pending.forEach(({ wrapper }, index) => {
@@ -82,11 +67,18 @@ function updateFoldHeights(root: HTMLElement) {
 	}
 }
 
+/**
+ * How long a caller waits for a fold to finish opening before it measures or
+ * scrolls into it. styles.css animates the fold height for 0.25s; a wait shorter
+ * than that lands on a target that is still moving.
+ */
+export const FOLD_TRANSITION_MS = 300;
+
 export interface FoldLayoutObservation {
 	/**
 	 * Start watching the fold contents inside newly rendered markup.
 	 *
-	 * Called with the blocks `blockPatch.ts` just inserted, rather than with the
+	 * Called with the blocks `previewPatch.ts` just inserted, rather than with the
 	 * whole article. The observation used to be torn down and rebuilt on every
 	 * keystroke, which meant a document's every fold got a fresh
 	 * ResizeObserver registration per character — and a fresh registration
@@ -144,7 +136,6 @@ export function observeFoldLayout(root: HTMLElement): FoldLayoutObservation {
 
 	observe(root);
 	window.addEventListener('resize', scheduleUpdate);
-	scheduleUpdate();
 
 	return {
 		observe,

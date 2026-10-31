@@ -1,3 +1,5 @@
+import { MARKDOWN_LINK_EXTENSIONS as RUST_MARKDOWN_LINK_EXTENSIONS } from '../bindings.js';
+
 export type MarkdownLinkTarget = {
 	path: string;
 	hash: string;
@@ -11,11 +13,21 @@ export type MarkdownLinkTarget = {
 // documented as a copy and pinned by a test; a list is cheaper to share than to
 // police.
 //
-// The Rust renderer keeps the only other copy, in `MARKDOWN_LINK_EXTENSIONS`
-// in src-tauri/src/markdown.rs, because no import crosses that boundary. It is
-// pinned against this one by `the extension list the rewriter mirrors still
-// matches markdownLinks.ts` in scripts/wikilinkFileTargets.test.ts.
-export const MARKDOWN_LINK_EXTENSIONS = ['md', 'markdown', 'mdown', 'mkd', 'txt'];
+// The list itself is the Rust renderer's `MARKDOWN_LINK_EXTENSIONS`
+// (src-tauri/src/markdown.rs), through bindings.ts, so the wikilink rewriter
+// and this side cannot disagree.
+export const MARKDOWN_LINK_EXTENSIONS: string[] = [...RUST_MARKDOWN_LINK_EXTENSIONS];
+
+/**
+ * The Open dialog's filters: the one list every other part of the app already
+ * treats as a Markpad document — including `.txt`, which loads, renders and
+ * saves like any other note (#535). Hardcoding a shorter list here only hid
+ * those files behind "All Files".
+ */
+export const MARKDOWN_OPEN_FILTERS = [
+	{ name: 'Markdown', extensions: MARKDOWN_LINK_EXTENSIONS },
+	{ name: 'All Files', extensions: ['*'] },
+];
 
 /** `.md`, `.markdown`, … anchored at the end of a path. Also used to replace it. */
 export const MARKDOWN_LINK_EXTENSION_PATTERN = new RegExp(
@@ -31,12 +43,51 @@ export function decodeLinkPath(path: string): string {
 	}
 }
 
+/**
+ * The element ids a same-document `#fragment` may name, decoded first. comrak
+ * percent-encodes the href to a heading but not the heading's id, and
+ * percent-encodes a footnote's id itself (`fn-%E6%B3%A8`), so a CJK heading
+ * is found only decoded and a CJK footnote only as written. A leading `^` is
+ * a block reference and is not part of the id.
+ */
+export function anchorIdCandidates(fragment: string): string[] {
+	const ids = [decodeLinkPath(fragment), fragment].map((id) => (id.startsWith('^') ? id.substring(1) : id));
+	return [...new Set(ids)];
+}
+
 export function hasMarkdownLinkExtension(path: string): boolean {
 	return MARKDOWN_LINK_EXTENSION_PATTERN.test(path);
 }
 
 function isAbsoluteMarkdownPath(path: string): boolean {
 	return path.startsWith('/') || path.startsWith('\\') || /^[a-z]:/i.test(path);
+}
+
+/**
+ * Whether `path` is a UNC path (`\\host\share\x`, `//host/share/x`, or any
+ * mix of the two separators) on a host other than the one `currentFile` lives
+ * on.
+ *
+ * Touching a UNC path makes Windows connect to its host over SMB and offer the
+ * user's NTLM credentials, so a document that can make the app touch one leaks
+ * a password hash to whoever wrote it. A document that itself lives on a share
+ * may still reach that host: its own images and neighbours live there. Every
+ * place a document's text becomes a path the app opens or loads asks this.
+ */
+export function isOffHostUncPath(path: string, currentFile: string): boolean {
+	const host = uncHost(path);
+	return host !== null && host !== uncHost(currentFile);
+}
+
+/**
+ * The host of a UNC path, or null. A device path names its host after `UNC`
+ * (`\\?\UNC\host\…`); any other device path (`\\?\C:\…`) is local.
+ */
+function uncHost(path: string): string | null {
+	const device = /^[\\/]{2}[?.][\\/]([^\\/]*)[\\/]?([^\\/]*)/.exec(path);
+	if (device) return device[1].toLowerCase() === 'unc' && device[2] ? device[2].toLowerCase() : null;
+	const match = /^[\\/]{2}([^\\/]+)/.exec(path);
+	return match ? match[1].toLowerCase() : null;
 }
 
 export function getMarkdownLinkTarget(href: string): MarkdownLinkTarget | null {
@@ -60,7 +111,7 @@ export function getMarkdownLinkTarget(href: string): MarkdownLinkTarget | null {
  * An href is URL-shaped even when it names a local file, which is what makes
  * this a different function from `resolveDocumentRelativePath` in ./markdown.ts
  * rather than a copy of it — see that function's comment for the three
- * differences and scripts/exportHtml.test.ts for the test that pins them. Here:
+ * differences and scripts/export.test.ts for the test that pins them. Here:
  * only `/` separates in the relative half (a `\` in a URL is a character, and
  * `sub\note.md` names one file), empty segments collapse (`a//b.md` is
  * `a/b.md`), and the base is normalized to `/` before its directory is taken.
@@ -86,24 +137,17 @@ function resolveHrefRelativePath(base: string, relative: string): string {
 }
 
 export function resolveMarkdownTargetPath(currentFile: string, target: MarkdownLinkTarget): string | null {
-	if (isAbsoluteMarkdownPath(target.path)) return target.path;
-	if (!currentFile) return null;
-	return resolveHrefRelativePath(currentFile, target.path);
+	let resolved: string;
+	if (isAbsoluteMarkdownPath(target.path)) resolved = target.path;
+	else if (!currentFile) return null;
+	else resolved = resolveHrefRelativePath(currentFile, target.path);
+	// `getMarkdownLinkTarget` refuses a literal `//`, but comrak writes `\` as
+	// `%5C` and the decoded `\\host\…` reached `canonicalize_path` intact.
+	return isOffHostUncPath(resolved, currentFile) ? null : resolved;
 }
 
 export function isOpenInNewTabMarkdownTarget(href: string, currentFile: string): boolean {
 	const target = getMarkdownLinkTarget(href);
 	if (!target) return false;
 	return resolveMarkdownTargetPath(currentFile, target) !== null;
-}
-
-export function normalizeComparableMarkdownPath(path: string, osType: string): string {
-	const normalized = path.replace(/\\/g, '/');
-	const comparable = normalized.startsWith('//')
-		? `//${normalized.slice(2).replace(/\/+/g, '/')}`
-		: normalized.replace(/\/+/g, '/');
-	if (osType === 'windows' || /^[a-z]:/i.test(comparable) || comparable.startsWith('//')) {
-		return comparable.toLowerCase();
-	}
-	return comparable;
 }

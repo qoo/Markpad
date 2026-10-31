@@ -5,7 +5,8 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
+use tauri_specta::Event;
 
 /// Maximum number of staged transfers kept in memory; oldest entries are
 /// evicted first so an abandoned drag can never grow the map unbounded.
@@ -29,13 +30,24 @@ pub struct PendingTransfer {
 
 /// Result of `cancel_detached_tab`. `cancelled == false && claimed == true`
 /// means the destination already took the payload and is still finishing:
-/// the source must keep waiting for `tab-transfer-claimed` instead of
-/// restoring its tab.
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+/// the source must keep waiting for `tab-transfer-claimed`, and ask again
+/// later, instead of restoring its tab.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelOutcome {
     pub cancelled: bool,
     pub claimed: bool,
+}
+
+/// Result of `refresh_detached_tab`. `Gone` means the transfer already
+/// ended: completed (the source is about to hear `tab-transfer-claimed`) or
+/// cancelled.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum RefreshOutcome {
+    Updated,
+    Revoked,
+    Gone,
 }
 
 /// Who is allowed to cancel a staged transfer.
@@ -85,10 +97,9 @@ pub struct TabTransferBroker {
     counter: AtomicU64,
 }
 
-/// Label of the window that a token authorises. `create_transfer_window`
-/// in lib.rs builds the destination window with exactly this label, so a
-/// webview cannot forge it: labels are assigned by the backend.
-fn destination_label(token: &str) -> String {
+/// Label of the window a token authorises. Only the backend assigns labels,
+/// so a webview cannot forge it.
+pub(crate) fn destination_label(token: &str) -> String {
     format!("window-{token}")
 }
 
@@ -208,15 +219,18 @@ impl TabTransferBroker {
 
     /// The source's own timeout path: never destroys a transfer the
     /// destination has already claimed and is still working on.
+    ///
+    /// One lock for the read and the removal. Released in between, a
+    /// `complete` landing in the gap took the entry and told the source it
+    /// had moved, while this still reported `cancelled` and the source kept
+    /// its copy: the tab in both windows.
     fn cancel_from_source(&self, token: &str, now: Instant) -> CancelOutcome {
-        let claimed_at = match self.peek(token) {
-            Some(entry) => entry.claimed_at,
-            None => {
-                return CancelOutcome {
-                    cancelled: false,
-                    claimed: false,
-                }
-            }
+        let mut inner = crate::window_runtime::lock_recover(&self.inner);
+        let Some(claimed_at) = inner.entries.get(token).map(|entry| entry.claimed_at) else {
+            return CancelOutcome {
+                cancelled: false,
+                claimed: false,
+            };
         };
         if let Some(claimed_at) = claimed_at {
             if now.duration_since(claimed_at) < CLAIM_GRACE {
@@ -226,11 +240,41 @@ impl TabTransferBroker {
                 };
             }
         }
-        self.take(token);
+        inner.insertion_order.retain(|entry| entry != token);
+        inner.entries.remove(token);
         CancelOutcome {
             cancelled: true,
             claimed: claimed_at.is_some(),
         }
+    }
+
+    /// The source's tab changed after it was staged. Until the destination
+    /// claims, the newer copy simply replaces the payload. After the claim
+    /// the destination is rendering the old copy, so the transfer is
+    /// withdrawn instead: its `complete` then finds nothing and it rolls
+    /// back, and the source keeps the tab it is still editing.
+    fn refresh_as(
+        &self,
+        caller_label: &str,
+        token: &str,
+        payload: String,
+    ) -> Result<RefreshOutcome, String> {
+        let mut inner = crate::window_runtime::lock_recover(&self.inner);
+        let Some(entry) = inner.entries.get_mut(token) else {
+            return Ok(RefreshOutcome::Gone);
+        };
+        if entry.source_label != caller_label {
+            return Err(format!(
+                "TRANSFER_FORBIDDEN: window '{caller_label}' may not refresh this tab transfer"
+            ));
+        }
+        if entry.claimed_at.is_none() {
+            entry.payload = payload;
+            return Ok(RefreshOutcome::Updated);
+        }
+        inner.insertion_order.retain(|entry| entry != token);
+        inner.entries.remove(token);
+        Ok(RefreshOutcome::Revoked)
     }
 
     /// The destination's rollback path: it owns the claim, so it may always
@@ -316,7 +360,13 @@ impl TabTransferBroker {
     }
 }
 
+/// `tab-transfer-claimed`: the destination finished taking the tab, so the
+/// source window may drop it.
+#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type, tauri_specta::Event)]
+pub struct TabTransferClaimed(pub String);
+
 #[tauri::command]
+#[specta::specta]
 pub fn stage_detached_tab(
     window: tauri::Window,
     state: State<'_, TabTransferBroker>,
@@ -326,6 +376,7 @@ pub fn stage_detached_tab(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn claim_detached_tab(
     window: tauri::Window,
     state: State<'_, TabTransferBroker>,
@@ -335,6 +386,7 @@ pub fn claim_detached_tab(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn complete_detached_tab(
     app: AppHandle,
     window: tauri::Window,
@@ -342,21 +394,30 @@ pub fn complete_detached_tab(
     token: String,
 ) -> Result<(), String> {
     let transfer = state.complete_as(window.label(), &token)?;
-    app.emit_to(
-        transfer.source_label.as_str(),
-        "tab-transfer-claimed",
-        token,
-    )
-    .map_err(|e| format!("TRANSFER_HANDOFF_FAILED: {e}"))
+    TabTransferClaimed(token)
+        .emit_to(&app, transfer.source_label.as_str())
+        .map_err(|e| format!("TRANSFER_HANDOFF_FAILED: {e}"))
 }
 
 #[tauri::command]
+#[specta::specta]
 pub fn cancel_detached_tab(
     window: tauri::Window,
     state: State<'_, TabTransferBroker>,
     token: String,
 ) -> Result<CancelOutcome, String> {
     state.cancel_as(window.label(), &token, Instant::now())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn refresh_detached_tab(
+    window: tauri::Window,
+    state: State<'_, TabTransferBroker>,
+    token: String,
+    payload: String,
+) -> Result<RefreshOutcome, String> {
+    state.refresh_as(window.label(), &token, payload)
 }
 
 #[cfg(test)]
@@ -404,8 +465,8 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    // P1-B-4: the old `t{counter}` scheme let any webview walk t1..t16 and
-    // read another window's document.
+    // The old `t{counter}` scheme let any webview walk t1..t16 and read
+    // another window's document.
     #[test]
     fn tokens_are_not_enumerable() {
         let broker = TabTransferBroker::new();
@@ -462,8 +523,8 @@ mod tests {
         );
     }
 
-    // P1-B-3: claiming marks the entry so the source's 15s timeout stops
-    // racing a slow but healthy destination.
+    // Claiming marks the entry so the source's 15s timeout stops racing a
+    // slow but healthy destination.
     #[test]
     fn claim_marks_the_entry_and_repeated_claims_keep_the_first_stamp() {
         let broker = TabTransferBroker::new();
@@ -536,6 +597,81 @@ mod tests {
         assert!(broker.peek(&token).is_none());
     }
 
+    // The source drops its tab when it hears `tab-transfer-claimed`, which
+    // `complete_detached_tab` sends to the source label `complete_as` hands back.
+    // A claim is only a reservation: it hands back the payload and no source to
+    // announce to, and the completion after it still finds the transfer.
+    #[test]
+    fn only_completion_hands_back_the_source_to_announce_to() {
+        let broker = TabTransferBroker::new();
+        let token = broker.stage("tab".to_string(), "main".to_string());
+        let destination = destination_label(&token);
+
+        assert_eq!(
+            broker.claim_as(&destination, &token, Instant::now()),
+            Ok(Some("tab".to_string()))
+        );
+        let transfer = broker
+            .complete_as(&destination, &token)
+            .expect("the claim must leave the transfer for completion");
+        assert_eq!(transfer.source_label, "main");
+    }
+
+    // The source kept typing while the new window booted: the destination
+    // must claim the newer copy, not the one staged at the click.
+    #[test]
+    fn refresh_before_the_claim_replaces_the_payload() {
+        let broker = TabTransferBroker::new();
+        let token = broker.stage("old".to_string(), "main".to_string());
+        let destination = destination_label(&token);
+
+        assert_eq!(
+            broker.refresh_as("main", &token, "new".to_string()),
+            Ok(RefreshOutcome::Updated)
+        );
+        assert_eq!(
+            broker
+                .claim_as(&destination, &token, Instant::now())
+                .unwrap()
+                .as_deref(),
+            Some("new")
+        );
+    }
+
+    // After the claim the destination is rendering the old copy. Completing
+    // it would close the source tab over the newer text, so the transfer is
+    // withdrawn and the destination's completion fails.
+    #[test]
+    fn refresh_after_the_claim_withdraws_the_transfer() {
+        let broker = TabTransferBroker::new();
+        let token = broker.stage("old".to_string(), "main".to_string());
+        let destination = destination_label(&token);
+        broker
+            .claim_as(&destination, &token, Instant::now())
+            .unwrap();
+
+        assert_eq!(
+            broker.refresh_as("main", &token, "new".to_string()),
+            Ok(RefreshOutcome::Revoked)
+        );
+        assert!(broker.complete_as(&destination, &token).is_err());
+        assert_eq!(
+            broker.refresh_as("main", &token, "newer".to_string()),
+            Ok(RefreshOutcome::Gone)
+        );
+    }
+
+    #[test]
+    fn only_the_source_may_refresh() {
+        let broker = TabTransferBroker::new();
+        let token = broker.stage("doc".to_string(), "main".to_string());
+        let refusal = broker
+            .refresh_as(&destination_label(&token), &token, "forged".to_string())
+            .expect_err("the destination must not rewrite the source's document");
+        assert!(refusal.starts_with("TRANSFER_FORBIDDEN"), "{refusal}");
+        assert_eq!(broker.peek(&token).unwrap().payload, "doc");
+    }
+
     #[test]
     fn destination_may_release_its_own_claim() {
         let broker = TabTransferBroker::new();
@@ -564,8 +700,8 @@ mod tests {
         assert_eq!(broker.cancel_from_destination("nope"), missing);
     }
 
-    // P1-B-2: completing a transfer whose entry is gone must be reported,
-    // not silently swallowed, so the destination can roll its tab back.
+    // Completing a transfer whose entry is gone must be reported, not
+    // silently swallowed, so the destination can roll its tab back.
     #[test]
     fn completing_twice_finds_nothing_the_second_time() {
         let broker = TabTransferBroker::new();

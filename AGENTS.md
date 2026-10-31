@@ -143,10 +143,11 @@ src-tauri/
 - Export singleton instances (e.g., `export const tabManager = new TabManager()`)
 
 ### Tauri Invoke
-Use `invoke()` from `@tauri-apps/api/core` for Rust commands:
+Call Rust commands through the generated bindings (`cargo test` regenerates
+`src/lib/bindings.ts`); a raw `invoke` is a lint error:
 ```typescript
-import { invoke } from '@tauri-apps/api/core';
-const result = await invoke<string>('command_name', { arg: value });
+import { commands } from '../bindings.js'; // relative to the caller
+const result = await commands.commandName(value);
 ```
 
 ### File Operations
@@ -158,14 +159,36 @@ All file operations go through Rust commands - never use Node.js fs APIs.
 - **Frontend**: two runners, split by glob so a file belongs to exactly one.
   - `npm test` runs `scripts/*.test.ts` (`node --test --import tsx`).
   - `npm run test:vitest` runs `scripts/*.spec.ts` (vitest, jsdom, Svelte plugin).
-- **CI**: Runs `npm audit`, `npm run check`, `npm test`, `npm run test:vitest` and
-  `cargo test` on PRs
+- **CI**: Runs `npm audit --audit-level=moderate`, `npm run check`, `npm run lint`, `npm test`,
+  `npm run test:vitest` and `cargo test` on PRs
 
-Two kinds of assertion live in this suite: behavior tests, which import and run the real
-modules, and source-shape assertions, which match the source text for a contract the
-compiler cannot check — a Tauri command name, an i18n key, a second copy of a fixed
-behavior. A green run is not a claim that every behavior is covered; a source-shape
-assertion passes as long as the line it matches is still spelled that way.
+Tests run the real code and assert what it does. A test does not read source as text —
+no regex over a file, no slicing a function body, no cutting code out of a component and
+evaluating it: such a test guards a spelling, goes red on a rename and stays green on a
+regression. When the logic sits in a component where a test cannot call it, move it into a
+`.ts` or `.svelte.ts` module the component calls, and test the module.
+
+What a run cannot show is held elsewhere. Command and event names, arguments and returns
+are generated from Rust into `src/lib/bindings.ts` (tauri-specta), so a mismatch is a
+`npm run check` error. Code conventions ("one implementation of this behavior", "call
+through this wrapper") are lint rules in `eslint.config.js` (`npm run lint`), plus
+`src-tauri/clippy.toml` and `scripts/conventions.test.ts` for the Rust ones clippy cannot
+express.
+
+### Where a test goes
+
+Tests are grouped by feature, not by the fix that added them:
+
+- `scripts/<feature>.test.ts` and `scripts/<feature>.spec.ts` hold behavior tests (the
+  runner rules below decide which of the two).
+- `scripts/<feature>.<area>.test.ts` / `.spec.ts` is for a part of a feature that must run
+  in its own process (module mocks, a process-wide shim such as `installShimDom()`) or would
+  make the main file unreadable.
+
+A new case goes into the existing file for its feature, as a `test` inside the `describe`
+it belongs to or a new `describe`. A new file is for a new feature or one of the reasons
+above, not for a new fix. Name a test by the behavior it claims; put the issue number and
+the bug history in a comment above it.
 
 ### Which runner a test belongs to
 
@@ -181,22 +204,11 @@ what an effect writes cannot fail. Under vitest the module is compiled for real 
 **Leave it as `*.test.ts` (`node --test`) otherwise.** Plain TypeScript modules run fine
 there, the runner is already configured, and moving a passing file buys nothing.
 
-**Do not migrate `.svelte` component tests.** Mounting a component here means jsdom
-standing in for Monaco, mermaid and KaTeX, and the assertion it earns — "the handler is
-wired up" — is weaker than the source-shape assertion it replaced, not stronger.
-
-### What must never be migrated
-
-Two categories are correct *because* they are text assertions, and a runtime test cannot
-express them at all:
-
-- **Cross-language contracts.** A `#[tauri::command]` name, an event name, a config key: one
-  side is Rust and the other is TypeScript, and nothing but the spelling connects them.
-  Running the TypeScript proves the TypeScript.
-- **Single-implementation conventions.** "There is exactly one copy of this behavior", "no
-  other caller passes this flag", "this constant is not hard-coded a second time". These are
-  claims about the *absence* of a second implementation. Executing the one implementation
-  that exists cannot observe a second one; only reading the source can.
+**Mount a component only for its markup wiring, and only one that does not need Monaco,
+mermaid or KaTeX.** The suite mounts `Toc`, `HomePage`, `Settings`, `TitleBar`, `Tab`,
+`UpdateDialog` and `ContextMenu` this way (vitest, jsdom; stub `Element.prototype.animate`
+for transitions). `MarkdownViewer.svelte` and `Editor.svelte` are not mounted: their logic is
+tested through the modules they call.
 
 ### Migrating a file
 
@@ -215,25 +227,10 @@ unchanged. Two things bite:
   answer, so a bare `invoke: () => Promise.resolve(null)` leaves `osType` null and the
   font defaults it indexes undefined.
 
-One shimmed file is still where it is, because a rename does not reach what is wrong
-with it:
-
-- `foldStatePerDocument.test.ts` cuts functions out of `.svelte` files with its own
-  brace-pairing scanner. The logic has to move into a `.svelte.ts` module first.
-
-Of the other two:
-
-- `tabReadingPosition.test.ts` called `installShimDom()`, which assigns
-  `globalThis.document` — under vitest that replaces jsdom's. Its anchor harness was
-  rewritten onto the real DOM (`tabReadingPosition.spec.ts`), which it could be because
-  `findAnchorElement` reads structure and attributes and measures nothing.
-- `checkedReadMigration.test.ts` was two files in one, which is why neither answer fit
-  it. Six of its tests are the never-migrate categories — an unchecked command existing
-  nowhere in `src` *or* in the Rust crate, and four statement-order claims about a
-  `.svelte` component — and stayed. The three that drive `ensureFullContent` are a runes
-  module run for real, and are `checkedReadMigration.spec.ts` now. A file that shims
-  runes is worth opening before it is worth renaming: the split may be per test rather
-  than per file.
+A test that shims runes is worth reading before it is worth moving: the split may be per
+test rather than per file. A harness that calls `installShimDom()` assigns
+`globalThis.document`, which under vitest replaces jsdom's; such a harness is rewritten onto
+the real DOM rather than carried over.
 
 ### A real DOM is not a layout
 
@@ -241,8 +238,8 @@ jsdom implements the DOM, not CSS layout: `offsetTop`, `offsetHeight` and every
 `getBoundingClientRect()` are 0. So migrating a file buys real answers about structure,
 attributes, traversal and parsing, and buys nothing at all about geometry. A test whose
 subject is a position on screen has to construct the boxes either way —
-`scrollSyncAcrossFolds.test.ts` lays a document out with collapsed folds in it, and
-`anchorJumpUnderZoom.spec.ts` builds elements whose rects carry a zoom factor while their
+`layout.scrollSync.test.ts` lays a document out with collapsed folds in it, and
+`navigation.spec.ts` builds elements whose rects carry a zoom factor while their
 `offsetWidth` does not. Neither is worse for being under `node --test` or better for being
 under vitest; the geometry is the fixture.
 
@@ -283,7 +280,7 @@ mandatory for `tauri-plugin-updater` to compare versions correctly.
 The lock file is the one that gets forgotten, because nothing in the editing
 loop reads it — a bump without it lands green and stays wrong until the next
 person's `cargo build` rewrites the line and leaves them a dirty working tree.
-`scripts/versionSync.test.ts` asserts the three agree.
+`scripts/release.workflows.test.ts` asserts the three agree.
 
 ## Releasing
 

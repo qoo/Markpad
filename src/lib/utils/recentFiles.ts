@@ -1,10 +1,5 @@
 import { writeStoredSetting } from '../stores/settings.svelte.js';
 
-// Module-private on purpose. Both used to be exported, and the only importer
-// was recentFilesMultiWindow.test.ts, which compared each one with itself —
-// so renaming the key or changing the cap could not fail anything. The test
-// writes both values out now; an export that exists to be asserted against
-// itself is not a contract with anyone.
 const RECENT_FILES_KEY = 'recent-files';
 const RECENT_FILES_LIMIT = 9;
 /**
@@ -31,8 +26,26 @@ export function parseRecentFiles(raw: string | null): string[] {
 	}
 }
 
+/**
+ * One spelling per file for a Windows path. The Open dialog hands over
+ * `C:\n\b.md` while a followed link resolves to `C:/n/b.md`, and both are one
+ * file, so the list showed it twice. Windows paths fold case as well.
+ * Anything else is compared as written: on macOS and Linux `\` is an ordinary
+ * filename character and case may matter.
+ */
+function recentFileKey(path: string): string {
+	return /^([a-z]:[\\/]|\\\\)/i.test(path) ? path.replace(/\\/g, '/').toLowerCase() : path;
+}
+
+/** Keeps the first spelling of each file, so the one just promoted wins. */
 function dedupe(files: readonly string[]): string[] {
-	return [...new Set(files)];
+	const seen = new Set<string>();
+	return files.filter((file) => {
+		const key = recentFileKey(file);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
 }
 
 /** Moves `path` to the front, keeping the list at most {@link RECENT_FILES_LIMIT} long. */
@@ -129,4 +142,27 @@ export function updateStoredRecentFiles(mutate: (current: string[]) => string[])
 export function isRecentFilesStorageEvent(event: Pick<StorageEvent, 'key' | 'storageArea'>): boolean {
 	if (typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function' && event.storageArea && event.storageArea !== localStorage) return false;
 	return event.key === null || event.key === RECENT_FILES_KEY;
+}
+
+/**
+ * A window's view of the list. Every change is a change to the stored list
+ * (through {@link updateStoredRecentFiles}) and `publish` gets what landed;
+ * `listen` folds in what sibling windows did, since localStorage fires
+ * `storage` only in the *other* same-origin documents.
+ */
+export function createRecentFiles(publish: (files: string[]) => void) {
+	return {
+		load: () => publish(readStoredRecentFiles()),
+		save: (path: string) => publish(updateStoredRecentFiles((current) => promoteRecentFile(current, path))),
+		remove: (path: string) => publish(updateStoredRecentFiles((current) => dropRecentFile(current, path))),
+		rename: (oldPath: string, newPath: string) =>
+			publish(updateStoredRecentFiles((current) => renameRecentFile(current, oldPath, newPath))),
+		listen(target: Pick<Window, 'addEventListener' | 'removeEventListener'>): () => void {
+			const onStorage = (event: Event) => {
+				if (isRecentFilesStorageEvent(event as StorageEvent)) publish(readStoredRecentFiles());
+			};
+			target.addEventListener('storage', onStorage);
+			return () => target.removeEventListener('storage', onStorage);
+		},
+	};
 }

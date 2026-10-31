@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { commands } from '../bindings.js';
 import {
 	DEFAULT_EDITOR_TOOLBAR_ORDER,
 	applyEditorToolbarMove,
@@ -17,6 +17,11 @@ import {
 	type OpenFileMode,
 } from '../utils/openFileMode.js';
 import {
+	DEFAULT_OPEN_FILE_TARGET,
+	isOpenFileTarget,
+	type OpenFileTarget,
+} from '../utils/openFileTarget.js';
+import {
 	DEFAULT_TITLEBAR_TOOLBAR_ORDER,
 	DEFAULT_TITLEBAR_TOOLBAR_PLACEMENT,
 	applyTitlebarToolbarMove,
@@ -32,7 +37,7 @@ import {
 	getStoredPreviewFullWidth,
 	normalizePreviewMaxWidth,
 } from '../utils/previewWidth.js';
-import { getSupportedLanguages, type LanguageCode } from '../utils/i18n.js';
+import { getSupportedLanguages, type LanguageCode, type TranslationKey } from '../utils/i18n.js';
 
 export type OSType = 'macos' | 'windows' | 'linux' | 'unknown';
 
@@ -199,6 +204,20 @@ export const DEFAULT_FONTS: Record<OSType, DefaultFonts> = {
 	},
 };
 
+export type TabPosition = 'top' | 'left' | 'right';
+export type SidebarStackOrder = 'openFilesTop' | 'folderTop';
+
+export function isTabPosition(value: unknown): value is TabPosition {
+	return value === 'top' || value === 'left' || value === 'right';
+}
+
+/** The Settings select for the tab position, in order. */
+export const TAB_POSITION_OPTIONS: readonly { value: TabPosition; labelKey: TranslationKey }[] = [
+	{ value: 'top', labelKey: 'settings.tabPositionTop' },
+	{ value: 'left', labelKey: 'settings.tabPositionLeft' },
+	{ value: 'right', labelKey: 'settings.tabPositionRight' },
+];
+
 /**
  * The allowed range of a numeric setting. Single source of truth: the settings
  * UI renders `min`/`max`/`step` from it and every write path (typing, spin
@@ -221,14 +240,26 @@ export const PREVIEW_FONT_SIZE_RANGE: NumericSettingRange = { min: 12, max: 48, 
 export const CODE_FONT_SIZE_RANGE: NumericSettingRange = { min: 10, max: 48, step: 1, default: 14 };
 export const EDITOR_MAX_WIDTH_RANGE: NumericSettingRange = { min: 20, max: 500, step: 10, default: 80 };
 export const TOC_WIDTH_RANGE: NumericSettingRange = { min: 180, max: 420, step: 1, default: 240 };
-// The preview zoom factor, as a percentage. The 25/500 pair used to be written
-// out three times — the wheel handler and the keyboard chords in
-// MarkdownViewer.svelte and the editor's own wheel handler — beside a `100` in
-// three more places, and the stored value was read with a bare `parseInt` that
-// let a corrupt key through as NaN. `Math.min(NaN + 10, 500)` is NaN too, so
-// once that happened neither the wheel nor the chords could get back out; the
-// preview rendered `zoom: NaN` until the reset button was found.
+// Width of the tab column when tabs are drawn down the side of the window (#884).
+export const TAB_COLUMN_WIDTH_RANGE: NumericSettingRange = { min: 140, max: 420, step: 1, default: 200 };
+// Share of the sidebar column the upper section takes when both are shown, in percent.
+export const SIDEBAR_SPLIT_RANGE: NumericSettingRange = { min: 15, max: 85, step: 1, default: 40 };
+// Preview zoom, in percent. The only place its bounds and default live.
 export const ZOOM_LEVEL_RANGE: NumericSettingRange = { min: 25, max: 500, step: 10, default: 100 };
+
+/**
+ * The zoom factor one Ctrl/Cmd+wheel event asks for (#831).
+ *
+ * WebKit and Chromium both deliver a trackpad pinch as ctrl+wheel events with
+ * `deltaY = -100·ln(scale)`, so `exp(-deltaY / 100)` hands back the fingers'
+ * own scale: a pinch zooms as far as the fingers move, not a fixed step per
+ * event. The clamp caps one event near 10%, which is what a mouse notch still
+ * gets where it reports a large delta (100 on Windows); a slow notch on macOS
+ * reports a few pixels and zooms by that much less.
+ */
+export function wheelZoomFactor(deltaY: number): number {
+	return Math.exp(-Math.max(-10, Math.min(10, deltaY)) / 100);
+}
 
 /** True when `value` is a finite number the user is allowed to commit as-is. */
 export function isWithinRange(value: unknown, range: NumericSettingRange): boolean {
@@ -265,8 +296,12 @@ const LEGACY_PREVIEW_FULL_WIDTH_KEY = 'isFullWidth';
 const LEGACY_AUTO_SAVE_KEY = 'editor.autoSave';
 const LEGACY_CONFIRM_BEFORE_SAVE_KEY = 'editor.confirmBeforeSave';
 
+function hasStorage(): boolean {
+	return typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function';
+}
+
 function readStoredKey(key: string): string | null {
-	if (typeof localStorage === 'undefined' || typeof localStorage.getItem !== 'function') return null;
+	if (!hasStorage()) return null;
 	return localStorage.getItem(key);
 }
 
@@ -378,7 +413,7 @@ export interface PersistedSetting<T> {
  * hop. It also makes redundant writes free in the ordinary single-window case.
  */
 export function writeStoredSetting(key: string, value: string | null): boolean {
-	if (typeof localStorage === 'undefined' || typeof localStorage.getItem !== 'function') return false;
+	if (!hasStorage()) return false;
 	const current = localStorage.getItem(key);
 	if (value === null) {
 		if (current === null) return false;
@@ -392,7 +427,7 @@ export function writeStoredSetting(key: string, value: string | null): boolean {
 
 /** Applies everything currently in localStorage onto `target`. */
 function loadPersistedSettings<T>(target: T, entries: readonly PersistedSetting<T>[]): void {
-	if (typeof localStorage === 'undefined' || typeof localStorage.getItem !== 'function') return;
+	if (!hasStorage()) return;
 	for (const entry of entries) {
 		entry.load(target, localStorage.getItem(entry.key));
 	}
@@ -423,7 +458,7 @@ function installPersistedSettings<T>(target: T, entries: readonly PersistedSetti
 		if (typeof window === 'undefined') return;
 		const entriesByKey = new Map(entries.map((entry) => [entry.key, entry]));
 		const onStorage = (event: StorageEvent) => {
-			if (event.storageArea && typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function' && event.storageArea !== localStorage) return;
+			if (event.storageArea && hasStorage() && event.storageArea !== localStorage) return;
 			// A null key means the whole store was cleared; re-read everything.
 			if (event.key === null) {
 				loadPersistedSettings(target, entries);
@@ -448,12 +483,36 @@ export class SettingsStore {
 	highlightColor = $state('yellow');
 	showTabs = $state(true);
 	restoreStateOnReopen = $state(true);
+	closeWindowWithLastTab = $state(true);
 	zenMode = $state(false);
+	/** Keeps the editor's cursor line in the middle of the pane. */
+	typewriterMode = $state(false);
+	/** Dims the editor outside the paragraph the cursor is in (#819). Independent of zen mode. */
+	focusMode = $state(false);
 	showToc = $state(false);
 	preZenState = $state<PreZenState | null>(null);
 	occurrencesHighlight = $state(false);
+	/** The preview's own Highlight Occurrences: copies of the selected text are marked. */
+	previewOccurrences = $state(false);
+	/** Temporary Highlight in the preview's right-click menu; off, the items and the highlights are hidden. */
+	previewAnnotations = $state(false);
+	/** A table wider than the text column grows into the margins (#811). Off, it scrolls inside the column, as on GitHub. */
+	previewTableBreakout = $state(false);
+	/** A table too wide to fit scrolls sideways, as on GitHub. Off, its cells break inside words so it fits. */
+	previewTableScroll = $state(true);
+	/** A newline inside a paragraph renders as a line break. Off, it is a space, as CommonMark says (#967). */
+	previewNewlineBreaks = $state(true);
 	showWhitespace = $state(false);
 	stickyScroll = $state(true);
+	/**
+	 * What the outline marks as the current heading: the heading scrolled to,
+	 * or the one the tab's cursor is in (#799). The cursor is followed only
+	 * where the reader can see it: in the editor, or drawn in the preview with
+	 * `previewCursor` on. Otherwise the outline follows the scroll.
+	 */
+	tocFollows = $state<'scroll' | 'cursor'>('scroll');
+	/** Whether a click in the preview places the tab's cursor, drawn there (#799). */
+	previewCursor = $state(false);
 	/**
 	 * Whether a newly split tab starts with its panes scroll-locked.
 	 *
@@ -466,6 +525,8 @@ export class SettingsStore {
 	 */
 	splitScrollSync = $state(false);
 	openFileMode = $state<OpenFileMode>(DEFAULT_OPEN_FILE_MODE);
+	/** Where a file opened from outside goes with several windows open. See `OpenFileTarget`. */
+	openFileTarget = $state<OpenFileTarget>(DEFAULT_OPEN_FILE_TARGET);
 	newFileDefaultMode = $state(true);
 	showRecentFiles = $state(true);
 	/**
@@ -481,8 +542,9 @@ export class SettingsStore {
 	 *
 	 * It covers a jump in either pane — a heading from the table of contents, a
 	 * find match, back and forward — because they are one decision the user
-	 * makes once, not a preview one and an editor one. `utils/motion.ts` holds
-	 * that decision; the seven places that used to spell it themselves ask it.
+	 * makes once, not a preview one and an editor one. Every jump reads this
+	 * setting and nothing else; the system's reduce-motion preference is not
+	 * consulted (see `utils/motion.ts`).
 	 */
 	animateJumpScroll = $state(true);
 	/*
@@ -496,12 +558,6 @@ export class SettingsStore {
 	 * finds it smeary still has no reason to lose the animated jump.
 	 */
 	animateCursor = $state(true);
-	/**
-	 * The system's own request for less motion. Not persisted and not a default
-	 * for `animateJumpScroll` — it is the OS answering, live, and a stored copy
-	 * would be wrong the moment the user changed it.
-	 */
-	systemReducedMotion = $state(false);
 	/*
 	 * Off, so a click on a relative link keeps navigating this tab.
 	 *
@@ -512,7 +568,7 @@ export class SettingsStore {
 	 * take away deliberately rather than as the side effect of a new setting.
 	 */
 	linksOpenInNewTab = $state(false);
-	editorMaxWidth = $state(80);
+	editorMaxWidth = $state(EDITOR_MAX_WIDTH_RANGE.default);
 	previewMaxWidth = $state(DEFAULT_PREVIEW_MAX_WIDTH);
 	// Preview ignores previewMaxWidth and fills the pane.
 	previewFullWidth = $state(false);
@@ -533,7 +589,34 @@ export class SettingsStore {
 	 * answering it again every time one is opened.
 	 */
 	splitEditorSide = $state<'left' | 'right'>('left');
-	tocWidth = $state(240);
+	tocWidth = $state(TOC_WIDTH_RANGE.default);
+	/**
+	 * Where the open documents are listed (#884): across the title bar, or as
+	 * a column down one side of the window. A long horizontal strip hides most
+	 * of its tabs once a dozen files are open; a column shows them all by name.
+	 * `showTabs` still decides whether they are shown at all, so zen mode hides
+	 * the column the same way it hides the strip.
+	 */
+	tabPosition = $state<TabPosition>('top');
+	tabColumnWidth = $state(TAB_COLUMN_WIDTH_RANGE.default);
+	/** Where the tabs are drawn, or null with them hidden. Every place that asks where the tabs are reads this. */
+	get tabPlacement(): TabPosition | null {
+		return this.showTabs ? this.tabPosition : null;
+	}
+	/**
+	 * The folder sidebar. When the tabs are in a side column the folder stacks
+	 * into that column, so `folderSide` only places it while they are not.
+	 * `sidebarStackOrder` says which section is upper when both share the column, and `sidebarSplit` how much of it the
+	 * upper one takes.
+	 */
+	folderSide = $state<'left' | 'right'>('left');
+	sidebarStackOrder = $state<SidebarStackOrder>('openFilesTop');
+	sidebarSplit = $state(SIDEBAR_SPLIT_RANGE.default);
+	/**
+	 * Off: the folder lists only what Markpad opens. On: every file, the rest
+	 * dimmed and opened by the system's default app.
+	 */
+	folderShowAllFiles = $state(false);
 	osType = $state<OSType>('unknown');
 	imageDirectory = $state('img');
 	macosImageScaling = $state(true);
@@ -546,23 +629,25 @@ export class SettingsStore {
 	titlebarToolbarPlacement = $state<Record<string, TitlebarToolbarPlacement>>({ ...DEFAULT_TITLEBAR_TOOLBAR_PLACEMENT });
 
 	editorFont = $state('Consolas');
-	editorFontSize = $state(14);
+	editorFontSize = $state(EDITOR_FONT_SIZE_RANGE.default);
 	previewFont = $state('Segoe UI');
-	previewFontSize = $state(16);
+	previewFontSize = $state(PREVIEW_FONT_SIZE_RANGE.default);
 	codeFont = $state('Consolas');
-	codeFontSize = $state(14);
+	codeFontSize = $state(CODE_FONT_SIZE_RANGE.default);
 
 	// File-save behavior: on, edits are persisted without Cmd+S; off, they are
-	// kept until saved and closing asks. One switch, because that is the number
+	// kept until saved (closing backs them up or asks, see `persistOpenEditors`).
+	// One switch, because that is the number
 	// of behaviours the app has — see `autoSaveSetting.ts` for the pair it
 	// replaced and why the two of them were never independent.
 	autoSave = $state(DEFAULT_AUTO_SAVE);
+	persistOpenEditors = $state(true);
 
 	/** The `$effect.root` disposer from the constructor. See {@link dispose}. */
 	#disposeEffects: (() => void) | null = null;
 
 	constructor() {
-		if (typeof localStorage === 'undefined' || typeof localStorage.getItem !== 'function') return;
+		if (!hasStorage()) return;
 
 		const entries = createSettingsPersistence();
 
@@ -613,10 +698,6 @@ export class SettingsStore {
 		this.#disposeEffects = null;
 	}
 
-	toggleMinimap() {
-		this.minimap = !this.minimap;
-	}
-
 	toggleWordWrap() {
 		if (this.wordWrap === 'off') {
 			this.wordWrap = 'on';
@@ -631,48 +712,8 @@ export class SettingsStore {
 		this.lineNumbers = this.lineNumbers === 'on' ? 'off' : 'on';
 	}
 
-	toggleVimMode() {
-		this.vimMode = !this.vimMode;
-	}
-
-	toggleStatusBar() {
-		this.statusBar = !this.statusBar;
-	}
-
-	toggleWordCount() {
-		this.wordCount = !this.wordCount;
-	}
-
 	toggleLineHighlight() {
 		this.renderLineHighlight = this.renderLineHighlight === 'line' ? 'none' : 'line';
-	}
-
-	toggleTabs() {
-		this.showTabs = !this.showTabs;
-	}
-
-	toggleRestoreStateOnReopen() {
-		this.restoreStateOnReopen = !this.restoreStateOnReopen;
-	}
-
-	toggleShowRecentFiles() {
-		this.showRecentFiles = !this.showRecentFiles;
-	}
-
-	toggleShowFolderForDuplicateNames() {
-		this.showFolderForDuplicateNames = !this.showFolderForDuplicateNames;
-	}
-
-	toggleAnimateJumpScroll() {
-		this.animateJumpScroll = !this.animateJumpScroll;
-	}
-
-	toggleAnimateCursor() {
-		this.animateCursor = !this.animateCursor;
-	}
-
-	toggleLinksOpenInNewTab() {
-		this.linksOpenInNewTab = !this.linksOpenInNewTab;
 	}
 
 	toggleZenMode() {
@@ -709,30 +750,6 @@ export class SettingsStore {
 		}
 	}
 
-	toggleToc() {
-		this.showToc = !this.showToc;
-	}
-
-	toggleOccurrencesHighlight() {
-		this.occurrencesHighlight = !this.occurrencesHighlight;
-	}
-
-	toggleShowWhitespace() {
-		this.showWhitespace = !this.showWhitespace;
-	}
-
-	toggleStickyScroll() {
-		this.stickyScroll = !this.stickyScroll;
-	}
-
-	toggleNewFileDefaultMode() {
-		this.newFileDefaultMode = !this.newFileDefaultMode;
-	}
-
-	togglePinnedToc() {
-		this.pinnedToc = !this.pinnedToc;
-	}
-
 	toggleTocSide() {
 		this.tocSide = this.tocSide === 'left' ? 'right' : 'left';
 	}
@@ -745,20 +762,16 @@ export class SettingsStore {
 		this.tocWidth = clampToRange(width, TOC_WIDTH_RANGE);
 	}
 
-	toggleMacosImageScaling() {
-		this.macosImageScaling = !this.macosImageScaling;
+	setTabColumnWidth(width: number) {
+		this.tabColumnWidth = clampToRange(width, TAB_COLUMN_WIDTH_RANGE);
 	}
 
-	toggleAutoSave() {
-		this.autoSave = !this.autoSave;
+	setSidebarSplit(percent: number) {
+		this.sidebarSplit = clampToRange(Math.round(percent), SIDEBAR_SPLIT_RANGE);
 	}
 
 	setLanguage(lang: LanguageCode) {
 		this.language = lang;
-	}
-
-	toggleEditorToolbar() {
-		this.showEditorToolbar = !this.showEditorToolbar;
 	}
 
 	setEditorToolbarToolVisible(id: string, visible: boolean) {
@@ -829,10 +842,6 @@ export class SettingsStore {
 		this.previewMaxWidth = DEFAULT_PREVIEW_MAX_WIDTH;
 	}
 
-	togglePreviewFullWidth() {
-		this.previewFullWidth = !this.previewFullWidth;
-	}
-
 	// The three zoom operations live here rather than at the four keyboard and
 	// wheel handlers that used to spell them out, so ZOOM_LEVEL_RANGE is the only
 	// place the bounds and the neutral factor exist. `stepWithinRange` also
@@ -846,13 +855,28 @@ export class SettingsStore {
 		this.zoomLevel = stepWithinRange(this.zoomLevel, -ZOOM_LEVEL_RANGE.step, ZOOM_LEVEL_RANGE);
 	}
 
+	// zoomLevel is whole percent and one pinch event is often a fraction of
+	// one: rounding every step would stall a slow pinch where it started. The
+	// unrounded level carries between events until something else moves zoomLevel.
+	#exactZoom: number | null = null;
+
+	zoomBy(factor: number) {
+		const current =
+			this.#exactZoom !== null && Math.round(this.#exactZoom) === this.zoomLevel
+				? this.#exactZoom
+				: clampToRange(this.zoomLevel, ZOOM_LEVEL_RANGE);
+		const next = Math.min(ZOOM_LEVEL_RANGE.max, Math.max(ZOOM_LEVEL_RANGE.min, current * factor));
+		this.#exactZoom = next;
+		this.zoomLevel = Math.round(next);
+	}
+
 	resetZoom() {
 		this.zoomLevel = ZOOM_LEVEL_RANGE.default;
 	}
 
 	async initOSType() {
 		try {
-			const osType = await invoke<unknown>('get_os_type');
+			const osType = await commands.getOsType();
 			this.osType = isOSType(osType) ? osType : 'unknown';
 		} catch (e) {
 			console.error('Failed to get OS type:', e);
@@ -934,9 +958,18 @@ export function createSettingsPersistence(): PersistedSetting<SettingsStore>[] {
 		booleanSetting('editor.wordCount', (s) => s.wordCount, (s, v) => { s.wordCount = v; }),
 		stringSetting('editor.renderLineHighlight', (s) => s.renderLineHighlight, (s, v) => { s.renderLineHighlight = v; }),
 		booleanSetting('editor.showTabs', (s) => s.showTabs, (s, v) => { s.showTabs = v; }),
+		booleanSetting('editor.persistOpenEditors', (s) => s.persistOpenEditors, (s, v) => { s.persistOpenEditors = v; }),
 		booleanSetting('editor.restoreStateOnReopen', (s) => s.restoreStateOnReopen, (s, v) => { s.restoreStateOnReopen = v; }),
+		booleanSetting('editor.closeWindowWithLastTab', (s) => s.closeWindowWithLastTab, (s, v) => { s.closeWindowWithLastTab = v; }),
 		booleanSetting('editor.zenMode', (s) => s.zenMode, (s, v) => { s.zenMode = v; }),
+		booleanSetting('editor.typewriterMode', (s) => s.typewriterMode, (s, v) => { s.typewriterMode = v; }),
+		booleanSetting('editor.focusMode', (s) => s.focusMode, (s, v) => { s.focusMode = v; }),
 		booleanSetting('editor.occurrencesHighlight', (s) => s.occurrencesHighlight, (s, v) => { s.occurrencesHighlight = v; }),
+		booleanSetting('preview.occurrencesHighlight', (s) => s.previewOccurrences, (s, v) => { s.previewOccurrences = v; }),
+		booleanSetting('preview.annotations', (s) => s.previewAnnotations, (s, v) => { s.previewAnnotations = v; }),
+		booleanSetting('preview.tableBreakout', (s) => s.previewTableBreakout, (s, v) => { s.previewTableBreakout = v; }),
+		booleanSetting('preview.tableScroll', (s) => s.previewTableScroll, (s, v) => { s.previewTableScroll = v; }),
+		booleanSetting('preview.newlineBreaks', (s) => s.previewNewlineBreaks, (s, v) => { s.previewNewlineBreaks = v; }),
 		booleanSetting('editor.showWhitespace', (s) => s.showWhitespace, (s, v) => { s.showWhitespace = v; }),
 		booleanSetting('editor.stickyScroll', (s) => s.stickyScroll, (s, v) => { s.stickyScroll = v; }),
 		booleanSetting('editor.splitScrollSync', (s) => s.splitScrollSync, (s, v) => { s.splitScrollSync = v; }),
@@ -952,11 +985,19 @@ export function createSettingsPersistence(): PersistedSetting<SettingsStore>[] {
 				s.openFileMode = resolveOpenFileMode(raw, readStoredKey(LEGACY_START_IN_EDITOR_KEY));
 			},
 		},
+		{
+			key: 'files.openFileTarget',
+			read: (s) => s.openFileTarget,
+			load: (s, raw) => {
+				if (isOpenFileTarget(raw)) s.openFileTarget = raw;
+			},
+		},
 		booleanSetting('editor.newFileDefaultMode', (s) => s.newFileDefaultMode, (s, v) => { s.newFileDefaultMode = v; }),
 		booleanSetting('editor.showRecentFiles', (s) => s.showRecentFiles, (s, v) => { s.showRecentFiles = v; }),
 		booleanSetting('editor.showFolderForDuplicateNames', (s) => s.showFolderForDuplicateNames, (s, v) => { s.showFolderForDuplicateNames = v; }),
 		booleanSetting('motion.animateJumpScroll', (s) => s.animateJumpScroll, (s, v) => { s.animateJumpScroll = v; }),
 		booleanSetting('motion.animateCursor', (s) => s.animateCursor, (s, v) => { s.animateCursor = v; }),
+		booleanSetting('preview.cursor', (s) => s.previewCursor, (s, v) => { s.previewCursor = v; }),
 		booleanSetting('links.openInNewTab', (s) => s.linksOpenInNewTab, (s, v) => { s.linksOpenInNewTab = v; }),
 		numberSetting('editor.maxWidth', EDITOR_MAX_WIDTH_RANGE, (s) => s.editorMaxWidth, (s, v) => { s.editorMaxWidth = v; }),
 		{
@@ -972,8 +1013,7 @@ export function createSettingsPersistence(): PersistedSetting<SettingsStore>[] {
 			// first launch after the upgrade. The write effect seeds the new key
 			// immediately, and `??` prefers it, so the legacy one stops being
 			// consulted after that — the same treatment `editor.openFileMode` and
-			// `editor.autoSaveEdits` give theirs. It used to be deleted here
-			// instead, which a `read` that touches one field cannot do.
+			// `editor.autoSaveEdits` give theirs.
 			load: (s, raw) => {
 				s.previewFullWidth = getStoredPreviewFullWidth(raw, readStoredKey(LEGACY_PREVIEW_FULL_WIDTH_KEY));
 			},
@@ -988,6 +1028,13 @@ export function createSettingsPersistence(): PersistedSetting<SettingsStore>[] {
 			},
 		},
 		{
+			key: 'editor.tocFollows',
+			read: (s) => s.tocFollows,
+			load: (s, raw) => {
+				if (raw === 'scroll' || raw === 'cursor') s.tocFollows = raw;
+			},
+		},
+		{
 			key: 'editor.splitEditorSide',
 			read: (s) => s.splitEditorSide,
 			load: (s, raw) => {
@@ -995,6 +1042,30 @@ export function createSettingsPersistence(): PersistedSetting<SettingsStore>[] {
 			},
 		},
 		numberSetting('editor.tocWidth', TOC_WIDTH_RANGE, (s) => s.tocWidth, (s, v) => { s.tocWidth = v; }),
+		{
+			key: 'editor.tabPosition',
+			read: (s) => s.tabPosition,
+			load: (s, raw) => {
+				if (isTabPosition(raw)) s.tabPosition = raw;
+			},
+		},
+		numberSetting('editor.tabColumnWidth', TAB_COLUMN_WIDTH_RANGE, (s) => s.tabColumnWidth, (s, v) => { s.tabColumnWidth = v; }),
+		{
+			key: 'folder.side',
+			read: (s) => s.folderSide,
+			load: (s, raw) => {
+				if (raw === 'left' || raw === 'right') s.folderSide = raw;
+			},
+		},
+		{
+			key: 'folder.stackOrder',
+			read: (s) => s.sidebarStackOrder,
+			load: (s, raw) => {
+				if (raw === 'openFilesTop' || raw === 'folderTop') s.sidebarStackOrder = raw;
+			},
+		},
+		numberSetting('folder.split', SIDEBAR_SPLIT_RANGE, (s) => s.sidebarSplit, (s, v) => { s.sidebarSplit = v; }),
+		booleanSetting('folder.showAllFiles', (s) => s.folderShowAllFiles, (s, v) => { s.folderShowAllFiles = v; }),
 		stringSetting('editor.imageDirectory', (s) => s.imageDirectory, (s, v) => { s.imageDirectory = v; }),
 		booleanSetting('editor.macosImageScaling', (s) => s.macosImageScaling, (s, v) => { s.macosImageScaling = v; }),
 		{
@@ -1073,6 +1144,93 @@ export function createSettingsPersistence(): PersistedSetting<SettingsStore>[] {
 			load: (s, raw) => { s.preZenState = normalizePreZenState(parseStoredRecord(raw)); },
 		},
 	];
+}
+
+/** Marks a file as Markpad settings; its value is the format version. */
+const SETTINGS_FILE_MARKER = 'markpadSettings';
+
+// A family the user never picked is the exporting OS's default, which the
+// importing machine may not have. Leaving it out keeps the importer's own.
+const FONT_DEFAULT_FIELDS: Record<string, keyof DefaultFonts> = {
+	'editor.font': 'editorFont',
+	'preview.font': 'previewFont',
+	'preview.codeFont': 'codeFont',
+};
+
+/** A parsed settings file: localStorage values by key, and theme JSON by name. */
+export interface SettingsFile {
+	settings: Record<string, unknown>;
+	themes: Record<string, string>;
+}
+
+/**
+ * Serializes every persisted setting to a settings file (#134), keyed by its
+ * localStorage key. A stored value that is itself JSON (booleans, numbers,
+ * lists) is written as that JSON so the file can be edited by hand; the
+ * `stringify` check keeps the round trip exact.
+ *
+ * `themes` are the installed VS Code themes, carried whole because Markpad
+ * keeps no link back to where one was downloaded from.
+ */
+export function exportSettings(store: SettingsStore, themes: Record<string, string> = {}): string {
+	const values: Record<string, unknown> = {};
+	for (const entry of createSettingsPersistence()) {
+		const raw = entry.read(store);
+		if (raw === null) continue;
+		const fontField = FONT_DEFAULT_FIELDS[entry.key];
+		if (fontField && raw === DEFAULT_FONTS[store.osType][fontField]) continue;
+		let value: unknown = raw;
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			if (typeof parsed !== 'string' && JSON.stringify(parsed) === raw) value = parsed;
+		} catch {
+			// Not JSON: an ordinary string setting.
+		}
+		values[entry.key] = value;
+	}
+	return JSON.stringify({ [SETTINGS_FILE_MARKER]: 1, settings: values, themes }, null, '\t') + '\n';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Throws when `text` is not a settings file. Theme entries that are not strings are dropped. */
+export function parseSettingsFile(text: string): SettingsFile {
+	let parsed: unknown = null;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		// Reported below with every other non-settings file.
+	}
+	if (!isRecord(parsed) || typeof parsed[SETTINGS_FILE_MARKER] !== 'number' || !isRecord(parsed.settings)) {
+		throw new Error('Not a Markpad settings file');
+	}
+	const themes: Record<string, string> = {};
+	if (isRecord(parsed.themes)) {
+		for (const [name, json] of Object.entries(parsed.themes)) {
+			if (typeof json === 'string') themes[name] = json;
+		}
+	}
+	return { settings: parsed.settings, themes };
+}
+
+/**
+ * Applies a settings file's values onto `store`. Keys the file does not name
+ * keep their current value, and unknown keys are ignored. Each value goes
+ * through the same `load` that reads localStorage, so a hand-edited or foreign
+ * value is validated exactly like a corrupt stored one. The write effects then
+ * persist it and sync the other windows.
+ *
+ * Install the file's themes first: a `vscode:` theme that is not on disk yet
+ * falls back to `system` the moment it is applied.
+ */
+export function applySettings(store: SettingsStore, values: Record<string, unknown>): void {
+	for (const entry of createSettingsPersistence()) {
+		if (!Object.prototype.hasOwnProperty.call(values, entry.key)) continue;
+		const value = values[entry.key];
+		entry.load(store, typeof value === 'string' ? value : JSON.stringify(value));
+	}
 }
 
 export const settings = new SettingsStore();

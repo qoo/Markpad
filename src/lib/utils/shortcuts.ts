@@ -12,16 +12,10 @@
  * been a fourth copy — and the one users would trust most.
  *
  * So this is the single copy the display layers read, and
- * `scripts/shortcutRegistry.test.ts` ties it to the handlers: every chord below
+ * `scripts/shortcuts.test.ts` ties it to the handlers: every chord below
  * is fired at the real code and has to run the command it is labelled with.
  * The registry is not a source of truth about behaviour — the handlers are —
  * it is a claim about them that a test refuses to let drift.
- *
- * WHAT IS NOT HERE
- *
- * The clipboard chords (`Mod+C`, `Mod+V`). They are OS conventions rather than
- * app shortcuts, and `Mod+V` is registered as a bare `addCommand` with no id,
- * so listing Copy without Paste would be the more confusing half-answer.
  */
 
 /**
@@ -37,11 +31,12 @@
  * continuation and nothing anywhere told a user it was there.
  */
 import type { ViewerCommand } from './viewerKeymap.js';
+import type { TranslationKey } from './i18n.js';
 
 type ShortcutGroup = 'file' | 'edit' | 'keys' | 'view' | 'window';
 
 /** Display order of the groups, and the i18n key that titles each one. */
-export const SHORTCUT_GROUPS: ReadonlyArray<{ group: ShortcutGroup; labelKey: string }> = [
+export const SHORTCUT_GROUPS: ReadonlyArray<{ group: ShortcutGroup; labelKey: TranslationKey }> = [
 	{ group: 'file', labelKey: 'menu.file' },
 	{ group: 'edit', labelKey: 'menu.edit' },
 	{ group: 'keys', labelKey: 'keys.group' },
@@ -65,7 +60,11 @@ export type ShortcutEntry = {
 	 * these labels was already in the dictionary for a menu entry or a context
 	 * menu, in all 26 locales.
 	 */
-	readonly labelKey: string;
+	readonly labelKey: TranslationKey;
+	/** The label on macOS, where the app menu names the command differently. */
+	readonly macosLabelKey?: TranslationKey;
+	/** A note on where the chord works, for a command that is not everywhere. */
+	readonly hintKey?: TranslationKey;
 	/**
 	 * The chords, most-advertised first. Written in the spelling the CODE uses,
 	 * which is not always the spelling a user reads: `Mod` renders as `Cmd` on
@@ -84,21 +83,25 @@ export type ShortcutEntry = {
 	 * The name of the handler `Editor.svelte` binds this chord to with a bare
 	 * `editor.addCommand` — no action id, no label, no menu entry.
 	 *
-	 * The `keys` group needs this because there is no action id to check against:
-	 * a contextual key IS a nameless command. Recording the handler's name keeps
-	 * the row as verifiable as every other one — `shortcutRegistry.test.ts` reads
+	 * Contextual keys and Cut/Paste need this because there is no action id to
+	 * check against. Recording the handler's name keeps the row as verifiable as
+	 * every other one — `shortcuts.editor.test.ts` reads
 	 * the component's `addCommand` calls, evaluates the keybinding with Monaco's
 	 * own `KeyMod`/`KeyCode`, and requires that this chord be bound to this
 	 * function.
 	 */
 	readonly editorCommand?: string;
 	/**
+	 * Monaco's own command for this chord, which the app leaves alone (Undo,
+	 * Redo). `editor.chords.spec.ts` checks it against Monaco's real keymap.
+	 */
+	readonly monacoCommand?: string;
+	/**
 	 * The command the document-level dispatcher means by this row's chords when
 	 * the editor does not have focus.
 	 *
 	 * One entry means every chord in the row runs it (`file-new` binds both
-	 * `Mod+T` and `Mod+N`); otherwise there is one per chord, in `chords` order,
-	 * which is how `view-preview-width`'s `[` and `]` say which way each goes.
+	 * `Mod+T` and `Mod+N`); otherwise there is one per chord, in `chords` order.
 	 *
 	 * A `ViewerCommand` rather than a function name, now that the dispatcher has
 	 * a module of its own: the compiler now rejects a row naming a
@@ -111,19 +114,17 @@ export type ShortcutEntry = {
 	readonly documentCommands?: readonly ViewerCommand[];
 	/**
 	 * Platforms where the document handler deliberately stays out of the way.
-	 * Only Quit uses this: on macOS the native Tauri menu owns `Cmd+Q` and the
+	 * Only Quit uses this: on macOS the native menu owns `Cmd+Q` and the
 	 * handler returns early, so the chord is real but answered somewhere else.
 	 */
 	readonly documentExempt?: readonly ShortcutPlatform[];
-	/** The accelerator the native macOS menu claims, for the same reason. */
-	readonly nativeMenuAccelerator?: string;
 };
 
 /**
  * Every user-visible shortcut, grouped for display.
  *
  * Each row is checked against the code that implements it. Adding a row without
- * a matching binding fails `scripts/shortcutRegistry.test.ts`, which is the
+ * a matching binding fails `scripts/shortcuts.test.ts`, which is the
  * whole point: the panel cannot advertise a chord the app does not answer.
  */
 export const SHORTCUTS: readonly ShortcutEntry[] = [
@@ -137,6 +138,13 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 		group: 'file',
 		editorAction: true,
 		documentCommands: ['new-file'],
+	},
+	{
+		id: 'file-new-window',
+		labelKey: 'menu.newWindow',
+		chords: ['Mod+Shift+N'],
+		group: 'file',
+		documentCommands: ['new-window'],
 	},
 	{
 		id: 'file-open',
@@ -198,20 +206,29 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 		chords: ['Mod+Shift+R'],
 		group: 'file',
 		editorAction: true,
+		documentCommands: ['reveal-file'],
 	},
 	{
 		id: 'app-exit',
 		labelKey: 'menu.exit',
+		// The macOS app menu says "Quit Markpad"; Windows and Linux say "Exit".
+		macosLabelKey: 'menu.quit',
 		chords: ['Mod+Q'],
 		group: 'file',
-		documentCommands: ['close-window'],
+		documentCommands: ['app-exit'],
 		// On macOS the document handler returns before this branch; the native
-		// menu's CmdOrCtrl+Q is what answers, and #281 left exactly two entries.
+		// menu's Quit answers it.
 		documentExempt: ['macos'],
-		nativeMenuAccelerator: 'CmdOrCtrl+Q',
 	},
 
 	// ---------------------------------------------------------------- edit
+	{ id: 'edit-undo', labelKey: 'menu.undo', chords: ['Mod+Z'], group: 'edit', monacoCommand: 'undo' },
+	// Windows and Linux also take `Mod+Y`. macOS does not, and a row has one
+	// chord list for every platform, so only the chord all three answer is shown.
+	{ id: 'edit-redo', labelKey: 'menu.redo', chords: ['Mod+Shift+Z'], group: 'edit', monacoCommand: 'redo' },
+	{ id: 'edit-cut', labelKey: 'menu.cut', chords: ['Mod+X'], group: 'edit', editorCommand: 'cutToClipboard' },
+	{ id: 'custom-copy', labelKey: 'menu.copy', chords: ['Mod+C'], group: 'edit', editorAction: true },
+	{ id: 'edit-paste', labelKey: 'menu.paste', chords: ['Mod+V'], group: 'edit', editorCommand: 'pasteFromClipboard' },
 	{ id: 'fmt-bold', labelKey: 'menu.bold', chords: ['Mod+B'], group: 'edit', editorAction: true },
 	{ id: 'fmt-italic', labelKey: 'menu.italic', chords: ['Mod+I'], group: 'edit', editorAction: true },
 	{ id: 'fmt-underline', labelKey: 'menu.underline', chords: ['Mod+U'], group: 'edit', editorAction: true },
@@ -245,7 +262,7 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 		//
 		// Taking it means Mod+K stops being a chord PREFIX, which is what
 		// `insert-table-simple` and `table-insert-column` used to hang off. What
-		// that costs on Monaco's side is argued in monacoChordOwnership.spec.ts.
+		// that costs on Monaco's side is argued in editor.chords.spec.ts.
 		chords: ['Mod+K'],
 		group: 'edit',
 		editorAction: true,
@@ -268,7 +285,7 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 		//
 		// NOT `Mod+Alt+C`, which was the obvious pick and is not available — on macOS
 		// that is Monaco's `toggleFindCaseSensitive`. The reason it cannot be taken is
-		// recorded in monacoChordOwnership.spec.ts, where the next person hunting for
+		// recorded in editor.chords.spec.ts, where the next person hunting for
 		// a free chord will be.
 		chords: ['Mod+Shift+C'],
 		group: 'edit',
@@ -337,7 +354,7 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 	// ---------------------------------------------------------------- view
 	{
 		id: 'view-toggle-edit',
-		labelKey: 'menu.editor',
+		labelKey: 'menu.editMode',
 		chords: ['Mod+E'],
 		group: 'view',
 		editorAction: true,
@@ -345,7 +362,7 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 	},
 	{
 		id: 'view-toggle-live',
-		labelKey: 'menu.toggleLiveMode',
+		labelKey: 'menu.autoReload',
 		chords: ['Mod+L'],
 		group: 'view',
 		// Both halves, like Mod+E: Monaco's own Ctrl+L is `expandLineSelection`,
@@ -377,6 +394,7 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 		chords: ['Mod+Alt+Z'],
 		group: 'view',
 		editorAction: true,
+		documentCommands: ['toggle-zen-mode'],
 	},
 	{
 		id: 'toggle-tabs',
@@ -384,6 +402,7 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 		chords: ['Mod+Shift+B'],
 		group: 'view',
 		editorAction: true,
+		documentCommands: ['toggle-tabs'],
 	},
 	{
 		id: 'app-find',
@@ -398,18 +417,29 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 		chords: ['Mod+,'],
 		group: 'view',
 		documentCommands: ['open-settings'],
-		nativeMenuAccelerator: 'CmdOrCtrl+,',
 	},
 	{
-		id: 'view-preview-width',
-		labelKey: 'settings.previewMaxWidth',
-		// One row, two chords: `[` narrows and `]` widens, the same pair the
-		// settings stepper offers. Both run the same branch, which turns full-width
-		// off before it adjusts the width — one shortcut, two directions, which is
-		// why this is the one row whose commands are listed per chord.
-		chords: ['Mod+Alt+[', 'Mod+Alt+]'],
+		id: 'app-home',
+		labelKey: 'menu.home',
+		// Shift+Cmd+H is Home in Finder and Safari. Monaco binds nothing to it.
+		chords: ['Mod+Shift+H'],
 		group: 'view',
-		documentCommands: ['preview-width-narrower', 'preview-width-wider'],
+		editorAction: true,
+		documentCommands: ['toggle-home'],
+	},
+	{
+		id: 'view-preview-narrower',
+		labelKey: 'menu.previewNarrower',
+		chords: ['Mod+Alt+['],
+		group: 'view',
+		documentCommands: ['preview-width-narrower'],
+	},
+	{
+		id: 'view-preview-wider',
+		labelKey: 'menu.previewWider',
+		chords: ['Mod+Alt+]'],
+		group: 'view',
+		documentCommands: ['preview-width-wider'],
 	},
 	{ id: 'view-zoom-in', labelKey: 'menu.zoomIn', chords: ['Mod+='], group: 'view', documentCommands: ['zoom-in'] },
 	{ id: 'view-zoom-out', labelKey: 'menu.zoomOut', chords: ['Mod+-'], group: 'view', documentCommands: ['zoom-out'] },
@@ -444,7 +474,7 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 	},
 	{
 		id: 'tab-move-window',
-		labelKey: 'menu.moveToWindow',
+		labelKey: 'menu.moveToNextWindow',
 		chords: ['Mod+Shift+M'],
 		group: 'window',
 		documentCommands: ['move-tab-to-next-window'],
@@ -466,6 +496,8 @@ export const SHORTCUTS: readonly ShortcutEntry[] = [
 	{
 		id: 'app-command-palette',
 		labelKey: 'menu.commandPalette',
+		// Monaco's palette: there is none in the preview.
+		hintKey: 'settings.toolbarEditOrSplit',
 		chords: ['Mod+P'],
 		group: 'window',
 		editorAction: true,
@@ -542,7 +574,7 @@ const PLATFORM_KEY_WORDS = {
  * `Alt` used to be in that second list, and that was wrong: the panel advertised
  * `Alt+Left` to a Mac user, who has no key called Alt to press. Adding a modifier
  * that macOS renames without adding it here fails
- * `scripts/shortcutRegistry.test.ts`.
+ * `scripts/shortcuts.test.ts`.
  */
 export function formatChord(chord: string, modifier: 'Cmd' | 'Ctrl'): string {
 	const words: Record<string, string> = PLATFORM_KEY_WORDS[modifier];
@@ -563,8 +595,8 @@ export function shortcutLabel(id: string, modifier: 'Cmd' | 'Ctrl'): string | un
 
 type ShortcutSection = {
 	group: ShortcutGroup;
-	labelKey: string;
-	entries: ReadonlyArray<{ id: string; labelKey: string; chords: string[] }>;
+	labelKey: TranslationKey;
+	entries: ReadonlyArray<{ id: string; labelKey: TranslationKey; hintKey?: TranslationKey; chords: string[] }>;
 };
 
 /** The whole registry, grouped and rendered for `platform` — what the panel draws. */
@@ -575,7 +607,8 @@ export function shortcutSections(platform: ShortcutPlatform): ShortcutSection[] 
 		labelKey,
 		entries: SHORTCUTS.filter((entry) => entry.group === group).map((entry) => ({
 			id: entry.id,
-			labelKey: entry.labelKey,
+			labelKey: (platform === 'macos' && entry.macosLabelKey) || entry.labelKey,
+			hintKey: entry.hintKey,
 			chords: entry.chords.map((chord) => formatChord(chord, modifier)),
 		})),
 	}));

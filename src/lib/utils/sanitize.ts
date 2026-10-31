@@ -13,11 +13,7 @@ import { MARKDOWN_LINK_EXTENSIONS } from './markdownLinks.js';
 
 // The extension set `hasMarkdownLinkExtension` accepts, spliced into a URI
 // pattern rather than called as a predicate — DOMPurify takes a regexp, not a
-// function. Re-exported because MarkdownViewer.svelte reads the same list for
-// the Open dialog's file filter and imports it from the sanitizer; the list
-// itself is defined once, in ./markdownLinks.ts.
-export { MARKDOWN_LINK_EXTENSIONS };
-
+// function.
 const markdownLinkExtensionPattern = MARKDOWN_LINK_EXTENSIONS
 	.map((ext) => ext.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
 	.join('|');
@@ -63,4 +59,16 @@ export const MARKDOWN_SANITIZE_CONFIG = {
  */
 export function sanitizeMarkdownHtml(html: string): string {
 	return DOMPurify.sanitize(html, MARKDOWN_SANITIZE_CONFIG);
+}
+
+/**
+ * The same policy, answering with the filtered nodes instead of a string.
+ *
+ * For the preview, where they go straight into the article
+ * (`previewPatch.ts`, one changed block at a time): a round trip after the
+ * filter is the one place a parser could still rewrite what the filter
+ * approved.
+ */
+export function sanitizeMarkdownFragment(html: string): DocumentFragment {
+	return DOMPurify.sanitize(html, { ...MARKDOWN_SANITIZE_CONFIG, RETURN_DOM_FRAGMENT: true });
 }

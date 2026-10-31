@@ -1,14 +1,14 @@
 //! Markdown rendering: the comrak configuration, the preprocessing steps that
 //! run before it, the math masking that hides TeX from CommonMark, and the
 //! heading anchors the editor completes from.
-//!
-//! Split out of `lib.rs`; the code and its tests are unchanged.
 
-use crate::fs_safety::{decode_text, read_to_string_lossy, utf8_truncation_boundary};
+use crate::fs_safety::{decode_text, utf8_truncation_boundary};
+use comrak::html::render_sourcepos;
 use comrak::nodes::NodeValue;
-use comrak::{markdown_to_html, parse_document, Anchorizer, Arena, Options};
+use comrak::{create_formatter, parse_document, Anchorizer, Arena, Options};
 use regex::{Captures, Regex};
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
@@ -41,8 +41,14 @@ static WIKILINK_RE: LazyLock<Regex> =
 /// it names, and `\s+` then spans the newline: the replacement has to put that
 /// newline back, or the anchor is folded onto the previous line and every line
 /// below it moves up one (see the line contract in `mod tests`).
-static BLOCK_ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)(\s+)\^([a-zA-Z0-9_-]+)$").expect("valid regex literal"));
+///
+/// `R` makes `$` match before a `\r\n` too. Without it a CRLF file has no line
+/// end this pattern recognises except the last one, and every other block id
+/// stays literal text. This is the only block-id rule: the preview and the
+/// outline both read the anchor it writes.
+static BLOCK_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?mR)(\s+)\^([a-zA-Z0-9_-]+)[ \t]*$").expect("valid regex literal")
+});
 /// The rendered task-list `<input>` this pass is allowed to mark.
 ///
 /// The boolean attributes are matched as an unordered set rather than in a
@@ -64,8 +70,21 @@ static TASK_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("valid regex literal")
 });
+/// The list-marker vocabulary, shared with the frontend through bindings.ts
+/// (`utils/listSyntax.ts` re-exports it): a marker one side accepts and the
+/// other does not is a checkbox that draws and then refuses to toggle. Only the
+/// marker is shared; the whitespace around it is each reader's own.
+pub(crate) const BULLET_MARKER: &str = r"[-+*]";
+/// `1.` and `1)`: CommonMark defines both delimiters.
+pub(crate) const ORDERED_MARKER: &str = r"\d+[.)]";
+/// The checkbox of a task list item, unchecked or checked in either case.
+pub(crate) const TASK_BOX: &str = r"\[[ xX]\]";
+
 static TASK_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*(?:>\s*)*(?:[-+*]|\d+[.)])\s+\[[ xX]\](?:\s|$)").expect("valid regex literal")
+    Regex::new(&format!(
+        r"^\s*(?:>\s*)*(?:{BULLET_MARKER}|{ORDERED_MARKER})\s+{TASK_BOX}(?:\s|$)"
+    ))
+    .expect("valid regex")
 });
 
 /// HTML-escapes `value` for use inside a double-quoted attribute. Embed
@@ -88,6 +107,24 @@ fn escape_html_attribute(value: &str) -> String {
     escaped
 }
 
+/// `path` percent-encoded so that it names the same file after the frontend's
+/// `decodeURIComponent` (the preview's image pass and the export resolver both
+/// run one). Mirrors `NEEDS_PERCENT_ENCODING` in src/lib/utils/imageEmbed.ts,
+/// the rule for the links Markpad writes itself: `%` above all, since a raw
+/// one either makes the decode throw or decodes to a different name, plus
+/// controls, space, `()<>?#\`. Everything else, non-ASCII included, is kept.
+fn encode_embed_destination(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for character in path.chars() {
+        if character <= ' ' || "\x7f%()<>?#\\".contains(character) {
+            encoded.push_str(&format!("%{:02X}", character as u32));
+        } else {
+            encoded.push(character);
+        }
+    }
+    encoded
+}
+
 /// The comrak configuration the preview is rendered with.
 ///
 /// Extracted because a second reader of the document — `heading_anchors`, for
@@ -107,11 +144,6 @@ pub(crate) fn markdown_options<'a>() -> Options<'a> {
     // rendered with the list bullet still showing AND the checkbox on its own
     // line above the text. The classes are GitHub's, which is where those
     // selectors came from.
-    //
-    // They went missing in the 0.18 → 0.54 upgrade (#426) together with the
-    // `disabled` change #320/#345 fixed, and unlike that one nobody reported
-    // it as its own defect — it arrived looking like part of the same
-    // breakage. #148 is where it finally surfaced, in a reader's screenshot.
     options.render.tasklist_classes = true;
     // `++ins++` — Pandoc's and CriticMarkup's spelling for inserted text, and
     // plain characters here until now. It is the only one of its group worth
@@ -171,12 +203,13 @@ fn heading_anchor_id(target: &str) -> String {
     Anchorizer::new().anchorize(target.trim())
 }
 
-/// File extensions the viewer will open as a document. Mirrors
-/// `hasMarkdownLinkExtension` in src/lib/utils/markdownLinks.ts — a wikilink
-/// whose href does not end in one of these is not claimed by the frontend's
-/// local-navigation path at all, so emitting one would produce a link that
-/// escapes to the external-URL opener instead of opening a tab.
-const MARKDOWN_LINK_EXTENSIONS: [&str; 5] = ["md", "markdown", "mdown", "mkd", "txt"];
+/// File extensions the viewer will open as a document. The frontend's list
+/// (`MARKDOWN_LINK_EXTENSIONS` in src/lib/utils/markdownLinks.ts) is this one,
+/// through bindings.ts — a wikilink whose href does not end in one of these is
+/// not claimed by the frontend's local-navigation path at all, so emitting one
+/// would produce a link that escapes to the external-URL opener instead of
+/// opening a tab.
+pub(crate) const MARKDOWN_LINK_EXTENSIONS: [&str; 5] = ["md", "markdown", "mdown", "mkd", "txt"];
 
 /// The extension of the last path component, if the trailing `.segment` really
 /// reads as one. `v1.2 spec` has none (the tail is not alphanumeric) and
@@ -239,9 +272,8 @@ fn wikilink_file_destination(path: &str) -> Option<String> {
 }
 
 /// Byte ranges of code regions — fenced code blocks, indented code blocks and
-/// inline code spans — paired with CommonMark's rules. The regex alternation
-/// previously used for
-/// protection (```` ```.*?```|`.*?` ````) cannot express them: a fence closes
+/// inline code spans — paired with CommonMark's rules. A regex alternation
+/// (```` ```.*?```|`.*?` ````) cannot express them: a fence closes
 /// only on a line-leading run of the same character at least as long as the
 /// opener, and a span opened by N backticks closes only on a run of exactly
 /// N. One mismatched pairing (e.g. a 4-backtick inline sample, or a ~~~
@@ -502,15 +534,25 @@ fn in_code_region(regions: &[(usize, usize)], pos: usize) -> bool {
         .is_ok()
 }
 
-fn process_internal_embeds(content: &str) -> Cow<'_, str> {
+/// `re.replace_all`, leaving matches that start inside code verbatim.
+fn replace_outside_code<'a>(
+    content: &'a str,
+    re: &Regex,
+    mut f: impl FnMut(&Captures) -> String,
+) -> Cow<'a, str> {
     let regions = code_region_ranges(content);
-
-    INTERNAL_EMBED_RE.replace_all(content, |caps: &Captures| {
+    re.replace_all(content, |caps: &Captures| {
         let full = caps.get(0).unwrap();
         if in_code_region(&regions, full.start()) {
-            return full.as_str().to_string();
+            full.as_str().to_string()
+        } else {
+            f(caps)
         }
+    })
+}
 
+fn process_internal_embeds(content: &str) -> Cow<'_, str> {
+    replace_outside_code(content, &INTERNAL_EMBED_RE, |caps| {
         let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let mut parts = inner.split('|');
         let path = parts.next().unwrap_or("");
@@ -519,10 +561,18 @@ fn process_internal_embeds(content: &str) -> Cow<'_, str> {
         // Every interpolated value is HTML-escaped: the target comes straight
         // from the document, so a quote in it would otherwise close the
         // attribute and let the rest be read as markup.
-        let src = escape_html_attribute(&path.replace(" ", "%20"));
+        let src = escape_html_attribute(&encode_embed_destination(path));
         let alt = escape_html_attribute(path);
 
-        if let Some(size_str) = size {
+        // Wrapped in a `<span>` because a bare `<img …/>` alone on a line is a
+        // complete open tag with nothing after it, which CommonMark reads as
+        // the start of an HTML block (type 7). That block runs to the next
+        // blank line and passes every line in it through as raw text, so the
+        // prose, emphasis and task checkboxes under an embed went unrendered.
+        // A line opening with `<span><img` is not that shape, and `span` is
+        // not a block tag, so the embed stays inline in a paragraph exactly
+        // like `![](a.png)` does.
+        let img = if let Some(size_str) = size {
             if size_str.contains('x') {
                 let mut dims = size_str.split('x');
                 let width = escape_html_attribute(dims.next().unwrap_or(""));
@@ -541,8 +591,89 @@ fn process_internal_embeds(content: &str) -> Cow<'_, str> {
             }
         } else {
             format!("<img src=\"{}\" alt=\"{}\" />", src, alt)
-        }
+        };
+        format!("<span>{img}</span>")
     })
+}
+
+/// A `WIKILINK_RE` match that `process_wikilinks` turns into a link.
+pub(crate) struct WikilinkParts<'a> {
+    path: &'a str,
+    heading: &'a str,
+    alias: Option<&'a str>,
+    /// `None` for a heading in this document (`[[#Setup]]`).
+    destination: Option<String>,
+}
+
+/// Whether a `WIKILINK_RE` match in `source` becomes a link, and its parts if
+/// it does. The renderer rewrites by this and the editor colours by it, so
+/// the two cannot disagree about what is a wikilink.
+pub(crate) fn wikilink_parts<'a>(source: &str, caps: &Captures<'a>) -> Option<WikilinkParts<'a>> {
+    let full = caps.get(0)?;
+    // The pattern is line-agnostic, but neither a heading id nor a
+    // filename contains a newline, so a target spanning lines can
+    // never resolve. Leaving it literal also keeps the line count
+    // stable — rewriting it to a single line would shift the source
+    // positions of every task checkbox below it (see
+    // `multiline_wikilinks_do_not_shift_task_source_positions`).
+    if full.as_str().contains('\n') {
+        return None;
+    }
+    // `![[…]]` is an embed, already rewritten by
+    // process_internal_embeds; it is never a link.
+    if source.as_bytes()[..full.start()].last() == Some(&b'!') {
+        return None;
+    }
+    // "[[1#x]](https://example.com)" is a CommonMark link whose text
+    // is "[1#x]"; claiming the brackets would strand the "(url)".
+    // Requiring a "#" already protects the common citation spelling
+    // "[[1]](url)", but not the forms that do carry one.
+    if source[full.end()..].starts_with('(') {
+        return None;
+    }
+
+    let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+    let (target, alias) = match inner.split_once('|') {
+        Some((target, alias)) => (target, Some(alias)),
+        None => (inner, None),
+    };
+    let alias = alias.filter(|a| !a.trim().is_empty());
+    // The `#` the pattern matched may have been in the alias half
+    // ("[[Notes|see #1]]"), which is a bare note link, not a heading
+    // link. Only a `#` in the target counts.
+    let (path, heading) = target.split_once('#')?;
+    let (path, heading) = (path.trim(), heading.trim());
+    if heading.is_empty() {
+        return None;
+    }
+    let destination = if path.is_empty() {
+        None
+    } else {
+        Some(wikilink_file_destination(path)?)
+    };
+    Some(WikilinkParts {
+        path,
+        heading,
+        alias,
+        destination,
+    })
+}
+
+/// Byte ranges, outside code, of the `![[embed]]`s and `[[…#heading]]` links
+/// `convert_markdown` rewrites, each with the length of its opening marker.
+pub(crate) fn wikilink_ranges(content: &str) -> Vec<(usize, usize, usize)> {
+    let regions = code_region_ranges(content);
+    let embeds = INTERNAL_EMBED_RE
+        .find_iter(content)
+        .map(|m| (m.start(), m.end(), 3));
+    let links = WIKILINK_RE
+        .captures_iter(content)
+        .filter(|caps| wikilink_parts(content, caps).is_some())
+        .map(|caps| (caps.get(0).unwrap().start(), caps.get(0).unwrap().end(), 2));
+    embeds
+        .chain(links)
+        .filter(|&(start, _, _)| !in_code_region(&regions, start))
+        .collect()
 }
 
 fn process_wikilinks<'a>(content: &'a str) -> Cow<'a, str> {
@@ -562,61 +693,23 @@ fn process_wikilinks<'a>(content: &'a str) -> Cow<'a, str> {
     //    definition). Every Copy Reference call site emits a "#", so requiring
     //    one fixes the defect completely without touching either.
     if WIKILINK_RE.is_match(&processed) {
-        let regions = code_region_ranges(&processed);
         let source: &str = &processed;
-        let replaced = WIKILINK_RE.replace_all(source, |caps: &Captures| {
-            let full = caps.get(0).unwrap();
-            let literal = || full.as_str().to_string();
-            if in_code_region(&regions, full.start()) {
-                return literal();
-            }
-            // The pattern is line-agnostic, but neither a heading id nor a
-            // filename contains a newline, so a target spanning lines can
-            // never resolve. Leaving it literal also keeps the line count
-            // stable — rewriting it to a single line would shift the source
-            // positions of every task checkbox below it (see
-            // `multiline_wikilinks_do_not_shift_task_source_positions`).
-            if full.as_str().contains('\n') {
-                return literal();
-            }
-            // `![[…]]` is an embed, already rewritten by
-            // process_internal_embeds; it is never a link.
-            if source.as_bytes()[..full.start()].last() == Some(&b'!') {
-                return literal();
-            }
-            // "[[1#x]](https://example.com)" is a CommonMark link whose text
-            // is "[1#x]"; claiming the brackets would strand the "(url)".
-            // Requiring a "#" already protects the common citation spelling
-            // "[[1]](url)", but not the forms that do carry one.
-            if source[full.end()..].starts_with('(') {
-                return literal();
-            }
-
-            let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let (target, alias) = match inner.split_once('|') {
-                Some((target, alias)) => (target, Some(alias)),
-                None => (inner, None),
-            };
-            let alias = alias.filter(|a| !a.trim().is_empty());
-            // The `#` the pattern matched may have been in the alias half
-            // ("[[Notes|see #1]]"), which is a bare note link, not a heading
-            // link. Only a `#` in the target counts.
-            let Some((path, heading)) = target.split_once('#') else {
+        let replaced = replace_outside_code(source, &WIKILINK_RE, |caps| {
+            let literal = || caps[0].to_string();
+            let Some(WikilinkParts {
+                path,
+                heading,
+                alias,
+                destination,
+            }) = wikilink_parts(source, caps)
+            else {
                 return literal();
             };
-            let (path, heading) = (path.trim(), heading.trim());
-            if heading.is_empty() {
-                return literal();
-            }
             let anchor = heading_anchor_id(heading);
 
-            if path.is_empty() {
+            let Some(destination) = destination else {
                 // Same document: [[#Setup]] / [[#Setup|jump]].
                 return format!("[{}](#{anchor})", alias.unwrap_or(heading));
-            }
-
-            let Some(destination) = wikilink_file_destination(path) else {
-                return literal();
             };
             // Obsidian renders an un-aliased heading link as "Note > Heading";
             // keeping that spelling means a pasted reference reads the same in
@@ -634,17 +727,25 @@ fn process_wikilinks<'a>(content: &'a str) -> Cow<'a, str> {
     // 2. Process ^block-id at the end of lines
     // For block IDs, they are trailing. We skip code blocks but also need to be careful with inline code at EOL.
     if BLOCK_ID_RE.is_match(&processed) {
-        let regions = code_region_ranges(&processed);
-        let replaced = BLOCK_ID_RE.replace_all(&processed, |caps: &Captures| {
-            let full = caps.get(0).unwrap();
-            if in_code_region(&regions, full.start()) {
-                return full.as_str().to_string();
-            }
-            // Re-emit the matched whitespace verbatim. For the common
-            // trailing form (" ^id") that is the same single space this used
-            // to hardcode; for an id on its own line it is the newline that
-            // keeps the following lines at their original numbers.
-            let leading = caps.get(1).map(|m| m.as_str()).unwrap_or(" ");
+        let source: &str = &processed;
+        let replaced = replace_outside_code(source, &BLOCK_ID_RE, |caps| {
+            // For an id on its own line the matched whitespace holds the line
+            // break, which is re-emitted verbatim so the following lines keep
+            // their original numbers. After text on the same line the spaces go with
+            // the id: left in, `## Setup ^s1` reads "Setup " to comrak, which
+            // renders the id `setup-` while every `[[#Setup]]` and completion
+            // asks for `setup`. Only text drops them — after a bare `#` or `-`
+            // the space is what makes the line a heading or a list item.
+            let leading = caps.get(1).unwrap();
+            let line_start = source[..leading.start()].rfind('\n').map_or(0, |i| i + 1);
+            let after_markers_only = source[line_start..leading.start()]
+                .chars()
+                .all(|c| c.is_whitespace() || c.is_ascii_digit() || "#-+*>.)".contains(c));
+            let leading = if leading.as_str().contains('\n') || after_markers_only {
+                leading.as_str()
+            } else {
+                ""
+            };
             let id = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             format!(
                 "{}<a id=\"{}\" class=\"block-id-anchor\" data-label=\"{}\"></a>",
@@ -816,7 +917,16 @@ struct MaskedSpan {
 /// and can never pair. Scanning the raw buffer the same way is what keeps the
 /// two ends agreeing, and it is also what stops a single `$$` inside a fenced
 /// block from flipping the delimiter parity of the whole document.
+///
+/// Autolinked URLs are cut out the same way. comrak links
+/// `https://x/People?$select=Name&$top=2` as it stands, and
+/// `processInlineMath` leaves an autolink's text alone; masking
+/// `$select=Name&$` here would hand the frontend math it never renders.
 fn math_scan_segments(content: &str, regions: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut excluded = regions.to_vec();
+    excluded.extend(autolink_ranges(content));
+    excluded.sort_unstable();
+    let regions = excluded.as_slice();
     let len = content.len();
     let mut segments = Vec::new();
     let mut line_start = 0usize;
@@ -862,6 +972,68 @@ fn math_scan_segments(content: &str, regions: &[(usize, usize)]) -> Vec<(usize, 
         line_start = newline + 1;
     }
     segments
+}
+
+/// Byte ranges comrak's `autolink` extension turns into links: `http://`,
+/// `https://` and `ftp://` URLs, and bare `www.` ones, per `url_match` and
+/// `www_match` in comrak's parser/autolink.rs.
+///
+/// ponytail: runs to the next whitespace or `<`/`>` and skips comrak's
+/// trailing-punctuation trim, which can only over-cover a `)` or `.` that
+/// ends the URL.
+fn autolink_ranges(content: &str) -> Vec<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &content[index..];
+        let before = index.checked_sub(1).map(|at| bytes[at]);
+        let host = if rest.starts_with("www.") {
+            before
+                .is_none_or(|b| b.is_ascii_whitespace() || b"*_~([".contains(&b))
+                .then_some(4)
+        } else {
+            ["http://", "https://", "ftp://"]
+                .into_iter()
+                .find(|scheme| rest.starts_with(scheme))
+                .filter(|_| !before.is_some_and(|b| b.is_ascii_alphabetic()))
+                .map(str::len)
+        };
+        match host.filter(|&host| is_autolink_domain(&rest[host..])) {
+            Some(_) => {
+                let end = rest
+                    .find(|c: char| c.is_ascii_whitespace() || c == '<' || c == '>')
+                    .map_or(content.len(), |offset| index + offset);
+                ranges.push((index, end));
+                index = end;
+            }
+            None => index += rest.chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    ranges
+}
+
+/// comrak's `check_domain` without `relaxed_autolinks`: at least one dot, and
+/// no `_` in the last two labels.
+fn is_autolink_domain(data: &str) -> bool {
+    let (mut dots, mut underscores_before, mut underscores) = (0, 0, 0);
+    for (at, c) in data.char_indices() {
+        match c {
+            '\\' if at + 1 < data.len() => {}
+            '_' => underscores += 1,
+            '.' => {
+                underscores_before = underscores;
+                underscores = 0;
+                dots += 1;
+            }
+            '-' => {}
+            c if c.is_whitespace() || c.is_ascii_punctuation() => {
+                return underscores_before == 0 && underscores == 0 && dots > 0;
+            }
+            _ => {}
+        }
+    }
+    dots > 0 && ((underscores_before == 0 && underscores == 0) || dots > 10)
 }
 
 fn char_before(content: &str, low: usize, at: usize) -> Option<char> {
@@ -1231,14 +1403,31 @@ fn restore_math_spans(html: &str, masked: &MaskedMath) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     let mut in_tag = false;
-    while let Some((at, anchored)) = [
-        (rest.find(masked.prefix.as_str()), false),
-        (rest.find(anchor_prefix.as_str()), true),
-    ]
-    .into_iter()
-    .filter_map(|(at, anchored)| at.map(|at| (at, anchored)))
-    .min()
-    {
+    // Where each spelling next occurs in `html`, searched again only once
+    // `rest` has moved past it. Searching `rest` afresh on every token
+    // rescans to the end for a spelling that no longer occurs, which made
+    // this quadratic in the number of math spans.
+    let mut next = [
+        html.find(masked.prefix.as_str()),
+        html.find(anchor_prefix.as_str()),
+    ];
+    loop {
+        let offset = html.len() - rest.len();
+        for (found, needle) in next
+            .iter_mut()
+            .zip([masked.prefix.as_str(), anchor_prefix.as_str()])
+        {
+            if found.is_some_and(|at| at < offset) {
+                *found = rest.find(needle).map(|at| at + offset);
+            }
+        }
+        let Some((at, anchored)) = [(next[0], false), (next[1], true)]
+            .into_iter()
+            .filter_map(|(at, anchored)| at.map(|at| (at - offset, anchored)))
+            .min()
+        else {
+            break;
+        };
         out.push_str(&rest[..at]);
         if let Some(bracket) = rest[..at].rfind(['<', '>']) {
             in_tag = rest.as_bytes()[bracket] == b'<';
@@ -1290,6 +1479,7 @@ fn escape_html_text(text: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            '\0' => out.push('\u{FFFD}'),
             _ => out.push(ch),
         }
     }
@@ -1303,13 +1493,12 @@ fn escape_html_text(text: &str) -> String {
 /// `mod tests` under "The line-number contract of `convert_markdown`" —
 /// a new step here must also be registered in `line_preserving_transforms()`.
 ///
-/// Not a Tauri command, despite having carried `#[tauri::command]` until the
-/// attribute was removed. It was never in `generate_handler!`, so no frontend
-/// could ever invoke it — the registered entry point is `render_markdown`, and
-/// this is what that and `build_markdown_preview` call underneath. A command
-/// name is a string with no compiler behind it, so an attribute that claims an
-/// exposure the app does not have is a claim nothing was ever going to check.
-pub(crate) fn convert_markdown(content: &str) -> String {
+/// Not a Tauri command: the registered entry point is `render_markdown`, and
+/// this is what it calls underneath.
+///
+/// `split_blocks`: write [`BLOCK_SEPARATOR`] between top-level blocks, so the
+/// preview can diff, process and sanitize block by block.
+pub(crate) fn convert_markdown_with(content: &str, split_blocks: bool) -> String {
     // The buffer this command was called with, captured before anything runs
     // and never rebound. What `annotate_task_checkboxes` is handed at the end
     // has to be this rather than the parameter name: a new step written as a
@@ -1325,8 +1514,108 @@ pub(crate) fn convert_markdown(content: &str) -> String {
 
     let options = markdown_options();
 
-    let html = markdown_to_html(&masked_math.text, &options);
+    let html = render_html(&masked_math.text, &options, split_blocks);
     annotate_task_checkboxes(restore_math_spans(&html, &masked_math), raw_buffer)
+}
+
+/// The document as one string, the form the export and the tests read.
+#[cfg(test)]
+pub(crate) fn convert_markdown(content: &str) -> String {
+    convert_markdown_with(content, false)
+}
+
+// `hardbreaks` renders a soft break as the same `<br>` as a hard one. The class
+// lets the Every Newline Breaks the Line setting hide just these in CSS (#967). The
+// `<br>` itself stays: scroll sync and display math read source lines off it.
+// The `usize` is the open raw-HTML tag count `block_split_formatter` keeps.
+create_formatter!(PreviewFormatter<usize>, {
+    NodeValue::SoftBreak => |context, node, entering| {
+        if entering {
+            context.write_str("<br class=\"softbreak\"")?;
+            render_sourcepos(context, node)?;
+            context.write_str(" />")?;
+            context.lf()?;
+        }
+    },
+});
+
+/// Between two top-level blocks of the preview's HTML. comrak replaces every
+/// NUL in its input with U+FFFD and `escape_html_text` does the same for the
+/// math it restores, so no document can write one.
+pub(crate) const BLOCK_SEPARATOR: char = '\0';
+
+/// Tags a raw HTML block opens and leaves open, minus the ones it closes.
+/// `<details>` / markdown / `</details>` is three top-level blocks to comrak
+/// and one element to the browser, so no separator goes between them.
+static HTML_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<(/?)([A-Za-z][A-Za-z0-9-]*)[^>]*?(/?)>").unwrap());
+const VOID_TAGS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track",
+    "wbr",
+];
+
+fn html_depth_change(literal: &str) -> isize {
+    HTML_TAG_RE
+        .captures_iter(literal)
+        .filter(|c| c[3].is_empty() && !VOID_TAGS.contains(&c[2].to_ascii_lowercase().as_str()))
+        .map(|c| if c[1].is_empty() { 1 } else { -1 })
+        .sum()
+}
+
+/// `context.user` is how many tags raw HTML has left open at the top level.
+fn block_split_formatter<'a>(
+    context: &mut comrak::html::Context<usize>,
+    node: &'a comrak::nodes::AstNode<'a>,
+    entering: bool,
+) -> Result<comrak::html::ChildRendering, std::fmt::Error> {
+    let top_level = node
+        .parent()
+        .is_some_and(|parent| matches!(parent.data().value, NodeValue::Document));
+    // Footnote definitions are one block: comrak opens the `<section>` on the
+    // first and closes it after the last.
+    if entering
+        && top_level
+        && context.user == 0
+        && node.previous_sibling().is_some()
+        && !(matches!(node.data().value, NodeValue::FootnoteDefinition(_))
+            && node
+                .previous_sibling()
+                .is_some_and(|prev| matches!(prev.data().value, NodeValue::FootnoteDefinition(_))))
+    {
+        // On a line of its own: the block's own `cr` then has nothing to add.
+        context.cr()?;
+        context.write_char(BLOCK_SEPARATOR)?;
+        context.lf()?;
+    }
+    if entering && top_level {
+        if let NodeValue::HtmlBlock(block) = &node.data().value {
+            context.user = context
+                .user
+                .saturating_add_signed(html_depth_change(&block.literal));
+        }
+    }
+    PreviewFormatter::formatter(context, node, entering)
+}
+
+fn render_html(markdown: &str, options: &Options, split_blocks: bool) -> String {
+    let arena = Arena::new();
+    let root = parse_document(&arena, markdown, options);
+    let mut html = String::new();
+    if split_blocks {
+        comrak::html::format_document_with_formatter(
+            root,
+            options,
+            &mut html,
+            &comrak::options::Plugins::default(),
+            block_split_formatter,
+            0,
+        )
+        .map(|_| ())
+    } else {
+        PreviewFormatter::format_document(root, options, &mut html, 0).map(|_| ())
+    }
+    .expect("writing to a String cannot fail");
+    html
 }
 
 /// Marks the rendered task checkboxes the frontend is allowed to toggle.
@@ -1340,21 +1629,16 @@ pub(crate) fn convert_markdown(content: &str) -> String {
 /// only agree while every preprocessing step preserves line numbers. Checking
 /// the raw buffer here is what turns a broken step into "the checkbox stays
 /// disabled" instead of a write aimed at the wrong line of the user's
-/// document — the P0 that issue #352 fixed.
+/// document.
 ///
-/// What a wrong line costs is narrower than it was, and worth stating
-/// precisely, because an overstated reason invites the next reader to check
-/// it, find it false, and delete the guard as theatre. Since #352 the
-/// frontend rewrites only lines that already match
+/// The frontend rewrites only lines that already match
 /// `/^(\s*(?:>\s*)*(?:[-+*]|\d+[.)])\s+)\[( |x|X)\]/`
 /// (`documentSession.toggleTaskCheckbox`), so a wrong line that is ordinary
-/// prose is a no-op and the toggle reports failure — it does NOT write a
-/// `- [x]` marker into whatever happens to sit there, as this comment used to
-/// claim of the pre-#352 frontend. What still corrupts is a wrong line that
-/// is itself task-shaped, and neither spelling of that is exotic: a task list
-/// quoted inside a fenced code block is ordinary content in a notes app, and
-/// a real task elsewhere in the same document means the user clicks one
-/// checkbox and a different one silently flips.
+/// prose is a no-op and the toggle reports failure. What still corrupts is a
+/// wrong line that is itself task-shaped, and neither spelling of that is
+/// exotic: a task list quoted inside a fenced code block is ordinary content
+/// in a notes app, and a real task elsewhere in the same document means the
+/// user clicks one checkbox and a different one silently flips.
 ///
 /// So do NOT "unify" this with the preprocessed text that produced the HTML.
 /// Passing `&processed_links` here would make the two sides agree by
@@ -1396,7 +1680,6 @@ fn annotate_task_checkboxes(html: String, markdown: &str) -> String {
 }
 
 pub(crate) struct MarkdownPreview {
-    pub(crate) html: String,
     pub(crate) content: String,
     pub(crate) is_full: bool,
     pub(crate) lossy: bool,
@@ -1405,42 +1688,36 @@ pub(crate) struct MarkdownPreview {
 
 /// The body of `open_markdown_preview`, kept synchronous and path-taking so
 /// the decode-fidelity behaviour can be exercised against real files.
+///
+/// No HTML: the frontend renders the buffer itself (`render_markdown`), so
+/// rendering here too only doubled the work of opening a document.
 pub(crate) fn build_markdown_preview(
     path: &Path,
     max_bytes: usize,
 ) -> Result<MarkdownPreview, String> {
     use std::io::Read;
-    let path_str = path.to_str().ok_or("Invalid path")?;
-    let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
+    let f = fs::File::open(path).map_err(|e| e.to_string())?;
 
-    let metadata = f.metadata().map_err(|e| e.to_string())?;
-    if metadata.len() <= max_bytes as u64 {
-        let decoded = read_to_string_lossy(path_str).map_err(|e| e.to_string())?;
-        let html = convert_markdown(&decoded.content);
-        return Ok(MarkdownPreview {
-            html,
-            content: decoded.content,
-            is_full: true,
-            lossy: decoded.lossy,
-            encoding: decoded.encoding,
-        });
-    }
-
+    // One byte past the budget tells a file that fits from one that does not,
+    // without a separate size check or a second open.
     // `Read::read` only guarantees *at most* `buf.len()` bytes and may
     // return a short read for reasons that have nothing to do with EOF,
     // truncating the preview well below the requested budget.
     // `take(..).read_to_end(..)` keeps reading to the limit or EOF.
     let mut vec_buf = Vec::new();
-    Read::by_ref(&mut f)
-        .take(max_bytes as u64)
+    f.take(max_bytes as u64 + 1)
         .read_to_end(&mut vec_buf)
         .map_err(|e| e.to_string())?;
-    // The cut lands on a raw byte offset, which can slice a multi-byte
-    // character in half; drop the partial tail instead of rendering it as
-    // a replacement character. This also keeps a perfectly good UTF-8 file
-    // from being reported as a lossy decode just because the preview budget
-    // fell inside one of its characters.
-    vec_buf.truncate(utf8_truncation_boundary(&vec_buf));
+    let is_full = vec_buf.len() <= max_bytes;
+    if !is_full {
+        vec_buf.truncate(max_bytes);
+        // The cut lands on a raw byte offset, which can slice a multi-byte
+        // character in half; drop the partial tail instead of rendering it as
+        // a replacement character. This also keeps a perfectly good UTF-8 file
+        // from being reported as a lossy decode just because the preview budget
+        // fell inside one of its characters.
+        vec_buf.truncate(utf8_truncation_boundary(&vec_buf));
+    }
 
     // Detection runs on the prefix, so it can differ from what the whole file
     // would say — and a legacy multi-byte character cut in half here is a
@@ -1449,19 +1726,113 @@ pub(crate) fn build_markdown_preview(
     // `saveContent` outright, and the full read that precedes any edit
     // (`ensureFullContent`) replaces both answers with the whole file's.
     let preview = decode_text(&vec_buf);
-
-    let html = convert_markdown(&preview.content);
     Ok(MarkdownPreview {
-        html,
         content: preview.content,
-        is_full: false,
+        is_full,
         lossy: preview.lossy,
         encoding: preview.encoding,
     })
 }
 
+/// The preprocessing the renderer runs before comrak, for a caller that reads
+/// line numbers off the parse. Every step is line-preserving, so sourcepos
+/// still addresses the caller's buffer.
+fn preprocess_for_positions(markdown: &str, front_matter_lines: usize) -> MaskedMath {
+    let markdown = blank_front_matter(markdown, front_matter_lines);
+    let autolinks = process_parenthesized_autolinks(&markdown);
+    let embeds = process_internal_embeds(&autolinks);
+    let preprocessed = process_wikilinks(&embeds);
+    mask_math_spans(&preprocessed)
+}
+
+/// `markdown` with its first `lines` lines emptied, so the parse does not read
+/// the front matter's closing `---` as a setext underline. The preview strips
+/// front matter before rendering; this keeps each line's ending instead, so
+/// sourcepos still counts the buffer's. A BOM on the first line goes with it.
+///
+/// The caller says how many lines that is (`frontMatterFenceLines` in
+/// frontMatter.ts) rather than this finding them, because the rule is the one
+/// the preview strips by, and it needs a YAML parser: a leading `---` block is
+/// front matter only when its YAML is a mapping, empty, or malformed. Any two
+/// leading `---` lines also match a thematic break with prose under it.
+pub(crate) fn blank_front_matter(markdown: &str, lines: usize) -> Cow<'_, str> {
+    if lines == 0 {
+        return Cow::Borrowed(markdown);
+    }
+    let mut blanked = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    for _ in 0..lines {
+        let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        let line = &rest[..line_end];
+        blanked.push_str(&line[line.trim_end_matches(['\n', '\r']).len()..]);
+        rest = &rest[line_end..];
+    }
+    blanked.push_str(rest);
+    Cow::Owned(blanked)
+}
+
+/// The editor's headings and foldable blocks, from one parse: its folding
+/// provider wants both for the same buffer, and parsing a long document is the
+/// expensive part.
+#[derive(serde::Serialize, specta::Type)]
+pub(crate) struct Outline {
+    anchors: Vec<HeadingAnchor>,
+    folds: Vec<FoldRange>,
+}
+
+pub(crate) fn outline(markdown: &str, front_matter_lines: usize) -> Outline {
+    let masked = preprocess_for_positions(markdown, front_matter_lines);
+    let arena = Arena::new();
+    let root = parse_document(&arena, &masked.text, &markdown_options());
+    Outline {
+        anchors: heading_anchors(root, &masked),
+        folds: block_fold_ranges(root, markdown),
+    }
+}
+
+/// Lines the editor can fold, 1-based and inclusive.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, specta::Type)]
+pub(crate) struct FoldRange {
+    start: u32,
+    end: u32,
+}
+
+/// What the editor folds besides headings (#777): list items, code blocks,
+/// quotes and tables that span more than one line. Registering a folding
+/// provider turns Monaco's indentation folding off, and list items are what
+/// that used to fold. Read off the renderer's parse, so a `- item` inside a
+/// fence is not a list.
+///
+/// comrak ends a list item on the blank line after it, which would make every
+/// one-line item in a loose list a fold hiding that blank line, so trailing
+/// blank lines are dropped first — the same rule the heading folds use.
+fn block_fold_ranges<'a>(root: &'a comrak::nodes::AstNode<'a>, markdown: &str) -> Vec<FoldRange> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    root.descendants()
+        .filter_map(|node| {
+            let data = node.data.borrow();
+            match data.value {
+                NodeValue::Item(_)
+                | NodeValue::TaskItem(_)
+                | NodeValue::CodeBlock(_)
+                | NodeValue::BlockQuote
+                | NodeValue::Table(_) => {}
+                _ => return None,
+            }
+            let (start, mut end) = (data.sourcepos.start.line, data.sourcepos.end.line);
+            while end > start && lines.get(end - 1).is_none_or(|line| line.trim().is_empty()) {
+                end -= 1;
+            }
+            (end > start).then_some(FoldRange {
+                start: start as u32,
+                end: end as u32,
+            })
+        })
+        .collect()
+}
+
 /// A heading, and the id a link has to name to reach it.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, specta::Type)]
 pub(crate) struct HeadingAnchor {
     /// 1-based line in the buffer the caller passed, for ordering the list.
     line: u32,
@@ -1501,15 +1872,10 @@ pub(crate) struct HeadingAnchor {
 /// `restore_math_spans` writes into an anchor — and the two agree because
 /// anchorizing is a per-character map with no collapsing, so doing it to the
 /// pieces and doing it to the whole give the same string.
-pub(crate) fn heading_anchors(markdown: &str) -> Vec<HeadingAnchor> {
-    let autolinks = process_parenthesized_autolinks(markdown);
-    let embeds = process_internal_embeds(&autolinks);
-    let preprocessed = process_wikilinks(&embeds);
-    let masked = mask_math_spans(&preprocessed);
-
-    let arena = Arena::new();
-    let options = markdown_options();
-    let root = parse_document(&arena, &masked.text, &options);
+fn heading_anchors<'a>(
+    root: &'a comrak::nodes::AstNode<'a>,
+    masked: &MaskedMath,
+) -> Vec<HeadingAnchor> {
     let mut anchorizer = Anchorizer::new();
     let mut anchors = Vec::new();
 
@@ -1522,7 +1888,11 @@ pub(crate) fn heading_anchors(markdown: &str) -> Vec<HeadingAnchor> {
             }
         };
 
-        let text = unmask_math_text(&collect_inline_text(node), &masked);
+        // comrak's own text collection, untrimmed, because that is exactly
+        // what its renderer anchorizes: a soft break in a multi-line setext
+        // heading is a space there (`foo-bar`), and a rule that dropped it
+        // would offer `foobar`.
+        let text = unmask_math_text(&node.collect_text(), masked);
         if text.trim().is_empty() {
             continue;
         }
@@ -1530,26 +1900,12 @@ pub(crate) fn heading_anchors(markdown: &str) -> Vec<HeadingAnchor> {
         anchors.push(HeadingAnchor {
             line: line as u32,
             level,
-            slug: anchorizer.anchorize(text.trim()),
+            slug: anchorizer.anchorize(&text),
             text: text.trim().to_owned(),
         });
     }
 
     anchors
-}
-
-/// The text a heading reads as, which is what comrak anchorizes: the literals
-/// of its inline children, with the emphasis and link markup dropped.
-fn collect_inline_text<'a>(node: &'a comrak::nodes::AstNode<'a>) -> String {
-    let mut text = String::new();
-    for descendant in node.descendants() {
-        match &descendant.data.borrow().value {
-            NodeValue::Text(literal) => text.push_str(literal),
-            NodeValue::Code(code) => text.push_str(&code.literal),
-            _ => {}
-        }
-    }
-    text
 }
 
 /// Puts masked math back into a piece of *text*, which is the spelling a text
@@ -1641,7 +1997,9 @@ pub(crate) mod tests {
         fs::write(&path, "中文标题很长".as_bytes()).unwrap();
 
         let preview = build_markdown_preview(&path, 4).unwrap();
+        let exact = build_markdown_preview(&path, "中文标题很长".len()).unwrap();
         fs::remove_file(&path).unwrap();
+        assert!(exact.is_full, "a file exactly the budget long is whole");
 
         assert!(!preview.is_full);
         assert!(!preview.lossy, "unexpected flag on {:?}", preview.content);
@@ -2219,7 +2577,7 @@ pub(crate) mod tests {
     //
     // So both sides are asserted against one shared, hand-authored
     // table: scripts/mathDelimiterCorpus.json. The other half lives in
-    // scripts/mathDelimiterContract.test.ts and runs the real frontend.
+    // scripts/preview.render.test.ts and runs the real frontend.
     // Change one side's rule and exactly one of the two goes red.
     // -----------------------------------------------------------------
 
@@ -2285,6 +2643,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn only_a_soft_break_is_marked_as_one() {
+        // Two trailing spaces and a trailing backslash are hard breaks, which
+        // Every Newline Breaks the Line must never hide.
+        let html = convert_markdown("soft\nspaces  \nslash\\\nend\n");
+        assert_eq!(
+            html,
+            "<p data-sourcepos=\"1:1-4:3\">soft<br class=\"softbreak\" data-sourcepos=\"1:5-1:5\" />\n\
+             spaces<br data-sourcepos=\"2:7-2:9\" />\n\
+             slash<br data-sourcepos=\"3:6-3:7\" />\n\
+             end</p>\n",
+        );
+    }
+
+    #[test]
     fn the_math_contract_corpus_is_a_live_capture() {
         // Keeps the `html` the frontend test consumes honest: it is what
         // this renderer produces today, not what it produced once.
@@ -2316,6 +2688,20 @@ pub(crate) mod tests {
         assert!(
             html.contains("id=\"a-heading-with-x_1\""),
             "the mask leaked into the anchor: {html}",
+        );
+    }
+
+    #[test]
+    fn math_tokens_in_headings_and_text_restore_in_order() {
+        // `restore_math_spans` tracks where each token spelling occurs next;
+        // interleave both so neither is consumed out of order or skipped.
+        let html = convert_markdown("# H $a$\n\n$b$\n\n# K $c$\n\n$d$ $e$\n");
+        assert!(html.contains("id=\"h-a\""), "got: {html}");
+        assert!(html.contains("id=\"k-c\""), "got: {html}");
+        let order = ["$a$", "$b$", "$c$", "$d$", "$e$"].map(|math| html.find(math));
+        assert!(
+            order.iter().all(Option::is_some) && order.is_sorted(),
+            "got: {html}",
         );
     }
 
@@ -2392,6 +2778,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn embed_src_survives_the_frontends_decode() {
+        // The preview and the export both `decodeURIComponent` the src, so it
+        // must be percent-encoded with the rule `encodeImageDestination` in
+        // src/lib/utils/imageEmbed.ts uses: a raw `%` either throws there
+        // (`50%%20off`) or decodes to a different file (`50%20off` -> `50 off`).
+        for (embed, src) in [
+            ("![[50% off.png]]", "50%25%20off.png"),
+            ("![[50%20off.png]]", "50%2520off.png"),
+            ("![[img/a#1 (b).png]]", "img/a%231%20%28b%29.png"),
+            ("![[图片/截图.png]]", "图片/截图.png"),
+        ] {
+            let out = process_internal_embeds(embed);
+            assert!(out.contains(&format!("src=\"{src}\"")), "{embed}: {out}");
+        }
+    }
+
+    #[test]
+    fn an_embed_alone_on_a_line_does_not_swallow_the_lines_below() {
+        // A bare `<img …/>` alone on a line starts an HTML block (CommonMark
+        // type 7), which runs to the next blank line and passes everything in
+        // it through unparsed: no emphasis, no checkbox, no sourcepos.
+        for embed in [
+            "![[a.png]]",
+            "![[a.png|300]]",
+            "![[a.png|300x200]]",
+            "- ![[a.png]]",
+        ] {
+            let html = convert_markdown(&format!("{embed}\nSome **bold** text\n- [ ] task\n"));
+            assert!(html.contains(">bold</strong>"), "{embed}: {html}");
+            assert!(html.contains("data-task-checkbox"), "{embed}: {html}");
+            assert!(html.contains("<img src=\"a.png\""), "{embed}: {html}");
+        }
+        let sized = convert_markdown("![[a.png|300x200]]\nnext\n");
+        assert!(sized.contains("width=\"300\" height=\"200\""), "{sized}");
+    }
+
+    #[test]
     fn wikilink_anchors_match_the_ids_comrak_actually_renders() {
         // Asserted against comrak's real output rather than a copy of its
         // rules: if a comrak upgrade changes anchorization, this fails instead
@@ -2437,7 +2860,7 @@ pub(crate) mod tests {
             "```\n",
         );
 
-        let anchors = heading_anchors(markdown);
+        let anchors = outline(markdown, 0).anchors;
         let texts: Vec<&str> = anchors.iter().map(|a| a.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -2478,6 +2901,98 @@ pub(crate) mod tests {
         assert_eq!(anchors[1].level, 2);
     }
 
+    /// #777: a list item folds over its children, and markup inside a fence
+    /// is text — the fence folds, the `- ` and `# ` lines in it do not.
+    #[test]
+    fn block_fold_ranges_are_the_blocks_the_renderer_parsed() {
+        let markdown = concat!(
+            "- parent\n",        // 1
+            "  - child\n",       // 2
+            "  - child\n",       // 3
+            "- single\n",        // 4
+            "\n",                // 5
+            "```md\n",           // 6
+            "- not a list\n",    // 7
+            "# not a heading\n", // 8
+            "```\n",             // 9
+            "\n",                // 10
+            "> quote\n",         // 11
+            "> more\n",          // 12
+            "\n",                // 13
+            "| a | b |\n",       // 14
+            "|---|---|\n",       // 15
+            "| 1 | 2 |\n",       // 16
+        );
+        let ranges: Vec<(u32, u32)> = outline(markdown, 0)
+            .folds
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        assert_eq!(ranges, vec![(1, 3), (6, 9), (11, 12), (14, 16)]);
+    }
+
+    /// Front matter is not content. Parsed as markdown, its closing `---`
+    /// underlines the YAML into a setext H2 spanning the block: a heading
+    /// completion, a sticky-scroll row and a fold nobody wrote. The lines
+    /// after it keep their buffer numbers.
+    #[test]
+    fn front_matter_is_not_a_heading_and_lines_stay_the_buffers() {
+        let markdown = concat!(
+            "---\n",          // 1
+            "title: Hello\n", // 2
+            "tags: [a]\n",    // 3
+            "---\n",          // 4
+            "\n",             // 5
+            "### Intro\n",    // 6
+            "\n",             // 7
+            "> quote\n",      // 8
+            "> more\n",       // 9
+        );
+        let anchors: Vec<(u32, String)> = outline(markdown, 4)
+            .anchors
+            .into_iter()
+            .map(|a| (a.line, a.text))
+            .collect();
+        assert_eq!(anchors, vec![(6, "Intro".to_owned())]);
+        let ranges: Vec<(u32, u32)> = outline(markdown, 4)
+            .folds
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        assert_eq!(ranges, vec![(8, 9)]);
+
+        // Told there is none, it is markdown: a document that opens with a
+        // thematic break keeps its heading, as it does in the preview.
+        let rule = "---\n\n# Title\n\nSome intro text.\n\n---\n\n## Part 2\n";
+        let anchors: Vec<(u32, String)> = outline(rule, 0)
+            .anchors
+            .into_iter()
+            .map(|a| (a.line, a.text))
+            .collect();
+        assert_eq!(
+            anchors,
+            vec![(3, "Title".to_owned()), (9, "Part 2".to_owned())]
+        );
+    }
+
+    /// The front matter lines empty to their line endings alone, CRLF
+    /// included, so every later line keeps its number and its bytes.
+    #[test]
+    fn blank_front_matter_empties_the_first_lines_and_keeps_their_endings() {
+        let crlf = "\u{feff}--- \r\ntitle: Hello\r\n  ---\r\n# Top\r\n";
+        assert_eq!(blank_front_matter(crlf, 3), "\r\n\r\n\r\n# Top\r\n");
+        let lines: Vec<u32> = outline(crlf, 3).anchors.iter().map(|a| a.line).collect();
+        assert_eq!(lines, vec![4]);
+
+        assert!(matches!(
+            blank_front_matter("---\na: 1\n---\n", 0),
+            Cow::Borrowed("---\na: 1\n---\n")
+        ));
+        // No newline after the closing fence, and a count past the end.
+        assert_eq!(blank_front_matter("---\na: 1\n---", 3), "\n\n");
+        assert_eq!(blank_front_matter("---\na: 1\n---\n", 9), "\n\n\n");
+    }
+
     /// comrak never sees the buffer: four preprocessing steps run first, and
     /// two of them rewrite what a heading READS as. A completion list built
     /// from the raw text reports ids for headings that were never rendered.
@@ -2511,6 +3026,10 @@ pub(crate) mod tests {
             "## A [real link](https://x.dev) here\n",
             "## Code `let x = 1;` here\n",
             "## A **bold** and *italic* heading\n",
+            // A block id is rewritten to an anchor; the heading reads "Setup".
+            "## Setup ^s1\n",
+            // A soft break in a setext heading is a space to comrak.
+            "Foo\nBar\n===\n",
         ] {
             let html = convert_markdown(markdown);
             let rendered = html
@@ -2519,7 +3038,8 @@ pub(crate) mod tests {
                 .and_then(|rest| rest.split('"').next())
                 .unwrap_or_default()
                 .to_owned();
-            let ours = heading_anchors(markdown)
+            let ours = outline(markdown, 0)
+                .anchors
                 .first()
                 .map(|anchor| anchor.slug.clone())
                 .unwrap_or_default();
@@ -2654,6 +3174,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn heading_anchor_id_answers_each_lookup_afresh() {
+        // A wikilink names a heading by text, which only ever reaches the first
+        // heading with it, so a second lookup is not numbered `-1` the way a
+        // second heading in one document is.
+        assert_eq!(heading_anchor_id("Objectives"), "objectives");
+        assert_eq!(heading_anchor_id("Objectives"), "objectives");
+    }
+
+    #[test]
     fn wikilink_targets_survive_punctuation_in_the_heading() {
         // "1. 概述" used to become "1.-概述" while comrak rendered "1-概述",
         // so the link resolved to nothing.
@@ -2689,7 +3218,7 @@ pub(crate) mod tests {
     //    later headings with the same text; a wikilink can only ever address
     //    the first one (see the doc comment on `heading_anchor_id`).
     //  * The actual click-through. The href *shape* the frontend accepts is
-    //    pinned from the TypeScript side in scripts/wikilinkFileTargets.test.ts.
+    //    pinned from the TypeScript side in scripts/editing.test.ts.
 
     #[test]
     fn copy_reference_output_becomes_a_real_link() {
@@ -2772,6 +3301,28 @@ pub(crate) mod tests {
             "got: {out}"
         );
         assert!(out.contains("[My Notes (v2) > Setup]"), "got: {out}");
+    }
+
+    #[test]
+    fn a_block_id_does_not_change_the_heading_id_a_wikilink_reaches() {
+        let html = convert_markdown("## Setup ^s1\n\n[[#Setup]]\n");
+        assert!(html.contains("id=\"setup\""), "{html}");
+        assert!(html.contains("href=\"#setup\""), "{html}");
+        assert!(html.contains("id=\"s1\""), "{html}");
+        // A heading or list item that is nothing but the id keeps its space.
+        for (markdown, tag) in [("# ^s1\n", "<h1"), ("- ^s1\n", "<li")] {
+            let html = convert_markdown(markdown);
+            assert!(html.contains(tag) && html.contains("id=\"s1\""), "{html}");
+        }
+    }
+
+    #[test]
+    fn block_ids_resolve_in_a_crlf_document() {
+        let html = convert_markdown("## Head ^h1\r\n\r\nPara ^p1\r\n\r\nPara\r\n^p2\r\n");
+        for id in ["h1", "p1", "p2"] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "{id}: {html}");
+            assert!(!html.contains(&format!("^{id}")), "{id} left raw: {html}");
+        }
     }
 
     #[test]
@@ -3013,12 +3564,12 @@ pub(crate) mod tests {
     fn convert_markdown_body() -> String {
         let source = include_str!("markdown.rs").replace("\r\n", "\n");
         let needle = format!(
-            "\npub(crate) fn {}(content: &str) -> String {{",
-            "convert_markdown"
+            "\npub(crate) fn {}(content: &str, split_blocks: bool) -> String {{",
+            "convert_markdown_with"
         );
         let start = source
             .find(&needle)
-            .expect("convert_markdown must keep its `&str -> String` signature");
+            .expect("convert_markdown_with must keep its `(&str, bool) -> String` signature");
         let rest = &source[start + needle.len()..];
         rest[..rest
             .find("\n}\n")
@@ -3086,12 +3637,12 @@ pub(crate) mod tests {
         // tree happens to store it.
         let source = include_str!("markdown.rs").replace("\r\n", "\n");
         let needle = format!(
-            "\npub(crate) fn {}(content: &str) -> String {{",
-            "convert_markdown"
+            "\npub(crate) fn {}(content: &str, split_blocks: bool) -> String {{",
+            "convert_markdown_with"
         );
         let start = source
             .find(&needle)
-            .expect("convert_markdown must keep its `&str -> String` signature");
+            .expect("convert_markdown_with must keep its `(&str, bool) -> String` signature");
         let rest = &source[start + needle.len()..];
         let body = &rest[..rest
             .find("\n}\n")
@@ -3110,7 +3661,7 @@ pub(crate) mod tests {
         // touches the text at all; it is shared with `heading_anchors`, which
         // has to parse the document the way the renderer does.
         let not_a_transform = [
-            "markdown_to_html",
+            "render_html",
             "annotate_task_checkboxes",
             "restore_math_spans",
             "markdown_options",
@@ -3210,5 +3761,98 @@ pub(crate) mod tests {
             matching.contains("data-task-checkbox"),
             "the fail-safe rejected a genuine task line: {matching}",
         );
+    }
+}
+
+#[cfg(test)]
+mod split_blocks_tests {
+    use super::{convert_markdown, convert_markdown_with, BLOCK_SEPARATOR};
+
+    fn blocks(markdown: &str) -> Vec<String> {
+        convert_markdown_with(markdown, true)
+            .split(BLOCK_SEPARATOR)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn split_blocks_adds_nothing_but_the_separators() {
+        for sample in [
+            include_str!("../../samples/markdown-syntax.md"),
+            include_str!("../../samples/markdown-syntax.zh-CN.md"),
+            include_str!("../../samples/stress-test.md"),
+            include_str!("../../samples/katex-stress.md"),
+            include_str!("../../samples/link-test.md"),
+        ] {
+            let split = convert_markdown_with(sample, true);
+            assert!(split.contains(BLOCK_SEPARATOR));
+            assert_eq!(split.replace("\0\n", ""), convert_markdown(sample));
+        }
+    }
+
+    #[test]
+    fn one_separator_between_top_level_blocks() {
+        let parts = blocks("# A\n\npara\n\n- x\n  - nested\n\n> quote\n");
+        assert_eq!(parts.len(), 4, "{parts:?}");
+        assert!(parts[0].starts_with("<h1"));
+        assert!(parts[1].starts_with("\n<p"));
+        assert!(parts[2].contains("nested"));
+    }
+
+    #[test]
+    fn footnote_definitions_stay_one_block() {
+        let parts = blocks("a[^1] b[^2]\n\n[^1]: x\n\n[^2]: y\n");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(
+            parts[1].contains("<section ") && parts[1].contains("class=\"footnotes\""),
+            "{parts:?}"
+        );
+        assert!(parts[1].contains("</section>"));
+    }
+
+    #[test]
+    fn raw_html_left_open_holds_the_blocks_inside_it() {
+        let parts = blocks("<details>\n<summary>s</summary>\n\n**md**\n\n</details>\n\nafter\n");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].contains("<strong") && parts[0].contains("</details>"));
+    }
+
+    #[test]
+    fn raw_html_that_never_closes_holds_the_rest_of_the_document() {
+        assert_eq!(blocks("<div>\n\na\n\nb\n").len(), 1);
+    }
+
+    #[test]
+    fn void_and_self_closing_tags_open_nothing() {
+        assert_eq!(blocks("<img src=\"x.png\">\n\na\n\n<hr/>\n\nb\n").len(), 4);
+    }
+
+    /// `scripts/preview.spec.ts` replays the preview's block patch
+    /// over this sample's blocks, so the fixture has to be what the renderer
+    /// says today. `MARKPAD_UPDATE_FIXTURES=1 cargo test` rewrites it.
+    #[test]
+    fn preview_block_fixture_is_current() {
+        let blocks = blocks(include_str!("../../samples/markdown-syntax.md"));
+        let json = serde_json::to_string_pretty(&blocks).unwrap() + "\n";
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/fixtures/markdown-syntax.blocks.json"
+        );
+        if std::env::var_os("MARKPAD_UPDATE_FIXTURES").is_some() {
+            std::fs::write(path, &json).unwrap();
+        }
+        let fixture = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
+        assert!(
+            fixture == json,
+            "{path} is stale: run `MARKPAD_UPDATE_FIXTURES=1 cargo test preview_block_fixture`"
+        );
+    }
+
+    #[test]
+    fn no_document_can_write_the_separator() {
+        let html = convert_markdown_with("a\0b\n\n$x\0y$\n\n`c\0d`\n", true);
+        assert_eq!(html.matches(BLOCK_SEPARATOR).count(), 2, "{html:?}");
     }
 }

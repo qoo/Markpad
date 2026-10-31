@@ -1,3 +1,5 @@
+import { basename } from './pathIdentity.js';
+
 /**
  * The Markdown an image lands in when the *app* writes the link — a pasted
  * screenshot (`save_image`) or a dropped file (`copy_file_to_img`). Both used
@@ -45,7 +47,7 @@
  *     splits `img/note#1.png` into `img/note` + `#1.png` and exports a dead
  *     link. Making them work would mean changing what a `#` means to the
  *     export resolver — for every hand-written link too, not just ours. See
- *     the `<…>` cases in scripts/imageEmbed.test.ts, which pin that.
+ *     the `<…>` cases in scripts/editor.test.ts, which pin that.
  *
  * `%` is on the list for a reason that is easy to miss: comrak passes a `%`
  * through untouched when two hex digits follow it, so a file genuinely named
@@ -121,7 +123,7 @@ const FILENAME_TOKEN = '${filename}';
 export function resolveImageDirectory(setting: string, documentPath: string): string {
 	const template = setting || DEFAULT_IMAGE_DIRECTORY;
 	if (!template.includes(FILENAME_TOKEN)) return template;
-	const base = documentPath.split(/[/\\]/).pop() ?? documentPath;
+	const base = basename(documentPath);
 	const dot = base.lastIndexOf('.');
 	// `.gitignore` is all name and no extension: only a dot with something in
 	// front of it separates the two.

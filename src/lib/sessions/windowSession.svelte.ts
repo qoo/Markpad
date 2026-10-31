@@ -1,8 +1,11 @@
-import { invoke } from '@tauri-apps/api/core';
+import { untrack } from 'svelte';
+import { commands, events } from '../bindings.js';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { tabManager } from '../stores/tabs.svelte.js';
+import { isNewWindowLabel } from '../utils/pinnedTagWindow.js';
 import { hasRealFilePath } from '../utils/tabFileActions.js';
 import { validateTransferPayload, type TransferableTab } from '../utils/tabTransfer.js';
+import { createBoundedWriter } from './unsavedRecovery.js';
 
 type RestoredTab = {
 	id: string;
@@ -55,23 +58,28 @@ const MAX_DEFERRED = 8;
  */
 const MAX_INTERRUPTIONS = 3;
 
+// Old localStorage snapshot keys. The snapshot is written through Rust now;
+// these are read once for migration and removed after the first Rust write, so
+// an older build that reads them finds nothing to misread.
+const WINDOW_STATE_KEY = 'savedTabsDataV2';
+const LEGACY_STATE_KEY = 'savedTabsData';
+
 type WindowSessionOptions = {
-	isMainWindow: boolean;
-	windowStateKey: string;
-	legacyStateKey: string;
 	restoreInProgressKey: string;
 	serializeState: () => string;
 	shouldRestoreState: () => boolean;
 	isDisposed: () => boolean;
 	restoreState: (json: string) => void;
 	restoredTabs: () => RestoredTab[];
-	applyRestoredContent: (tabId: string, raw: string) => Promise<void>;
+	/** Read a restored tab the way an open reads it. Never throws. */
+	loadRestoredTab: (tabId: string) => Promise<void>;
 	dropRestoredTab: (tabId: string) => void;
 	canTransfer: (tabId: string) => boolean;
 	canDetach: (tabId: string) => boolean;
 	transferPayload: (tabId: string) => string;
 	onTransferClaimed: (tabId: string) => void;
-	acceptTransferredTab: (tab: TransferableTab) => Promise<boolean>;
+	/** Builds the arriving tab and returns its id, or null if it refused. */
+	acceptTransferredTab: (tab: TransferableTab) => Promise<string | null>;
 	onError: (message: string, error: unknown) => void;
 	onWarning: (message: string, error?: unknown) => void;
 	/**
@@ -86,12 +94,38 @@ type WindowSessionOptions = {
 export function createWindowSession(options: WindowSessionOptions) {
 	const appWindow = getCurrentWindow();
 
+	/**
+	 * The snapshot is written as the window changes, not only at close, so a
+	 * crash or kill brings every window back. Through the same bounded,
+	 * serialized writer as the unsaved backup: the last state wins, and a write
+	 * still in flight cannot land after the window is forgotten.
+	 */
+	const snapshots = createBoundedWriter({
+		write: (json) => commands.saveWindowState(json),
+		// A background write that fails retries on its own; only the one a
+		// close waits for is put in front of the user, by `persistState`.
+		onError: (error) => options.onWarning('Failed to save window state', error),
+	});
+	// Off until this window's own restore has run, so its empty starting state
+	// never replaces the snapshot it is about to read.
+	let recording = false;
+
+	/** Record the window's state within the writer's bounded delay. */
+	function record(json: string) {
+		if (recording && options.shouldRestoreState()) snapshots.update(json);
+	}
+
+	/** Record the full state, editor position included, at a moment no tab
+	 * switch is under way: focus loss or hide. */
+	function checkpoint() {
+		if (recording && options.shouldRestoreState()) snapshots.update(options.serializeState());
+	}
+
 	async function discardPersistedState() {
-		localStorage.removeItem(options.windowStateKey);
-		localStorage.removeItem(options.legacyStateKey);
-		if (!options.isMainWindow) return;
+		localStorage.removeItem(WINDOW_STATE_KEY);
+		localStorage.removeItem(LEGACY_STATE_KEY);
 		try {
-			await invoke('clear_window_state');
+			await commands.clearWindowState();
 		} catch (error) {
 			options.onError('Failed to clear window state', error);
 		}
@@ -108,11 +142,13 @@ export function createWindowSession(options: WindowSessionOptions) {
 	 * `restoreInProgressKey` stays as a read-once migration path: a breadcrumb
 	 * an older build left behind is still honoured, and dropped as soon as a
 	 * Rust write succeeds. The Rust file wins when both exist, so a downgrade
-	 * and re-upgrade cannot resurrect a stale localStorage record.
+	 * and re-upgrade cannot resurrect a stale localStorage record. localStorage
+	 * is shared by every window: the first window to start, the launch window,
+	 * reads it and removes it before any other window exists.
 	 */
 	async function readProgress(): Promise<RestoreProgress | null> {
 		const raw =
-			((await invoke('load_restore_progress').catch(() => null)) as string | null) ??
+			(await commands.loadRestoreProgress().catch(() => null)) ??
 			localStorage.getItem(options.restoreInProgressKey);
 		if (!raw) return null;
 		try {
@@ -140,8 +176,8 @@ export function createWindowSession(options: WindowSessionOptions) {
 		// which is what keeps the record absent in the ordinary case.
 		const clearing = !progress.running && progress.deferred.length === 0;
 		try {
-			if (clearing) await invoke('clear_restore_progress');
-			else await invoke('save_restore_progress', { json: JSON.stringify(progress) });
+			if (clearing) await commands.clearRestoreProgress();
+			else await commands.saveRestoreProgress(JSON.stringify(progress));
 		} catch (error) {
 			// No localStorage fallback on purpose: two copies that can disagree
 			// is how a stale record gets preferred over a fresh one. A backend
@@ -173,20 +209,36 @@ export function createWindowSession(options: WindowSessionOptions) {
 		await writeProgress({ ...progress, deferred });
 	}
 
-	async function persistState() {
-		if (!options.isMainWindow) return;
-		await releaseReadableDeferrals();
-		try {
-			await invoke('save_window_state', { json: options.serializeState() });
-			localStorage.removeItem(options.windowStateKey);
-			localStorage.removeItem(options.legacyStateKey);
-		} catch (error) {
-			options.onError('Failed to save window state on close', error);
+	/**
+	 * Every window keeps its own snapshot, keyed by its label on the Rust side,
+	 * so no window can overwrite another's. `remember` false is a window closed
+	 * on its own while others stay: it is not reopened next launch.
+	 */
+	async function persistState(remember: boolean) {
+		if (!remember) {
+			await snapshots.dispose();
+			try {
+				await commands.forgetWindowState();
+			} catch (error) {
+				options.onError('Failed to forget window state on close', error);
+			}
+			return;
 		}
+		await releaseReadableDeferrals();
+		if (!(await snapshots.flush(options.serializeState()))) {
+			options.onError('Failed to save window state on close', 'the write was refused');
+			return;
+		}
+		localStorage.removeItem(WINDOW_STATE_KEY);
+		localStorage.removeItem(LEGACY_STATE_KEY);
 	}
 
-	async function restore() {
-		if (!options.isMainWindow || options.isDisposed()) return;
+	/**
+	 * Restores this window's own snapshot. True when it had one: a reopened
+	 * window, which has no tab transfer or pinned group to claim.
+	 */
+	async function restore(): Promise<boolean> {
+		if (options.isDisposed()) return false;
 		if (!options.shouldRestoreState()) {
 			// Through `discardPersistedState`, because the snapshot is a file on
 			// the Rust side now. This branch is what makes turning the setting off
@@ -199,7 +251,10 @@ export function createWindowSession(options: WindowSessionOptions) {
 			// Nothing will be restored, so there is nothing for a breadcrumb to
 			// say about the next launch.
 			await writeProgress({ running: false, pending: null, deferred: [], interruptions: 0 });
-			return;
+			// Writes nothing while the setting is off; turned on later, the
+			// window starts recording with its next change.
+			recording = true;
+			return false;
 		}
 		const previous = await readProgress();
 		const deferred = previous ? [...previous.deferred] : [];
@@ -241,53 +296,43 @@ export function createWindowSession(options: WindowSessionOptions) {
 		const progress: RestoreProgress = { running: true, pending: null, deferred, interruptions };
 		await writeProgress(progress);
 
+		// The localStorage copies are from builds that kept one snapshot. The
+		// launch window starts first and removes them below, before it reopens
+		// any other window, so only it can read them.
 		const savedData =
-			localStorage.getItem(options.windowStateKey) ??
-			localStorage.getItem(options.legacyStateKey) ??
-			((await invoke('load_window_state').catch(() => null)) as string | null);
+			localStorage.getItem(WINDOW_STATE_KEY) ??
+			localStorage.getItem(LEGACY_STATE_KEY) ??
+			(await commands.loadWindowState().catch(() => null));
 		if (savedData) {
 			try {
 				options.restoreState(savedData);
 				for (const tab of options.restoredTabs()) {
 					// The home screen is not a document. Snapshots from builds that
 					// wrote its `HOME_TAB_PATH` sentinel must not turn into a read
-					// of a file by that name — and unlike a file that merely failed
-					// to read, there is nothing here to come back to later.
+					// of a file by that name.
 					if (!hasRealFilePath(tab.path)) {
 						options.dropRestoredTab(tab.id);
 						continue;
 					}
-					if (deferAll || deferred.includes(tab.path)) {
-						tabManager.markTabContentUnavailable(tab.id);
-						continue;
-					}
-					progress.pending = tab.path;
+					// A deferred document is not owed a read: it stays unavailable
+					// until the user asks for it (edit, reload). Every other tab
+					// waits unread and is read when it is first activated.
+					if (deferAll || deferred.includes(tab.path)) tabManager.markTabContentUnavailable(tab.id);
+					else tabManager.markTabUnread(tab.id);
+				}
+				// Only the tab on screen is read now, the way a normal open reads
+				// it. Taken synchronously, before any await, so the activation
+				// path cannot start a second read of it.
+				const active = tabManager.activeTab;
+				if (active && tabManager.takeUnread(active.id)) {
+					progress.pending = active.path;
 					// Awaited: the record has to be on disk before the read it
 					// describes starts, or the launch this read kills is the one
 					// that leaves nothing behind.
 					await writeProgress(progress);
-					try {
-						// `_checked`, because restore fills an editable buffer, and
-						// both of its answers belong to the tab: `lossy` so a file
-						// nothing could decode is never written back over, and the
-						// encoding so a legacy one is written back as itself.
-						// Without this, reopening the app laundered them away and
-						// the next auto-save destroyed or converted the document.
-						const [raw, lossy, encoding] = (await invoke('read_file_content_checked', { path: tab.path })) as [string, boolean, string];
-						if (options.isDisposed()) return;
-						await options.applyRestoredContent(tab.id, raw);
-						tabManager.setTabDecodedLossy(tab.id, lossy);
-						tabManager.setTabEncoding(tab.id, encoding);
-						if (options.isDisposed()) return;
-					} catch (error) {
-						if (options.isDisposed()) return;
-						// One failed read is not a decision to close the document.
-						// The file may be on a share that is down or a drive that is
-						// not plugged in; dropping the tab here also dropped it from
-						// the snapshot written moments later, so it never came back.
-						options.onWarning('Restore: keeping tab whose file could not be read', error);
-						tabManager.markTabContentUnavailable(tab.id);
-					}
+					if (options.isDisposed()) return true;
+					await options.loadRestoredTab(active.id);
+					if (options.isDisposed()) return true;
 					progress.pending = null;
 					await writeProgress(progress);
 				}
@@ -307,10 +352,14 @@ export function createWindowSession(options: WindowSessionOptions) {
 			// restore, so claiming early cannot accumulate phantom strikes.
 			await writeProgress({ running: false, pending: null, deferred, interruptions: 0 });
 		}
-		if (options.isDisposed()) return;
-		if (options.restoredTabs().length > 0) await persistState();
-		localStorage.removeItem(options.windowStateKey);
-		localStorage.removeItem(options.legacyStateKey);
+		if (options.isDisposed()) return Boolean(savedData);
+		// Every window has a snapshot from here on, an empty one included: the
+		// set of snapshots is the list of windows the next launch reopens.
+		recording = true;
+		await persistState(true);
+		localStorage.removeItem(WINDOW_STATE_KEY);
+		localStorage.removeItem(LEGACY_STATE_KEY);
+		return Boolean(savedData);
 	}
 
 	/**
@@ -322,7 +371,7 @@ export function createWindowSession(options: WindowSessionOptions) {
 	 */
 	async function releaseClaim(token: string) {
 		try {
-			await invoke('cancel_detached_tab', { token });
+			await commands.cancelDetachedTab(token);
 		} catch (error) {
 			options.onError('Failed to release tab transfer claim', error);
 		}
@@ -331,7 +380,7 @@ export function createWindowSession(options: WindowSessionOptions) {
 	async function acceptOfferedTransfer(token: string): Promise<boolean> {
 		let claimed = false;
 		try {
-			const payload = (await invoke('claim_detached_tab', { token })) as string | null;
+			const payload = await commands.claimDetachedTab(token);
 			// Distinguish "no such token" from a claim that succeeded: only the
 			// latter leaves something to release.
 			if (payload === null) {
@@ -345,11 +394,20 @@ export function createWindowSession(options: WindowSessionOptions) {
 				await releaseClaim(token);
 				return false;
 			}
-			if (!(await options.acceptTransferredTab(tab))) {
+			const tabId = await options.acceptTransferredTab(tab);
+			if (tabId === null) {
 				await releaseClaim(token);
 				return false;
 			}
-			await invoke('complete_detached_tab', { token });
+			try {
+				await commands.completeDetachedTab(token);
+			} catch (error) {
+				// The source withdrew the transfer (it kept editing, or its
+				// claim grace ran out) and still has the tab. Keeping this copy
+				// would leave the document open in both windows.
+				tabManager.closeTab(tabId);
+				throw error;
+			}
 			return true;
 		} catch (error) {
 			options.onError('Tab transfer claim error', error);
@@ -362,7 +420,7 @@ export function createWindowSession(options: WindowSessionOptions) {
 		const claimToken = appWindow.label.startsWith('window-')
 			? appWindow.label.slice('window-'.length)
 			: null;
-		if (!claimToken) return;
+		if (!claimToken || isNewWindowLabel(appWindow.label)) return;
 		await acceptOfferedTransfer(claimToken);
 	}
 
@@ -374,7 +432,7 @@ export function createWindowSession(options: WindowSessionOptions) {
 	// each copy with its own auto-save timer.
 	const transfersInFlight = new Set<string>();
 
-	async function transfer(tabId: string, deliver: (token: string) => Promise<void>): Promise<boolean> {
+	async function transfer(tabId: string, deliver: (token: string) => Promise<unknown>): Promise<boolean> {
 		if (!options.canTransfer(tabId)) return false;
 		if (transfersInFlight.has(tabId)) return false;
 		transfersInFlight.add(tabId);
@@ -385,18 +443,68 @@ export function createWindowSession(options: WindowSessionOptions) {
 		}
 	}
 
-	async function stageTransfer(tabId: string, deliver: (token: string) => Promise<void>): Promise<boolean> {
-		const token = (await invoke('stage_detached_tab', {
-			payload: options.transferPayload(tabId),
-		})) as string;
+	/**
+	 * What a transfer must not lose: the buffer, the baseline the next save is
+	 * checked against, and the file both belong to. Scroll position is left
+	 * out, so reading on in the source does not withdraw a claimed transfer.
+	 */
+	function transferRevision(tabId: string): string {
+		const tab = tabManager.tabs.find((item) => item.id === tabId);
+		return tab ? JSON.stringify([tab.path, tab.encoding, tab.rawContent, tab.originalContent]) : '';
+	}
+
+	async function stageTransfer(tabId: string, deliver: (token: string) => Promise<unknown>): Promise<boolean> {
+		// The payload is a snapshot, and the source tab stays live until the
+		// destination completes -- one to two seconds for a new window to
+		// boot. Typing there, or an auto-save resetting `originalContent`,
+		// would be closed away with the tab, and the destination's stale
+		// baseline would turn its next save into a false conflict. So every
+		// change is pushed to the broker as it happens: before the claim it
+		// replaces the payload, after it the broker withdraws the transfer.
+		let sent = transferRevision(tabId);
+		const token = await commands.stageDetachedTab(options.transferPayload(tabId));
 		let settled = false;
 		let resolveTransfer: (moved: boolean) => void;
-		const unlisten = await appWindow.listen<string>('tab-transfer-claimed', (event) => {
-			if (settled || event.payload !== token) return;
+		const settle = (moved: boolean) => {
+			if (settled) return;
 			settled = true;
 			unlisten();
+			stopWatching();
+			resolveTransfer(moved);
+		};
+		const unlisten = await events.tabTransferClaimed(appWindow).listen((event) => {
+			if (settled || event.payload !== token) return;
+			// A change whose refresh reached the broker after the completion:
+			// the destination has the older copy. Keeping this tab too leaves
+			// the document in both windows, which the save-time conflict check
+			// covers; closing it would lose the edit outright.
+			if (transferRevision(tabId) !== sent) {
+				options.onWarning('Tab changed while it was being moved; kept it in this window');
+				settle(false);
+				return;
+			}
 			options.onTransferClaimed(tabId);
-			resolveTransfer(true);
+			settle(true);
+		});
+		const stopWatching = $effect.root(() => {
+			$effect(() => {
+				const revision = transferRevision(tabId);
+				// '' is a tab closed mid-transfer: nothing left to send.
+				if (revision === sent || revision === '' || settled) return;
+				const payload = untrack(() => options.transferPayload(tabId));
+				void (async () => {
+					try {
+						const outcome = (await commands.refreshDetachedTab(token, payload)) as
+							'updated' | 'revoked' | 'gone';
+						if (outcome === 'updated') sent = revision;
+						else if (outcome === 'revoked') settle(false);
+						// `gone`: completed or cancelled, and either one settles
+						// through its own path.
+					} catch (error) {
+						options.onError('Failed to refresh tab transfer', error);
+					}
+				})();
+			});
 		});
 		return new Promise<boolean>((resolve) => {
 			resolveTransfer = resolve;
@@ -404,23 +512,25 @@ export function createWindowSession(options: WindowSessionOptions) {
 			// than assumes. `claimed` means the payload is already gone into
 			// the other window and only slow to render: giving up here would
 			// leave the same document open in both, and whichever auto-saves
-			// last wins. Keep waiting for `tab-transfer-claimed`; the
-			// destination releases the claim itself if it cannot finish.
+			// last wins. Keep waiting for `tab-transfer-claimed`, and keep
+			// asking: a destination that closed or crashed after its claim
+			// never completes, and the broker hands the transfer back once
+			// its claim grace runs out.
 			const cancel = async () => {
 				if (settled) return;
 				try {
-					const outcome = (await invoke('cancel_detached_tab', { token })) as {
+					const outcome = (await commands.cancelDetachedTab(token)) as {
 						cancelled: boolean;
 						claimed: boolean;
 					};
-					if (!outcome.cancelled && outcome.claimed) return;
+					if (!outcome.cancelled && outcome.claimed) {
+						setTimeout(cancel, 15_000);
+						return;
+					}
 				} catch (error) {
 					options.onError('Failed to cancel tab transfer', error);
 				}
-				if (settled) return;
-				settled = true;
-				unlisten();
-				resolve(false);
+				settle(false);
 			};
 			setTimeout(cancel, 15_000);
 			deliver(token).catch((error) => {
@@ -432,8 +542,8 @@ export function createWindowSession(options: WindowSessionOptions) {
 
 	async function detach(tabId: string) {
 		if (!options.canDetach(tabId)) return false;
-		return transfer(tabId, (token) => invoke('create_transfer_window', { token }));
+		return transfer(tabId, (token) => commands.createTransferWindow(token, null));
 	}
 
-	return { discardPersistedState, persistState, restore, claimTransferredTab, acceptOfferedTransfer, detach, transfer };
+	return { discardPersistedState, persistState, record, checkpoint, restore, claimTransferredTab, acceptOfferedTransfer, detach, transfer };
 }
